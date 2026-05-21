@@ -52,7 +52,8 @@ def _set_raw_keep_opost(fd: int) -> None:
     mode[6][termios.VTIME] = 0
     termios.tcsetattr(fd, termios.TCSAFLUSH, mode)
 from .state import parse_command_actions, reconstruct_history_from_rollout
-from .types import CodexConfig, CodexEvent
+from .types import CodexConfig, CodexEvent, _model_catalog_info
+from . import types as _types
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -536,6 +537,123 @@ def _set_session_collaboration_mode(session: CodexSession, mode: str) -> None:
     session.config = config
     session.state.config = config
     session.tools.config = config
+
+
+def _list_known_models() -> list[dict[str, Any]]:
+    _model_catalog_info("__warmup__")
+    cache = getattr(_types, "_MODEL_CATALOG_CACHE", None) or {}
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for slug, entry in cache.items():
+        if slug in seen:
+            continue
+        seen.add(slug)
+        out.append(entry)
+    out.sort(key=lambda e: str(e.get("slug", "")))
+    return out
+
+
+def _model_supported_efforts(model: str) -> list[str]:
+    info = _model_catalog_info(model)
+    raw = info.get("supported_reasoning_levels")
+    efforts: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and isinstance(item.get("effort"), str):
+                efforts.append(item["effort"])
+            elif isinstance(item, str):
+                efforts.append(item)
+    return efforts
+
+
+def _set_session_model(session: CodexSession, model: str, effort: str | None) -> None:
+    config = replace(session.config, model=model, model_reasoning_effort=effort)
+    session.config = config
+    session.state.config = config
+    session.tools.config = config
+
+
+def _handle_model_slash(session: CodexSession, rest: str) -> None:
+    tokens = rest.split()
+    current_model = session.config.model
+    current_effort = session.config.model_reasoning_effort or _model_catalog_info(current_model).get("default_reasoning_level") or "medium"
+    models = _list_known_models()
+
+    if not tokens:
+        print(f"Current model: {current_model} (reasoning effort: {current_effort})", file=sys.stderr, flush=True)
+        if not models:
+            print("No model catalog entries found.", file=sys.stderr, flush=True)
+            return
+        print("Available models:", file=sys.stderr, flush=True)
+        for i, entry in enumerate(models, 1):
+            slug = entry.get("slug", "")
+            efforts = _model_supported_efforts(slug) or [str(entry.get("default_reasoning_level") or "medium")]
+            marker = " *" if slug == current_model else ""
+            print(f"  [{i}] {slug}{marker}  efforts: {', '.join(efforts)}", file=sys.stderr, flush=True)
+        print("Select: <model#>[.<effort#>], or blank to cancel", file=sys.stderr, flush=True)
+        try:
+            choice = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("Cancelled.", file=sys.stderr, flush=True)
+            return
+        if not choice:
+            print("Cancelled.", file=sys.stderr, flush=True)
+            return
+        m_part, _, e_part = choice.partition(".")
+        try:
+            m_idx = int(m_part) - 1
+            entry = models[m_idx]
+        except (ValueError, IndexError):
+            print(f"Invalid model selection: {choice}", file=sys.stderr, flush=True)
+            return
+        slug = str(entry.get("slug", ""))
+        efforts = _model_supported_efforts(slug)
+        effort: str | None
+        if e_part:
+            try:
+                effort = efforts[int(e_part) - 1]
+            except (ValueError, IndexError):
+                print(f"Invalid effort selection: {e_part}", file=sys.stderr, flush=True)
+                return
+        else:
+            effort = str(entry.get("default_reasoning_level") or current_effort)
+        _set_session_model(session, slug, effort)
+        print(f"Model set to {slug} (reasoning effort: {effort}).", file=sys.stderr, flush=True)
+        return
+
+    if tokens[0] in {"effort", "reasoning"} and len(tokens) == 2:
+        effort = tokens[1]
+        supported = _model_supported_efforts(current_model)
+        if supported and effort not in supported:
+            print(f"Effort '{effort}' not supported by {current_model}. Supported: {', '.join(supported)}", file=sys.stderr, flush=True)
+            return
+        _set_session_model(session, current_model, effort)
+        print(f"Reasoning effort set to {effort} (model: {current_model}).", file=sys.stderr, flush=True)
+        return
+
+    name = tokens[0]
+    info = _model_catalog_info(name)
+    known_slugs = {str(e.get("slug", "")) for e in models}
+    if known_slugs and name not in known_slugs:
+        print(f"Unknown model '{name}'. Known: {', '.join(sorted(known_slugs))}", file=sys.stderr, flush=True)
+        return
+    if len(tokens) == 1:
+        supported = _model_supported_efforts(name)
+        if current_effort in supported:
+            effort = current_effort
+        else:
+            effort = str(info.get("default_reasoning_level") or "medium")
+    elif len(tokens) == 2:
+        effort = tokens[1]
+        supported = _model_supported_efforts(name)
+        if supported and effort not in supported:
+            print(f"Effort '{effort}' not supported by {name}. Supported: {', '.join(supported)}", file=sys.stderr, flush=True)
+            return
+    else:
+        print("Usage: /model | /model <name> [<effort>] | /model effort <effort>", file=sys.stderr, flush=True)
+        return
+    _set_session_model(session, name, effort)
+    print(f"Model set to {name} (reasoning effort: {effort}).", file=sys.stderr, flush=True)
 
 
 class _RequestUserInputRequest:
@@ -1878,6 +1996,9 @@ def _handle_interactive_slash_command(
             print("AGENTS.md already exists here. Skipping /init to avoid overwriting it.", file=sys.stderr, flush=True)
             return _InteractiveSlashResult(True)
         return _InteractiveSlashResult(True, prompt=_read_init_command_prompt())
+    if command == "model":
+        _handle_model_slash(session, slash.rest)
+        return _InteractiveSlashResult(True)
     if command == "raw":
         arg = slash.rest.strip().lower()
         if arg and arg not in {"on", "off"}:
