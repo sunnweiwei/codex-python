@@ -362,7 +362,7 @@ def _model_catalog_info(model: str) -> dict[str, Any]:
     global _MODEL_CATALOG_CACHE
     if _MODEL_CATALOG_CACHE is None:
         _MODEL_CATALOG_CACHE = {}
-        path = Path(__file__).with_name("upstream") / "openai-codex" / "codex-rs" / "models-manager" / "models.json"
+        path = Path(__file__).with_name("assets") / "models.json"
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
