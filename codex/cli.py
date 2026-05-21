@@ -573,50 +573,142 @@ def _set_session_model(session: CodexSession, model: str, effort: str | None) ->
     session.tools.config = config
 
 
-def _handle_model_slash(session: CodexSession, rest: str) -> None:
+def _interactive_model_picker(
+    models: list[dict[str, Any]],
+    current_model: str,
+    current_effort: str,
+    *,
+    color_mode: str = "auto",
+) -> tuple[str, str] | None:
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        for i, entry in enumerate(models, 1):
+            slug = entry.get("slug", "")
+            efforts = _model_supported_efforts(slug) or [str(entry.get("default_reasoning_level") or "medium")]
+            marker = " *" if slug == current_model else ""
+            print(f"  [{i}] {slug}{marker}  efforts: {', '.join(efforts)}", file=sys.stderr, flush=True)
+        return None
+
+    try:
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+    except Exception:
+        return None
+
+    style = _AnsiStyle(_should_use_color(color_mode))
+    rows: list[tuple[str, list[str]]] = []
+    for entry in models:
+        slug = str(entry.get("slug", ""))
+        efforts = _model_supported_efforts(slug)
+        if not efforts:
+            default_level = entry.get("default_reasoning_level")
+            efforts = [str(default_level)] if default_level else ["medium"]
+        rows.append((slug, efforts))
+
+    selected = next((i for i, (s, _e) in enumerate(rows) if s == current_model), 0)
+    effort_idx = [0] * len(rows)
+    for i, (slug, efforts) in enumerate(rows):
+        if slug == current_model and current_effort in efforts:
+            effort_idx[i] = efforts.index(current_effort)
+        else:
+            default_level = str(_model_catalog_info(slug).get("default_reasoning_level") or "medium")
+            if default_level in efforts:
+                effort_idx[i] = efforts.index(default_level)
+
+    rendered_rows = 0
+
+    def render(lines: list[str]) -> None:
+        nonlocal rendered_rows
+        cols = _terminal_columns()
+        _clear_prompt_lines(rendered_rows)
+        print("\n".join(lines), end="", file=sys.stderr, flush=True)
+        rendered_rows = _prompt_screen_rows(lines, cols)
+
+    def clear() -> None:
+        nonlocal rendered_rows
+        _clear_prompt_lines(rendered_rows)
+        rendered_rows = 0
+
+    def lines() -> list[str]:
+        out = [
+            f"{style.bold('Select model')}  (current: {current_model} / {current_effort})",
+            f"{style.dim('  ↑/↓ model  ←/→ reasoning effort  Enter confirm  Esc cancel')}",
+            "",
+        ]
+        for i, (slug, efforts) in enumerate(rows):
+            cur_eff = efforts[effort_idx[i]]
+            arrows = []
+            if len(efforts) > 1:
+                arrows.append("◂" if effort_idx[i] > 0 else " ")
+                arrows.append("▸" if effort_idx[i] < len(efforts) - 1 else " ")
+            else:
+                arrows = [" ", " "]
+            eff_part = f"{arrows[0]} {cur_eff} {arrows[1]}" if len(efforts) > 1 else f"  {cur_eff}  "
+            marker = "*" if slug == current_model else " "
+            line = f"  {marker} {slug:<20} {eff_part}"
+            if i == selected:
+                line = style.bold("> " + line.lstrip())
+            else:
+                line = "  " + line.lstrip()
+            out.append(line)
+        return out
+
+    try:
+        _set_raw_keep_opost(fd)
+        pending = b""
+        while True:
+            render(lines())
+            chunk, pending = _read_tty_chunk(fd, pending)
+            if chunk == b"":
+                return None
+            if chunk == b"\x03":
+                return None
+            if chunk in {b"\r", b"\n"}:
+                slug, efforts = rows[selected]
+                return slug, efforts[effort_idx[selected]]
+            if chunk == b"\x1b":
+                sequence, pending = _read_escape_sequence(fd, pending)
+                if sequence == b"\x1b":
+                    return None
+                if sequence in {b"\x1b[A", b"\x1bOA"}:
+                    selected = (selected - 1) % len(rows)
+                elif sequence in {b"\x1b[B", b"\x1bOB"}:
+                    selected = (selected + 1) % len(rows)
+                elif sequence in {b"\x1b[D", b"\x1bOD"}:
+                    _slug, efforts = rows[selected]
+                    if len(efforts) > 1:
+                        effort_idx[selected] = (effort_idx[selected] - 1) % len(efforts)
+                elif sequence in {b"\x1b[C", b"\x1bOC"}:
+                    _slug, efforts = rows[selected]
+                    if len(efforts) > 1:
+                        effort_idx[selected] = (effort_idx[selected] + 1) % len(efforts)
+                continue
+            if chunk == b"q":
+                return None
+    except KeyboardInterrupt:
+        return None
+    finally:
+        clear()
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+
+
+def _handle_model_slash(session: CodexSession, rest: str, *, color_mode: str = "auto") -> None:
     tokens = rest.split()
     current_model = session.config.model
     current_effort = session.config.model_reasoning_effort or _model_catalog_info(current_model).get("default_reasoning_level") or "medium"
     models = _list_known_models()
 
     if not tokens:
-        print(f"Current model: {current_model} (reasoning effort: {current_effort})", file=sys.stderr, flush=True)
         if not models:
             print("No model catalog entries found.", file=sys.stderr, flush=True)
             return
-        print("Available models:", file=sys.stderr, flush=True)
-        for i, entry in enumerate(models, 1):
-            slug = entry.get("slug", "")
-            efforts = _model_supported_efforts(slug) or [str(entry.get("default_reasoning_level") or "medium")]
-            marker = " *" if slug == current_model else ""
-            print(f"  [{i}] {slug}{marker}  efforts: {', '.join(efforts)}", file=sys.stderr, flush=True)
-        print("Select: <model#>[.<effort#>], or blank to cancel", file=sys.stderr, flush=True)
-        try:
-            choice = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
+        choice = _interactive_model_picker(models, current_model, current_effort, color_mode=color_mode)
+        if choice is None:
             print("Cancelled.", file=sys.stderr, flush=True)
             return
-        if not choice:
-            print("Cancelled.", file=sys.stderr, flush=True)
-            return
-        m_part, _, e_part = choice.partition(".")
-        try:
-            m_idx = int(m_part) - 1
-            entry = models[m_idx]
-        except (ValueError, IndexError):
-            print(f"Invalid model selection: {choice}", file=sys.stderr, flush=True)
-            return
-        slug = str(entry.get("slug", ""))
-        efforts = _model_supported_efforts(slug)
-        effort: str | None
-        if e_part:
-            try:
-                effort = efforts[int(e_part) - 1]
-            except (ValueError, IndexError):
-                print(f"Invalid effort selection: {e_part}", file=sys.stderr, flush=True)
-                return
-        else:
-            effort = str(entry.get("default_reasoning_level") or current_effort)
+        slug, effort = choice
         _set_session_model(session, slug, effort)
         print(f"Model set to {slug} (reasoning effort: {effort}).", file=sys.stderr, flush=True)
         return
@@ -1997,7 +2089,7 @@ def _handle_interactive_slash_command(
             return _InteractiveSlashResult(True)
         return _InteractiveSlashResult(True, prompt=_read_init_command_prompt())
     if command == "model":
-        _handle_model_slash(session, slash.rest)
+        _handle_model_slash(session, slash.rest, color_mode=color_mode)
         return _InteractiveSlashResult(True)
     if command == "raw":
         arg = slash.rest.strip().lower()
