@@ -14,7 +14,6 @@ from .types import ApprovalPolicy, CodexConfig, NetworkAccess, SandboxMode
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = PACKAGE_DIR / "assets"
-UPSTREAM_DIR = PACKAGE_DIR / "upstream" / "openai-codex"
 PINNED_UPSTREAM_COMMIT = "392e94e9ea756cffd89f35941e881d29b2a81a6e"
 
 ASSET_HASHES = {
@@ -30,21 +29,6 @@ ASSET_HASHES = {
     "prompts/memories/write/consolidation.md": "af0df49d83c5ccc08ad0cadcd2856b05ac33439533daec8ecd00d291a8ad3358",
     "prompts/memories/write/extensions/ad_hoc/instructions.md": "d36a36083d92f9d44efbd95e0e4b6e81d7d149e812f2bca2009b6dd4b8aa93e7",
     "grammars/apply_patch.lark": "d6367f4826ed608c424b0a308f3d6163527df63c22513d089b91863552f8bfeb",
-}
-
-UPSTREAM_ASSET_PATHS = {
-    "prompts/gpt_5_codex_prompt.md": "codex-rs/core/gpt_5_codex_prompt.md",
-    "prompts/gpt_5_2_prompt.md": "codex-rs/core/gpt_5_2_prompt.md",
-    "prompts/gpt-5.2-codex_prompt.md": "codex-rs/core/gpt-5.2-codex_prompt.md",
-    "prompts/prompt_with_apply_patch_instructions.md": "codex-rs/core/prompt_with_apply_patch_instructions.md",
-    "prompts/compact/prompt.md": "codex-rs/core/templates/compact/prompt.md",
-    "prompts/compact/summary_prefix.md": "codex-rs/core/templates/compact/summary_prefix.md",
-    "prompts/memories/read_path.md": "codex-rs/memories/read/templates/memories/read_path.md",
-    "prompts/memories/write/stage_one_system.md": "codex-rs/memories/write/templates/memories/stage_one_system.md",
-    "prompts/memories/write/stage_one_input.md": "codex-rs/memories/write/templates/memories/stage_one_input.md",
-    "prompts/memories/write/consolidation.md": "codex-rs/memories/write/templates/memories/consolidation.md",
-    "prompts/memories/write/extensions/ad_hoc/instructions.md": "codex-rs/memories/write/templates/extensions/ad_hoc/instructions.md",
-    "grammars/apply_patch.lark": "codex-rs/core/src/tools/handlers/apply_patch.lark",
 }
 
 MEMORY_STAGE_ONE_MODEL = "gpt-5.4-mini"
@@ -116,7 +100,7 @@ def _model_catalog() -> dict[str, dict[str, Any]]:
     global _MODEL_CATALOG
     if _MODEL_CATALOG is not None:
         return _MODEL_CATALOG
-    path = UPSTREAM_DIR / "codex-rs" / "models-manager" / "models.json"
+    path = ASSETS_DIR / "models.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -143,14 +127,6 @@ def verify_asset_hashes() -> dict[str, bool]:
         path: asset_sha256(path) == expected
         for path, expected in ASSET_HASHES.items()
     }
-
-
-def compare_assets_to_upstream() -> dict[str, bool]:
-    result = {}
-    for asset_path, upstream_path in UPSTREAM_ASSET_PATHS.items():
-        upstream = UPSTREAM_DIR / upstream_path
-        result[asset_path] = upstream.exists() and (ASSETS_DIR / asset_path).read_bytes() == upstream.read_bytes()
-    return result
 
 
 def build_base_instructions(

@@ -62,7 +62,8 @@ from codex.model import ModelStreamEvent
 from codex.model import collect_stream_response
 from codex.model import load_env_file
 from codex.prompts import build_base_instructions, build_environment_context, build_initial_context_items
-from codex.prompts import build_permissions_instructions, collect_agents_md, compare_assets_to_upstream
+from codex.prompts import build_permissions_instructions, collect_agents_md
+from codex.parity import compare_assets_to_upstream
 from codex.prompts import verify_asset_hashes, read_model_catalog_instructions
 from codex.prompts import build_memory_consolidation_prompt
 from codex.prompts import build_memory_stage_one_input_message
@@ -4086,20 +4087,18 @@ PATCH
             self.assertIn("Update file hunk for path 'duplicate.txt' is empty", empty.output)
 
     def test_apply_patch_freeform_matches_upstream_fixture_scenarios(self) -> None:
-        scenarios = (
-            Path(__file__).resolve().parents[1]
-            / "agents"
-            / "codex"
-            / "upstream"
-            / "openai-codex"
-            / "codex-rs"
-            / "apply-patch"
-            / "tests"
-            / "fixtures"
-            / "scenarios"
-        )
-        if not scenarios.exists():
-            self.skipTest("upstream openai/codex source not present; skipping fixture-based scenarios")
+        upstream_env = os.environ.get("CODEX_UPSTREAM_DIR")
+        if upstream_env:
+            upstream_root = Path(upstream_env).expanduser()
+        else:
+            upstream_root = (
+                Path(__file__).resolve().parents[1]
+                / "agents"
+                / "codex"
+                / "upstream"
+                / "openai-codex"
+            )
+        scenarios = upstream_root / "codex-rs" / "apply-patch" / "tests" / "fixtures" / "scenarios"
         expected_failures = {
             "005_rejects_empty_patch",
             "006_rejects_missing_context",
@@ -6097,14 +6096,14 @@ new file mode 100644
             ],
             env=env,
             interactions=[
-                ("/model\r", "recognized from upstream Codex"),
+                ("/permissions\r", "recognized from upstream Codex"),
                 ("/exit\r", None),
             ],
             timeout=10.0,
         )
         plain = _plain_terminal_output(output)
 
-        self.assertIn("'/model' is recognized from upstream Codex", plain)
+        self.assertIn("'/permissions' is recognized from upstream Codex", plain)
         self.assertNotIn("model should not be called", plain)
 
     def test_cli_tty_unknown_slash_command_is_not_sent_to_model(self) -> None:

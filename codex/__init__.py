@@ -1,8 +1,7 @@
-"""Pure-Python port of the openai/codex agent (codex exec core path).
+"""Python-native Codex core port.
 
-The implementation in this package does not call the official ``codex``
-binary; it is a real re-implementation of the public client at a pinned
-upstream commit. See ``UPSTREAM.md`` for the pinned SHA.
+The native implementation in this package does not call the official
+``codex`` binary. The optional parity helpers can call it as an oracle.
 """
 
 from .core import CodexSession

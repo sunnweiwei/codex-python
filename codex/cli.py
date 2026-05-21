@@ -51,6 +51,8 @@ def _set_raw_keep_opost(fd: int) -> None:
     mode[6][termios.VMIN] = 1
     mode[6][termios.VTIME] = 0
     termios.tcsetattr(fd, termios.TCSAFLUSH, mode)
+from .parity import compare_exec_traces, format_parity_report, format_trace_report, load_jsonl_events, run_parity_checks
+from .parity import summarize_exec_trace
 from .state import parse_command_actions, reconstruct_history_from_rollout
 from .types import CodexConfig, CodexEvent, _model_catalog_info
 from . import types as _types
@@ -86,8 +88,27 @@ def _main(argv: list[str] | None = None) -> int:
     exec_parser = subparsers.add_parser("exec")
     exec_parser.add_argument("prompt", nargs="?")
     _add_exec_options(exec_parser)
+    parity_parser = subparsers.add_parser("parity")
+    parity_subparsers = parity_parser.add_subparsers(dest="parity_command")
+    parity_check_parser = parity_subparsers.add_parser("check")
+    parity_check_parser.add_argument("--json", action="store_true", dest="parity_json")
+    parity_trace_parser = parity_subparsers.add_parser("trace")
+    parity_trace_parser.add_argument("jsonl", nargs="+")
+    parity_trace_parser.add_argument("--json", action="store_true", dest="parity_trace_json")
 
     args = parser.parse_args(raw_argv)
+    if args.command == "parity":
+        if args.parity_command in {None, "check"}:
+            report = run_parity_checks()
+            if getattr(args, "parity_json", False):
+                print(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True, indent=2))
+            else:
+                print(format_parity_report(report))
+            return 0 if report.ok else 1
+        if args.parity_command == "trace":
+            return _run_parity_trace(args)
+        parity_parser.print_help(sys.stderr)
+        return 2
 
     if args.command == "chat":
         return _main_chat(raw_argv[1:], prog="python -m codex chat")
@@ -112,9 +133,22 @@ def _main(argv: list[str] | None = None) -> int:
 def _should_route_to_chat(raw_argv: list[str]) -> bool:
     if not raw_argv:
         return True
-    if raw_argv[0] in {"-h", "--help", "exec"}:
+    if raw_argv[0] in {"-h", "--help", "exec", "parity"}:
         return False
     return True
+
+
+def _run_parity_trace(args: argparse.Namespace) -> int:
+    events_by_label = [(path, load_jsonl_events(path)) for path in args.jsonl]
+    if getattr(args, "parity_trace_json", False):
+        if len(events_by_label) == 2:
+            payload: dict[str, Any] = compare_exec_traces(events_by_label[0][1], events_by_label[1][1])
+        else:
+            payload = {label: summarize_exec_trace(events) for label, events in events_by_label}
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    print(format_trace_report(events_by_label))
+    return 0
 
 
 def _main_exec_resume(argv: list[str]) -> int:
@@ -636,13 +670,12 @@ def _interactive_model_picker(
         ]
         for i, (slug, efforts) in enumerate(rows):
             cur_eff = efforts[effort_idx[i]]
-            arrows = []
             if len(efforts) > 1:
-                arrows.append("◂" if effort_idx[i] > 0 else " ")
-                arrows.append("▸" if effort_idx[i] < len(efforts) - 1 else " ")
+                left = "◂" if effort_idx[i] > 0 else " "
+                right = "▸" if effort_idx[i] < len(efforts) - 1 else " "
+                eff_part = f"{left} {cur_eff} {right}"
             else:
-                arrows = [" ", " "]
-            eff_part = f"{arrows[0]} {cur_eff} {arrows[1]}" if len(efforts) > 1 else f"  {cur_eff}  "
+                eff_part = f"  {cur_eff}  "
             marker = "*" if slug == current_model else " "
             line = f"  {marker} {slug:<20} {eff_part}"
             if i == selected:
@@ -2244,7 +2277,7 @@ def _format_rollout_picker_item(path: Path) -> str:
 
 
 def _read_init_command_prompt() -> str:
-    path = Path(__file__).resolve().parent / "upstream" / "openai-codex" / "codex-rs" / "tui" / "prompt_for_init_command.md"
+    path = Path(__file__).resolve().parent / "assets" / "prompts" / "init_command.md"
     return path.read_text(encoding="utf-8")
 
 
