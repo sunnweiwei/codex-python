@@ -1,0 +1,706 @@
+{
+  "schema_version": 1,
+  "audit_scope": "living parity manifest for pinned upstream audit status and Python runtime implementation status",
+  "module_lifecycle": {
+    "completion_policy": "A module can only move to parity when its pinned upstream refs, copied assets or schemas, request/tool surface, runtime semantics, state/event behavior, and tests are all passed or explicitly not_applicable. Partial modules must name the next gate instead of being treated as complete.",
+    "status_values": [
+      "missing",
+      "scaffold",
+      "partial",
+      "complete",
+      "parity",
+      "blocked"
+    ],
+    "gate_status_values": [
+      "blocked",
+      "failed",
+      "missing",
+      "not_applicable",
+      "out_of_scope",
+      "partial",
+      "passed",
+      "passed_static",
+      "scaffold"
+    ],
+    "modules": {
+      "pinned_upstream": {
+        "status": "parity",
+        "owner_files": [
+          "codex/prompts.py",
+          "codex/parity.py",
+          "codex/parity_manifest.json"
+        ],
+        "upstream_refs": [
+          "git rev-parse HEAD at codex/upstream/openai-codex"
+        ],
+        "gates": {
+          "commit_locked": "passed",
+          "machine_check": "passed"
+        },
+        "next_gate": "Keep pinned commit fixed until the user explicitly asks to rebase."
+      },
+      "package_layout": {
+        "status": "complete",
+        "owner_files": [
+          "codex",
+          "tests"
+        ],
+        "upstream_refs": [
+          "public python package requirement from this port"
+        ],
+        "gates": {
+          "lowercase_package": "passed",
+          "uppercase_removed": "passed_static",
+          "tests": "passed"
+        },
+        "next_gate": "No further layout work unless new modules are added."
+      },
+      "parity_framework": {
+        "status": "complete",
+        "owner_files": [
+          "codex/parity.py",
+          "codex/cli.py",
+          "codex/PARITY_AUDIT.md",
+          "codex/parity_manifest.json"
+        ],
+        "upstream_refs": [
+          "codex/upstream/openai-codex"
+        ],
+        "gates": {
+          "manifest_lifecycle": "passed",
+          "cli_check": "passed_static",
+          "audit_coverage": "passed_static",
+          "module_status_policy": "passed"
+        },
+        "next_gate": "Each future module batch must update this manifest and pass python -m codex parity check."
+      },
+      "prompt_assets": {
+        "status": "parity",
+        "owner_files": [
+          "codex/assets",
+          "codex/prompts.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/core prompt assets",
+          "codex-rs/memories prompt assets",
+          "codex-rs/core/src/tools/handlers/apply_patch.lark"
+        ],
+        "gates": {
+          "hashes": "passed",
+          "upstream_byte_compare": "passed",
+          "tests": "passed_static"
+        },
+        "next_gate": "Asset copy parity is done; prompt assembly parity is tracked separately."
+      },
+      "prompt_assembly": {
+        "status": "complete",
+        "owner_files": [
+          "codex/prompts.py",
+          "codex/core.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/core/src/client_common.rs",
+          "codex-rs/core/src/config",
+          "codex-rs/core/src/session",
+          "codex-rs/models-manager/models.json"
+        ],
+        "gates": {
+          "base_prompt": "passed_static",
+          "model_catalog_prompt": "passed_static",
+          "default_model": "passed_static",
+          "permission_snippets": "passed_static",
+          "agents_md": "passed_static",
+          "environment_context": "passed_static",
+          "memory_read_injection": "passed_static",
+          "tests": "passed"
+        },
+        "next_gate": "Default exec prompt/request contract is complete, including auto base-instruction lookup from the pinned upstream model catalog; conditional apps/skills/plugins/realtime fragments remain tracked outside this module."
+      },
+      "request_shape": {
+        "status": "partial",
+        "owner_files": [
+          "codex/types.py",
+          "codex/model.py",
+          "codex/core.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/core/src/client.rs",
+          "codex-rs/core/src/client_common.rs"
+        ],
+        "gates": {
+          "responses_api_core_fields": "passed_static",
+          "tool_choice_store_stream": "passed_static",
+          "reasoning_include": "passed_static",
+          "model_catalog_reasoning_summary_default": "passed_static",
+          "model_catalog_default_verbosity": "passed_static",
+          "model_catalog_parallel_tool_calls": "passed_static",
+          "context_manager_call_output_normalization": "passed_static",
+          "context_manager_image_modality_normalization": "passed_static",
+          "context_manager_tool_output_truncation": "passed_static",
+          "model_catalog_default_reasoning_effort": "passed_static",
+          "local_official_codex_config_loading": "passed_static",
+          "provider_metadata": "passed_static",
+          "followup_response_item_sanitization": "passed_static",
+          "event_mapping": "not_applicable",
+          "tests": "passed"
+        },
+        "next_gate": "Core Responses request fields, follow-up item serialization, model-catalog reasoning effort/summary defaults, verbosity defaults, model-catalog parallel tool-call defaults, official-home config loading, and ContextManager-style prompt history normalization are covered. Remaining request-shape gaps are websocket/remote compaction transport fields tracked by later modules."
+      },
+      "tool_surface": {
+        "status": "complete",
+        "owner_files": [
+          "codex/tools.py",
+          "codex/parity_manifest.json"
+        ],
+        "upstream_refs": [
+          "codex-rs/core/src/tools/spec_plan.rs",
+          "codex-rs/core/src/tools/hosted_spec.rs",
+          "codex-rs/core/tests/suite/prompt_caching.rs"
+        ],
+        "gates": {
+          "default_non_windows_names": "passed",
+          "default_windows_names": "passed_static",
+          "invalid_search_files_removed": "passed",
+          "conditional_tools_classified": "passed_static",
+          "tests": "passed_static"
+        },
+        "next_gate": "Tool name surface is fixed; runtime semantics remain a separate module."
+      },
+      "tool_runtime": {
+        "status": "partial",
+        "owner_files": [
+          "codex/tools.py",
+          "codex/core.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/tools/src",
+          "codex-rs/core/src/tools/handlers",
+          "codex-rs/core/src/exec_command"
+        ],
+        "gates": {
+          "exec_command_response_text": "passed_static",
+          "exec_command_yield_bounds": "passed_static",
+          "exec_command_tty_stdin": "passed_static",
+          "exec_command_byte_output_capture": "passed_static",
+          "exec_command_escalation_rejection": "passed_static",
+          "exec_command_approval_provider": "passed_static",
+          "exec_command_sandbox_approval": "passed_static",
+          "exec_command_sandbox_denial_retry": "passed_static",
+          "approval_cache": "passed_static",
+          "permission_request_hook_events": "passed_static",
+          "platform_sandbox_metadata": "passed_static",
+          "macos_seatbelt_argv_transform": "passed_static",
+          "exec_command_real_pty": "passed_static",
+          "write_stdin_response_text": "passed_static",
+          "write_stdin_terminal_interaction": "passed_static",
+          "apply_patch_freeform_runtime": "passed_static",
+          "apply_patch_overwrite_move_verification": "passed_static",
+          "apply_patch_workspace_write_bounds": "passed_static",
+          "apply_patch_change_metadata": "passed_static",
+          "apply_patch_turn_diff_tracker": "passed_static",
+          "apply_patch_runtime_committed_delta": "passed_static",
+          "apply_patch_shell_heredoc_normalization": "passed_static",
+          "apply_patch_safety_approval": "passed_static",
+          "update_plan_output": "passed_static",
+          "update_plan_plan_mode_rejection": "passed_static",
+          "view_image_data_url_output": "passed_static",
+          "view_image_resize_and_detail": "passed_static",
+          "view_image_model_modality_gating": "passed_static",
+          "request_user_input": "partial",
+          "request_user_input_provider": "passed_static",
+          "request_user_input_local_cli_provider": "passed_static",
+          "multi_agent_runtime": "partial",
+          "parallel_tool_dispatch": "passed_static",
+          "parallel_tool_drain_order": "passed_static",
+          "tests": "passed"
+        },
+        "next_gate": "Unified exec/write_stdin/update_plan, local freeform apply_patch, apply_patch workspace-write path bounds/change metadata/turn-diff tracking/partial-failure committed deltas/shell-heredoc normalization, provider-backed sandbox/default approvals, permission-request hook events, session approval cache, on-failure sandbox-denial retry, macOS seatbelt argv transformation/metadata, view_image processing/catalog gating, request_user_input provider flow plus local CLI answer bridge, local multi-agent v1, and ordered parallel tool dispatch/drain are closer to upstream; remaining gates are full platform sandbox enforcement on every supported OS/environment, complete apply_patch hook/verification semantics, and exact ratatui/app-server request_user_input overlay replay/resolution semantics."
+      },
+      "hosted_tools": {
+        "status": "partial",
+        "owner_files": [
+          "codex/tools.py",
+          "codex/core.py",
+          "codex/model.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/core/src/tools/hosted_spec.rs"
+        ],
+        "gates": {
+          "web_search_spec": "passed_static",
+          "web_search_history": "passed_static",
+          "web_search_config_profile_mode": "passed_static",
+          "image_generation": "out_of_scope",
+          "tests": "passed_static"
+        },
+        "next_gate": "Web search hosted tool shape, filters, user location, context size, content types, profile/config mode loading, and history preservation are covered; remaining hosted-tool gaps are backend entitlement/capability normalization, full upstream requirement fallback, and image_generation out-of-scope support."
+      },
+      "session_lifecycle": {
+        "status": "complete",
+        "owner_files": [
+          "codex/core.py",
+          "codex/state.py",
+          "codex/types.py",
+          "codex/model.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/core/src/session",
+          "codex-rs/core/src/turn.rs",
+          "codex-rs/core/src/turn_context.rs"
+        ],
+        "gates": {
+          "lifecycle_catalog": "passed_static",
+          "initial_turn": "passed",
+          "tool_followup_loop": "passed",
+          "streaming_events": "passed",
+          "streaming_item_started_delta_completed": "passed",
+          "streaming_token_count": "passed",
+          "streaming_active_item_delta_aggregation": "passed",
+          "streaming_active_item_state_machine": "partial",
+          "turn_diff_tracking": "passed_static",
+          "plan_mode_proposed_plan_hidden_markup": "passed",
+          "plan_mode_plan_item_events": "partial",
+          "active_turn_pending_input": "passed",
+          "hook_provider_session_user_pre_post_stop_after_agent": "passed_static",
+          "hook_context_injection": "passed_static",
+          "pending_input_user_prompt_hook": "passed_static",
+          "permission_request_hook_decision": "passed_static",
+          "pre_post_compact_hooks": "passed_static",
+          "turn_aborted_marker_event": "passed",
+          "fixed_iteration_cap_default": "passed",
+          "streaming_retry": "passed_static",
+          "websocket_transport_fallback": "missing",
+          "interrupt_resume": "partial",
+          "tests": "passed"
+        },
+        "next_gate": "Default exec lifecycle now streams item started/delta/completed/token-count events, aggregates streamed active-item deltas, emits apply-patch turn_diff events, retries retryable stream failures with upstream-style stream_error diagnostics and sampling request replay, drains active-turn pending input before follow-up sampling, runs a local hook_provider for session/user/pending/pre-tool/post-tool/permission-request/pre-compact/post-compact/stop/after-agent gates with hook context injection, persists upstream-style interrupted-turn markers, strips Plan-mode proposed-plan markup from visible assistant text, and has no default fixed iteration cap while retaining an optional debug/test cap; remaining gaps are plan TurnItem streaming, websocket transport fallback, and full TUI draft-restore semantics."
+      },
+      "state_rollout": {
+        "status": "complete",
+        "owner_files": [
+          "codex/state.py",
+          "codex/core.py",
+          "codex/memory.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/core rollout/session/thread store"
+        ],
+        "gates": {
+          "upstream_rollout_item_catalog": "passed_static",
+          "upstream_rollout_path_layout": "passed_static",
+          "jsonl_write": "passed_static",
+          "session_meta_base_instructions": "passed_static",
+          "session_meta": "passed_static",
+          "turn_context_protocol_enums": "passed_static",
+          "turn_context": "passed_static",
+          "turn_context_permission_profile": "passed_static",
+          "turn_context_truncation_policy": "passed_static",
+          "response_item_persistence": "passed_static",
+          "event_msg_core_enums": "passed_static",
+          "event_msg_exec_command": "passed_static",
+          "event_msg_plan_update": "passed_static",
+          "event_msg_view_image": "passed_static",
+          "event_msg_request_user_input": "passed_static",
+          "event_msg_apply_patch": "passed_static",
+          "event_msg_apply_patch_changes": "passed_static",
+          "event_msg_web_search": "passed_static",
+          "event_msg_token_count": "passed",
+          "event_msg_persistence": "passed_static",
+          "compacted_item_persistence": "passed_static",
+          "rollout_reconstruction": "passed_static",
+          "last_message": "passed_static",
+          "resume_fork": "passed_static",
+          "memory_rollout_filter": "passed_static",
+          "tests": "passed"
+        },
+        "next_gate": "Default exec rollout persistence and reconstruction are complete; DB thread-store indexing remains outside this lightweight Python core."
+      },
+      "memory": {
+        "status": "partial",
+        "owner_files": [
+          "codex/memory.py",
+          "codex/prompts.py",
+          "codex/core.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/memories/read",
+          "codex-rs/memories/write"
+        ],
+        "gates": {
+          "feature_gate_default": "passed",
+          "read_path": "partial",
+          "phase_one_prompt_schema": "passed_static",
+          "phase_one_storage": "passed_static",
+          "phase_one_secret_redaction": "passed_static",
+          "phase_one_startup_thread_store_scan": "passed_static",
+          "phase_one_startup_source_filters": "passed_static",
+          "phase_one_startup_idle_age_filters": "passed_static",
+          "phase_one_current_thread_exclusion": "passed_static",
+          "state_store_schema": "passed_static",
+          "startup_claim_before_model": "passed_static",
+          "stage_one_job_claim": "passed_static",
+          "stage_one_job_success_failure": "passed_static",
+          "stage_one_usage_tracking": "passed_static",
+          "runtime_citation_usage_tracking": "passed_static",
+          "phase_one_retention_prune": "passed_static",
+          "extension_instruction_seed": "passed_static",
+          "phase_two_job_claim": "passed_static",
+          "phase_two_heartbeat": "passed_static",
+          "phase_two_success_failure": "passed_static",
+          "phase_two_selection_snapshot": "passed_static",
+          "explicit_startup_state_store": "passed_static",
+          "automatic_startup_scheduling": "passed_static",
+          "phase_two_input_selection": "passed_static",
+          "phase_two_workspace_sync": "passed_static",
+          "phase_two_extension_pruning": "passed_static",
+          "phase_two_workspace_diff": "partial",
+          "phase_two_session": "passed_static",
+          "explicit_phase_two_runner": "passed_static",
+          "startup_pipeline_phase_two": "passed_static",
+          "rate_limit_guard": "passed_static",
+          "external_context_pollution": "passed_static",
+          "mcp_external_context_pollution": "partial",
+          "background_jobs": "passed_static",
+          "tests": "passed_static"
+        },
+        "next_gate": "MemoryStateStore now participates in automatic root-session startup when the feature is enabled; startup can run in a detached local background task with thread-store metadata backfill, source/idle/age/current-thread filtered claims, prune, rate-limit guard, Phase 1, and Phase 2. Remaining gaps are exact spawned-agent heartbeat/completion wiring, MCP server_pollutes_memory handling, exact Rust state-runtime backfill/preview/thread-index semantics, and exact git utility semantics for Phase 2 workspace diffs."
+      },
+      "compaction": {
+        "status": "partial",
+        "owner_files": [
+          "codex/state.py",
+          "codex/core.py",
+          "codex/prompts.py",
+          "codex/model.py",
+          "codex/types.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/core/src/compact.rs",
+          "codex-rs/core/src/compact_remote.rs",
+          "codex-rs/codex-api/src/endpoint/compact.rs",
+          "codex-rs/core/templates/compact"
+        ],
+        "gates": {
+          "prompt_assets": "passed",
+          "manual_compact": "passed_static",
+          "auto_compact": "passed",
+          "pre_sampling_threshold_check": "passed",
+          "mid_turn_threshold_check": "passed",
+          "pre_sampling_before_current_input": "passed_static",
+          "last_api_usage_plus_local_items": "passed_static",
+          "token_usage_tracking": "passed",
+          "history_replacement": "passed_static",
+          "event_lifecycle": "passed_static",
+          "pre_post_compact_hooks": "passed_static",
+          "model_catalog_context_window": "passed",
+          "model_downshift_compaction": "passed",
+          "pending_incoming_estimation": "partial",
+          "image_token_estimator_adjustments": "partial",
+          "remote_compaction": "partial",
+          "remote_compaction_request_shape": "passed_static",
+          "remote_compaction_history_processing": "passed_static",
+          "remote_compaction_fallback": "passed_static",
+          "remote_compaction_v2": "missing",
+          "remote_compaction_trace_checkpoint": "missing",
+          "tests": "passed"
+        },
+        "next_gate": "Local manual/auto compaction now covers model-catalog context-window limits, streamed token usage, upstream-ordered pre-sampling compaction before current context/user input, last-API-usage-plus-local-items accounting, mid-turn follow-up compaction, previous-model downshift compaction, and pre/post compact hook gates that can inject context or abort. OpenAI-style /responses/compact remote compaction now sends the upstream endpoint payload shape, processes replacement history, and can fall back to local prompt compact in auto mode. Remaining gaps are image-specific token-estimator adjustments, websocket reset semantics, remote compaction v2, remote trace checkpoint recording, and upstream's own TODO for pending incoming context/user estimation."
+      },
+      "cli_exec": {
+        "status": "partial",
+        "owner_files": [
+          "codex/cli.py",
+          "codex/__main__.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/exec",
+          "codex-rs/tui/src/exec_cell/render.rs",
+          "codex-rs/tui/src/markdown_render.rs",
+          "codex-rs/tui/src/history_cell.rs",
+          "codex-rs/tui/src/bottom_pane/chat_composer.rs"
+        ],
+        "gates": {
+          "useful_args": "passed_static",
+          "json_events": "passed_static",
+          "human_event_renderer": "passed_static",
+          "tui_exec_cell_renderer": "partial",
+          "interactive_default_entrypoint": "passed_static",
+          "interactive_chat_repl": "partial",
+          "interactive_user_history_cell": "passed_static",
+          "interactive_composer_placeholder": "partial",
+          "interactive_basic_cursor_editing": "passed_static",
+          "interactive_line_transcript_spacing": "passed_static",
+          "interactive_bracketed_multiline_paste": "passed_static",
+          "interactive_running_turn_pending_input": "passed_static",
+          "interactive_working_status": "passed_static",
+          "interactive_context_token_status": "passed_static",
+          "interactive_session_context_carryover_status": "passed_static",
+          "interactive_session_reasoning_usage_status": "passed_static",
+          "interactive_compact_status": "passed_static",
+          "interactive_markdown_underscore_preservation": "passed_static",
+          "interactive_session_reuse": "passed_static",
+          "interactive_slash_commands": "partial",
+          "interactive_official_slash_command_catalog": "passed_static",
+          "interactive_unknown_slash_not_sent_to_model": "passed_static",
+          "interactive_unsupported_slash_not_sent_to_model": "passed_static",
+          "interactive_resume_command": "passed_static",
+          "interactive_fork_command": "passed_static",
+          "interactive_compact_result_cell": "passed_static",
+          "interactive_queued_compact_command": "passed_static",
+          "interactive_plan_command": "passed_static",
+          "interactive_inline_plan_command": "passed_static",
+          "interactive_ratatui_tui": "missing",
+          "interactive_interrupts": "partial",
+          "interactive_approval_overlay": "missing",
+          "interactive_resume_picker": "partial",
+          "interactive_fork_picker": "partial",
+          "ansi_human_renderer": "passed_static",
+          "human_cell_spacing": "passed_static",
+          "wrapped_text_continuation_indent": "passed_static",
+          "cjk_display_width_wrapping": "passed_static",
+          "agent_message_full_indent": "passed_static",
+          "work_separator": "passed_static",
+          "markdown_human_renderer": "passed_static",
+          "markdown_table_renderer": "passed_static",
+          "boxed_markdown_table_renderer": "passed_static",
+          "wrapped_markdown_table_cells": "passed_static",
+          "markdown_fence_table_unwrap": "passed_static",
+          "plan_update_history_cell": "passed_static",
+          "web_search_history_cell": "passed_static",
+          "request_user_input_history_cell": "passed_static",
+          "request_user_input_cli_prompt": "passed_static",
+          "request_user_input_arrow_selector": "passed_static",
+          "request_user_input_other_freeform": "passed_static",
+          "exec_command_continuation_gutter": "passed_static",
+          "exec_output_middle_truncation": "passed_static",
+          "reasoning_human_renderer": "passed_static",
+          "apply_patch_file_change_renderer": "passed_static",
+          "final_message_stream_dedup": "passed_static",
+          "parsed_command_metadata": "partial",
+          "trace_normalizer": "passed_static",
+          "output_last_message": "passed_static",
+          "output_schema": "passed_static",
+          "image_attachments": "passed_static",
+          "resume_explicit_rollout_path": "passed_static",
+          "resume_last_local": "passed_static",
+          "fork_explicit_rollout_path": "passed_static",
+          "oss_provider_flags": "passed_static",
+          "oss_provider_config": "passed_static",
+          "full_auto_warning": "passed_static",
+          "bypass_hook_trust_flag": "passed_static",
+          "color_flag": "passed_static",
+          "model_provider_rollout_metadata": "passed_static",
+          "config_profile_loading": "passed_static",
+          "dotted_config_overrides": "passed_static",
+          "parity_check_command": "passed_static",
+          "tests": "passed"
+        },
+        "next_gate": "Useful exec args, aliases, JSON events, non-JSON stderr progress rendering, color auto/always/never, cell spacing, active CJK-aware wrapping with continuation indentation, full-cell agent message indentation, work-before-answer separators, lightweight Markdown human rendering with upstream-style boxed/wrapped table rendering and markdown-fence table unwrapping, indented reasoning/thinking cells, upstream-style plan-update/web-search/request-user-input history cells, upstream-style apply_patch file-change blocks, final-message stream deduplication, a partial upstream TUI-style ExecCell renderer for Ran/Explored/Read/List/Search with command continuation gutters and middle output truncation, normalized trace summaries, last-message output, output schema, image attachments, config.toml profile loading, dotted -c overrides, local rollout resume/fork, OSS provider CLI/config selection, bracketed-paste-aware multiline interactive input, basic cursor editing, bottom-anchored live Working/Compacting status rows with elapsed time, API-backed context token display, logical session-context carryover across compactions, and cumulative API-backed session reasoning token usage, running-turn pending input submission, local request_user_input prompting with arrow-key option selection and Other freeform notes, an upstream-derived slash-command catalog that prevents known/unknown commands from leaking to the model, local /status, /rollout, /resume, and /fork, upstream-style /compact result rendering plus queued /compact dispatch after an active turn, /plan and /default interactive mode switching including /plan <prompt> inline submission, prompt erase-on-submit to avoid duplicate user-message echo, and a partial Esc interrupt path for local model/tool work are covered. The earlier Python curses full-screen experiment is removed from the default path because it was not an upstream-equivalent port of the ratatui product surface. Remaining CLI gaps are the real ratatui-style interactive shell: exact layout/colors, exact status row shimmer/details/timer scheduling, Shift+Tab mode cycling, full composer editing/keybindings/history search/paste placeholders/attachments, active transcript rewriting, approval overlays, full implementation of popup-backed slash commands (/model, /permissions, /mcp, /apps, /plugins, /agent, /side, /goal, /theme, /pets, etc.), exact ratatui resume/fork picker visuals, exact request_user_input overlay/replay UI including unanswered-confirmation and notes layout parity, complete model-transport cancellation parity, a full port of codex-rs/shell-command parse_command.rs, app-server/thread-store resume names, full upstream config surface/permission profiles, local OSS provider transport/readiness, upstream exit-code edge cases, and automated official Codex oracle runs for trace comparison."
+      },
+      "mcp_plugins": {
+        "status": "missing",
+        "owner_files": [
+          "codex/tools.py"
+        ],
+        "upstream_refs": [
+          "codex-rs/core MCP and plugin dynamic tool paths"
+        ],
+        "gates": {
+          "static_classification": "passed_static",
+          "runtime": "missing",
+          "tests": "missing"
+        },
+        "next_gate": "Keep out of default exec parity until core lifecycle is stable."
+      }
+    }
+  },
+  "upstream": {
+    "repository": "https://github.com/openai/codex",
+    "local_path": "codex/upstream/openai-codex",
+    "commit": "392e94e9ea756cffd89f35941e881d29b2a81a6e",
+    "license": "Apache-2.0",
+    "public_exec_core_target": true,
+    "source_refs": {
+      "tool_registry": "codex-rs/core/src/tools/spec_plan.rs",
+      "hosted_tools": "codex-rs/core/src/tools/hosted_spec.rs",
+      "default_tool_test": "codex-rs/core/tests/suite/prompt_caching.rs",
+      "responses_client": "codex-rs/core/src/client.rs",
+      "prompt_request": "codex-rs/core/src/client_common.rs",
+      "session": "codex-rs/core/src/session",
+      "compaction": "codex-rs/core/src/compact.rs",
+      "memory_read": "codex-rs/memories/read",
+      "memory_write": "codex-rs/memories/write"
+    },
+    "default_exec_tools_non_windows": [
+      "exec_command",
+      "write_stdin",
+      "update_plan",
+      "request_user_input",
+      "apply_patch",
+      "view_image",
+      "spawn_agent",
+      "send_input",
+      "resume_agent",
+      "wait_agent",
+      "close_agent",
+      "web_search"
+    ],
+    "default_exec_tools_windows": [
+      "shell_command",
+      "update_plan",
+      "request_user_input",
+      "apply_patch",
+      "view_image",
+      "spawn_agent",
+      "send_input",
+      "resume_agent",
+      "wait_agent",
+      "close_agent",
+      "web_search"
+    ],
+    "hosted_tools": [
+      {
+        "name": "web_search",
+        "status": "partial_in_python",
+        "notes": "Hosted Responses API tool emitted as web_search_call items."
+      },
+      {
+        "name": "image_generation",
+        "status": "out_of_first_exec_core_scope",
+        "notes": "Feature/config gated upstream hosted tool."
+      }
+    ],
+    "conditional_tools": [
+      "shell",
+      "local_shell",
+      "container.exec",
+      "shell_command",
+      "list_mcp_resources",
+      "list_mcp_resource_templates",
+      "read_mcp_resource",
+      "tool_search",
+      "request_permissions",
+      "request_plugin_install",
+      "get_goal",
+      "create_goal",
+      "update_goal",
+      "spawn_agents_on_csv",
+      "report_agent_job_result",
+      "send_message",
+      "followup_task",
+      "list_agents"
+    ],
+    "feature_gated_subsystems": {
+      "memory": {
+        "default_behavior": "feature_gated_upstream_default",
+            "status_in_python": "partial_read_path_citations_stage_one_rollout_loader_extractor_storage_thread_store_claim_filters_external_pollution_phase2_git_diff_consolidation_session_background_startup_and_upstream_rollout_jsonl_scaffold",
+            "read_path": "memory_summary.md developer instructions are injected only when MemoryTool and use_memories are enabled; assistant memory citations are parsed and hidden from visible text",
+        "write_path": "Phase 1 and Phase 2 prompt assets plus prompt builders are present; native Python sessions now persist upstream-shaped session_meta, turn_context, event_msg, response_item, and compacted JSONL lines; rollout JSONL can still load upstream response_item lines and legacy local item.completed lines, filter with the upstream memory persistence policy shape, retain environment context, apply upstream secret redaction, and feed the strict-schema Phase 1 extractor; Stage 1 startup backfills lightweight thread metadata, claims DB jobs with source/idle/age/current-thread filters before model extraction, and automatic root-session startup runs when the feature is enabled; web_search/tool_search external context can mark threads polluted when configured; raw_memories.md and rollout_summaries files can be rebuilt from Stage 1 records; phase2_workspace_diff.md can be rendered/written from a supplied diff or from the current memory workspace git baseline diff; Phase 2 can run through the startup pipeline or explicitly in a locked-down CodexSession; detached local background startup and rate-limit guard parity are present; full spawned-agent lifecycle, exact heartbeat behavior, and MCP-specific pollution are still partial"
+      },
+      "compaction": {
+        "default_behavior": "triggered by context/manual/remote compaction paths",
+        "status_in_python": "partial_manual_and_configured_auto_runtime",
+        "prompt_assets": [
+          "codex-rs/core/templates/compact/prompt.md",
+          "codex-rs/core/templates/compact/summary_prefix.md"
+        ]
+      },
+      "mcp_and_plugins": {
+        "default_behavior": "config/runtime dependent",
+        "status_in_python": "missing"
+      }
+    }
+  },
+  "python_current": {
+    "package_path": "codex",
+    "core_modules": {
+        "cli.py": "python -m codex exec subset with JSONL, profile/config loading, dotted -c overrides, output schema, images, local rollout resume, OSS provider flags, and last-message output",
+      "core.py": "session and follow-up tool-call loop with active-turn pending input and interrupt abort markers",
+      "model.py": "OpenAI Responses API wrapper plus scripted fake model",
+        "memory.py": "Memory rollout loader/filter, Phase 1 output schema, request builder, parser, explicit extractor, upstream secret redaction, thread-store metadata backfill and source/idle/age/current-thread filtered DB startup claims, DB-claimed startup pipeline, detached background startup task, rate-limit guard, automatic session startup hook support, Stage 1 storage file helpers, Phase 2 workspace git baseline/diff rendering, and explicit consolidation session runner",
+      "tools.py": "compact native tool registry and handlers",
+      "state.py": "in-memory history plus upstream-shaped rollout JSONL scaffold",
+      "prompts.py": "copied prompt assets, simplified base instruction assembly, and Memory read/write prompt builders",
+      "types.py": "config, lifecycle, event, result, and prompt request dataclasses",
+      "parity.py": "local parity framework checks plus official codex CLI oracle helper"
+    },
+    "tool_status": {
+      "exec_command": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Uses upstream-style response text, yield bounds, byte-level output capture, real PTY for tty=true on Unix, tty-gated stdin, approval/retry paths, macOS seatbelt argv transformation when available, and structured rollout metadata; full cross-platform sandbox orchestration remains partial."
+      },
+      "write_stdin": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Uses upstream-style response text, tty gating, terminal_interaction rollout events, and final exec_command_end when a local session exits; still local-subprocess only."
+      },
+      "search_files": {
+        "status": "removed_invalid",
+        "model_visible_by_default": false,
+        "upstream_default_non_windows": false,
+        "notes": "Not an upstream Codex default tool; removed from the runtime after initially being added by mistake."
+      },
+      "apply_patch": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Copied grammar is executable for local add/update/delete patches, including upstream overwrite, move, A/M/D summary, verify-before-write handling for predictable correctness errors, runtime committed-delta turn_diff events, shell heredoc normalization from supported exec_command invocations, configured workspace-write path bounds, plus git-diff fallback; exact approval/orchestrator hooks and full codex_apply_patch grammar/runtime semantics remain incomplete."
+      },
+      "update_plan": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Returns upstream `Plan updated`, rejects Plan mode, and persists plan_update EventMsg; richer UI plan state remains incomplete."
+      },
+      "view_image": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Validates detail, decodes images, preserves bounded PNG/JPEG/WebP bytes, resizes larger images to the upstream 2048 max dimension, returns data-url image content metadata, honors upstream model-catalog original-detail support, and returns the upstream unsupported-image-input error when configured."
+      },
+      "shell_command": {
+        "status": "conditional_partial",
+        "model_visible_by_default_non_windows": false,
+        "upstream_default_non_windows": false,
+        "notes": "No longer exposed by default on non-Windows. Full upstream shell tool type/config parity is still incomplete."
+      },
+      "request_user_input": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Schema, default unavailable-in-Default-mode handler, normalized isOther flag, local provider response path, local CLI answer bridge, and upstream-style result history cell are present. Exact ratatui overlay/app-server replay and resolution semantics remain incomplete."
+      },
+      "spawn_agent": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Model-visible schema is present and local Python subagent sessions can spawn/run in background; app-server/cloud thread management and full recursive worker semantics remain incomplete."
+      },
+      "send_input": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Model-visible schema is present and local Python subagent sessions accept queued follow-up input; true interruption semantics remain incomplete."
+      },
+      "resume_agent": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Model-visible schema is present and local closed-agent state can be reopened; app-server persistence remains incomplete."
+      },
+      "wait_agent": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Model-visible schema is present and local waits return running/completed/errored/not_found statuses."
+      },
+      "close_agent": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Model-visible schema is present and local agents can be marked shutdown; hard cancellation of running child work remains incomplete."
+      },
+      "web_search": {
+        "status": "partial",
+        "upstream_default_non_windows": true,
+        "notes": "Hosted tool spec is present with external_web_access, filters, user_location, search_context_size, search_content_types, and web_search_call items are preserved in history. Full upstream config/profile mode resolution and backend entitlement normalization remain incomplete."
+      }
+    },
+    "request_shape_status": "partial_default_exec_responses_shape_with_official_config_and_catalog_defaults",
+    "state_history_status": "complete_default_exec_rollout_resume_fork_prompt_normalization_and_turn_aborted_marker",
+    "memory_status": "partial",
+    "compaction_status": "partial"
+  }
+}
