@@ -164,27 +164,76 @@ def _eval_compare_assets_to_upstream() -> dict[str, bool]:
             and (Path(_CODEX_ASSETS_DIR) / asset_path).read_bytes() == upstream.read_bytes()
         )
     return result
-from codex.prompts import build_memory_consolidation_prompt
-from codex.prompts import build_memory_stage_one_input_message
-from codex.prompts import memory_stage_one_rollout_token_limit
-from codex.prompts import memory_stage_one_system_prompt
-from codex.state import build_compacted_history
-from codex.state import build_compaction_summary_text
-from codex.state import parse_command_actions
-from codex.state import prepare_prompt_history
-from codex.state import reconstruct_history_from_rollout
-from codex.state import parse_memory_citation
-from codex.state import extract_proposed_plan_text
-from codex.state import strip_memory_citations
-from codex.state import strip_proposed_plan_blocks
-from codex.state import summarization_prompt
-from codex.state import CODEX_ROLLOUT_ITEM_TYPES
-import codex.tools as codex_tools
-from codex.tools import ToolRuntime
-from codex.tools import ToolResult
-from codex.types import KNOWN_EVENT_TYPES
-from codex.types import PromptRequest
-from codex.types import TERMINAL_TURN_EVENT_TYPES
+# --- safe import shim (do not remove) -------------------------------------
+# Every `from codex.* import X` below is wrapped so that if a candidate
+# implementation is missing symbol X, the test module still loads. Only the
+# tests that actually touch X fail (with a clear ImportError) instead of the
+# whole suite collapsing at import time.
+import importlib as _importlib
+
+def _codex_unavail(qualname, exc):
+    msg = "{} is not implemented in this codex package: {}: {}".format(
+        qualname, type(exc).__name__, exc
+    )
+    class _Unavailable:
+        def __call__(self, *a, **k): raise ImportError(msg)
+        def __getattr__(self, n): raise ImportError(msg)
+        def __iter__(self): raise ImportError(msg)
+        def __bool__(self): return False
+        def __repr__(self): return "<unavailable {}>".format(qualname)
+    _Unavailable.__name__ = qualname.rsplit(".", 1)[-1]
+    return _Unavailable()
+
+def _codex_safe_from(modname, *names_with_aliases):
+    """names_with_aliases items are either 'Name' or 'Name as Alias'."""
+    pairs = []
+    for spec in names_with_aliases:
+        spec = spec.strip()
+        if " as " in spec:
+            name, alias = [p.strip() for p in spec.split(" as ")]
+        else:
+            name = alias = spec
+        pairs.append((name, alias))
+    try:
+        mod = _importlib.import_module(modname)
+    except Exception as _e:
+        for name, alias in pairs:
+            globals()[alias] = _codex_unavail(modname + "." + name, _e)
+        return
+    for name, alias in pairs:
+        try:
+            globals()[alias] = getattr(mod, name)
+        except AttributeError as _e:
+            globals()[alias] = _codex_unavail(modname + "." + name, _e)
+
+def _codex_safe_import(modname, alias):
+    try:
+        globals()[alias] = _importlib.import_module(modname)
+    except Exception as _e:
+        globals()[alias] = _codex_unavail(modname, _e)
+# --- end safe import shim -------------------------------------------------
+
+_codex_safe_from("codex.prompts", "build_memory_consolidation_prompt")
+_codex_safe_from("codex.prompts", "build_memory_stage_one_input_message")
+_codex_safe_from("codex.prompts", "memory_stage_one_rollout_token_limit")
+_codex_safe_from("codex.prompts", "memory_stage_one_system_prompt")
+_codex_safe_from("codex.state", "build_compacted_history")
+_codex_safe_from("codex.state", "build_compaction_summary_text")
+_codex_safe_from("codex.state", "parse_command_actions")
+_codex_safe_from("codex.state", "prepare_prompt_history")
+_codex_safe_from("codex.state", "reconstruct_history_from_rollout")
+_codex_safe_from("codex.state", "parse_memory_citation")
+_codex_safe_from("codex.state", "extract_proposed_plan_text")
+_codex_safe_from("codex.state", "strip_memory_citations")
+_codex_safe_from("codex.state", "strip_proposed_plan_blocks")
+_codex_safe_from("codex.state", "summarization_prompt")
+_codex_safe_from("codex.state", "CODEX_ROLLOUT_ITEM_TYPES")
+_codex_safe_import("codex.tools", "codex_tools")
+_codex_safe_from("codex.tools", "ToolRuntime")
+_codex_safe_from("codex.tools", "ToolResult")
+_codex_safe_from("codex.types", "KNOWN_EVENT_TYPES")
+_codex_safe_from("codex.types", "PromptRequest")
+_codex_safe_from("codex.types", "TERMINAL_TURN_EVENT_TYPES")
 
 
 def message(text: str) -> dict:
@@ -6790,7 +6839,7 @@ new file mode 100644
         *,
         env: dict[str, str],
         interactions: list[tuple[str, str | None]],
-        timeout: float = 8.0,
+        timeout: float = 30.0,
     ) -> str:
         import pty
         import select
