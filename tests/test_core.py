@@ -69,6 +69,19 @@ def _codex_safe_import(modname, alias):
         globals()[alias] = _codex_unavail(modname, _e)
 # --- end safe import shim -------------------------------------------------
 
+# --- subprocess.run default-timeout guard (do not remove) -----------------
+# A broken candidate may hang when the test launches `python -m codex ...` as
+# a subprocess (e.g. it tries to call OpenAI instead of honoring the fake-
+# responses env). Default every subprocess.run() to a generous timeout so a
+# single hung test cannot stall the whole suite.
+import subprocess as _codex_subprocess
+_codex_subprocess_run_orig = _codex_subprocess.run
+def _codex_subprocess_run(*args, **kwargs):
+    kwargs.setdefault("timeout", 30)
+    return _codex_subprocess_run_orig(*args, **kwargs)
+_codex_subprocess.run = _codex_subprocess_run
+# --- end subprocess.run guard ---------------------------------------------
+
 _codex_safe_import("codex.types", "codex_types")
 _codex_safe_from("codex", "CodexConfig", "CodexSession")
 _codex_safe_from("codex.memory", "MemoryStageOneRecord")
