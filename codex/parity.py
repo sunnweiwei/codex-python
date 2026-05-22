@@ -12,13 +12,14 @@ from typing import Any, Iterator, Sequence
 from .prompts import (
     ASSETS_DIR,
     PACKAGE_DIR,
-    PINNED_UPSTREAM_COMMIT,
     verify_asset_hashes,
 )
-from .state import UPSTREAM_ROLLOUT_ITEM_TYPES, reconstruct_history_from_rollout
+from .state import CODEX_ROLLOUT_ITEM_TYPES, reconstruct_history_from_rollout
 from .tools import ToolRuntime
 from .types import CodexConfig, KNOWN_EVENT_TYPES, TERMINAL_TURN_EVENT_TYPES
 
+
+PINNED_UPSTREAM_COMMIT = "392e94e9ea756cffd89f35941e881d29b2a81a6e"
 
 # Upstream awareness lives here (parity tool only) — the rest of the agent
 # package is upstream-agnostic. The upstream source location can be overridden
@@ -669,7 +670,7 @@ def _check_agent_lifecycle_contract() -> ParityCheckResult:
 
 def _check_rollout_item_catalog() -> ParityCheckResult:
     required = {"session_meta", "turn_context", "event_msg", "response_item", "compacted"}
-    missing = sorted(required - UPSTREAM_ROLLOUT_ITEM_TYPES)
+    missing = sorted(required - CODEX_ROLLOUT_ITEM_TYPES)
     ok = not missing
     return ParityCheckResult(
         "rollout_item_catalog",

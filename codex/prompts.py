@@ -14,7 +14,6 @@ from .types import ApprovalPolicy, CodexConfig, NetworkAccess, SandboxMode
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = PACKAGE_DIR / "assets"
-PINNED_UPSTREAM_COMMIT = "392e94e9ea756cffd89f35941e881d29b2a81a6e"
 
 ASSET_HASHES = {
     "prompts/gpt_5_codex_prompt.md": "42842be69650ae563d212695e8d3f3591534908fd8ca33b63f742daf41f88b65",
@@ -140,12 +139,11 @@ def build_base_instructions(
     memory_tool_enabled: bool = False,
     use_memories: bool = True,
 ) -> str:
-    """Return the upstream BaseInstructions.text payload.
+    """Return the base `instructions` payload for a model request.
 
     The extra keyword parameters are kept for the public Python API, but
-    upstream Codex does not mix permissions, AGENTS.md, or Memory read context
-    into the Responses `instructions` field. Those are emitted by
-    `build_initial_context_items`.
+    permissions, AGENTS.md, environment, and Memory read context are emitted
+    as initial context items instead of being mixed into `instructions`.
     """
 
     if prompt_asset and prompt_asset != "auto":

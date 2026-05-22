@@ -19,7 +19,7 @@ from .types import CodexConfig, CodexEvent, new_thread_id, new_turn_id
 
 COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000
 IMAGE_CONTENT_OMITTED_PLACEHOLDER = "image content omitted because you do not support image input"
-UPSTREAM_ROLLOUT_ITEM_TYPES = frozenset(
+CODEX_ROLLOUT_ITEM_TYPES = frozenset(
     {"session_meta", "turn_context", "event_msg", "response_item", "compacted"}
 )
 
@@ -1025,6 +1025,10 @@ def _is_contextual_user_message(item: dict[str, Any]) -> bool:
             text,
             "<hook_context>",
             "</hook_context>",
+        ) or _matches_context_fragment(
+            text,
+            "<subagent_notification>",
+            "</subagent_notification>",
         ):
             saw_context = True
             continue
@@ -1458,7 +1462,7 @@ def _tool_path(state: CodexState, value: str) -> Path:
 
 
 def parse_command_actions(command: str) -> list[dict[str, Any]]:
-    """Best-effort Python port of upstream shell-command ParsedCommand metadata."""
+    """Best-effort ParsedCommand metadata for shell transcript rendering."""
 
     stripped = _strip_leading_cd(command.strip())
     actions: list[dict[str, Any]] = []

@@ -44,8 +44,8 @@ DEFAULT_EXEC_YIELD_TIME_MS = 10_000
 DEFAULT_WRITE_STDIN_YIELD_TIME_MS = 250
 DEFAULT_MAX_OUTPUT_TOKENS = 10_000
 MAX_PROMPT_IMAGE_DIMENSION = 2048
-UPSTREAM_MODELS_JSON = Path(__file__).resolve().parent / "assets" / "models.json"
-UPSTREAM_SEATBELT_BASE_POLICY = Path(__file__).resolve().parent / "assets" / "seatbelt_base_policy.sbpl"
+MODEL_CATALOG_JSON = Path(__file__).resolve().parent / "assets" / "models.json"
+SEATBELT_BASE_POLICY = Path(__file__).resolve().parent / "assets" / "seatbelt_base_policy.sbpl"
 MACOS_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 _MODEL_CATALOG_CACHE: dict[str, dict[str, Any]] | None = None
 _PLATFORM_SANDBOX_AVAILABLE_CACHE: bool | None = None
@@ -450,22 +450,16 @@ class ToolRuntime:
 
     def request_user_input(self, arguments: Any) -> ToolResult:
         args = _expect_object(arguments)
-        questions = args.get("questions")
-        if not isinstance(questions, list) or not questions:
-            return ToolResult(False, "request_user_input requires one to three questions", {"questions": questions})
-        if len(questions) > 3:
-            return ToolResult(False, "request_user_input accepts at most three questions", {"questions": questions})
-        for question in questions:
-            if not isinstance(question, dict):
-                return ToolResult(False, "request_user_input questions must be objects", {"question": question})
-            options = question.get("options")
-            if not isinstance(options, list) or not options:
-                return ToolResult(
-                    False,
-                    "request_user_input requires non-empty options for every question",
-                    {"question": question.get("id")},
-                )
-            question["isOther"] = True
+        if self.config.agent_depth > 0:
+            return ToolResult(
+                False,
+                "request_user_input can only be used by the root thread",
+                {"agent_depth": self.config.agent_depth},
+            )
+        normalized = _normalize_request_user_input_questions(args.get("questions"))
+        if isinstance(normalized, ToolResult):
+            return normalized
+        questions = normalized
 
         if self.config.collaboration_mode not in self.config.request_user_input_available_modes:
             message = f"request_user_input is unavailable in {self.config.collaboration_mode} mode"
@@ -624,6 +618,8 @@ class ToolRuntime:
             return ToolResult(False, message, {"sandbox_permissions": sandbox_permissions})
         request = {
             "tool": tool_name,
+            "hook_tool_name": _approval_hook_tool_name(tool_name),
+            "matcher_aliases": _approval_hook_matcher_aliases(tool_name),
             "sandbox_permissions": sandbox_permissions,
             "justification": args.get("justification"),
             "prefix_rule": args.get("prefix_rule"),
@@ -762,6 +758,8 @@ class ToolRuntime:
             return None
         request = {
             "tool": tool_name,
+            "hook_tool_name": _approval_hook_tool_name(tool_name),
+            "matcher_aliases": _approval_hook_matcher_aliases(tool_name),
             "sandbox": self.config.sandbox,
             "approval_policy": self.config.approval_policy,
             "reason": None,
@@ -791,6 +789,8 @@ class ToolRuntime:
             return None
         request = {
             "tool": tool_name,
+            "hook_tool_name": _approval_hook_tool_name(tool_name),
+            "matcher_aliases": _approval_hook_matcher_aliases(tool_name),
             "sandbox_permissions": "require_escalated",
             "retry_without_sandbox": True,
             "reason": "command failed; retry without sandbox?",
@@ -836,6 +836,8 @@ class ToolRuntime:
             )
         request = {
             "tool": "apply_patch",
+            "hook_tool_name": "apply_patch",
+            "matcher_aliases": ["Write", "Edit"],
             "sandbox": self.config.sandbox,
             "sandbox_permissions": "require_escalated",
             "retry_without_sandbox": True,
@@ -912,7 +914,8 @@ class ToolRuntime:
             "model": self.config.model,
             "approval_policy": self.config.approval_policy,
             "sandbox": self.config.sandbox,
-            "tool_name": request.get("tool"),
+            "tool_name": request.get("hook_tool_name") or request.get("tool"),
+            "matcher_aliases": list(request.get("matcher_aliases") or []),
             "tool_input": dict(request),
         }
         self._record_runtime_event("hook.started", name="permission_request", request=_json_safe(hook_request))
@@ -1127,10 +1130,13 @@ def exec_command_spec() -> dict[str, Any]:
                 "cmd": {"type": "string", "description": "Shell command to execute."},
                 "workdir": {"type": "string", "description": "Optional working directory to run the command in; defaults to the turn cwd."},
                 "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
-                "tty": {"type": "boolean", "description": "Whether to allocate a TTY for the command. Defaults to false."},
-                "yield_time_ms": {"type": "number", "description": "How long to wait in milliseconds before yielding."},
-                "max_output_tokens": {"type": "number", "description": "Maximum approximate tokens to return."},
-                "login": {"type": "boolean", "description": "Whether to run the shell with login shell semantics. Defaults to true."},
+                "tty": {
+                    "type": "boolean",
+                    "description": "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process.",
+                },
+                "yield_time_ms": {"type": "number", "description": "How long to wait (in milliseconds) for output before yielding."},
+                "max_output_tokens": {"type": "number", "description": "Maximum number of tokens to return. Excess output will be truncated."},
+                "login": {"type": "boolean", "description": "Whether to run the shell with -l/-i semantics. Defaults to true."},
                 "sandbox_permissions": {"type": "string", "description": "Sandbox permissions for the command."},
                 "justification": {"type": "string", "description": "Question shown when requesting escalated execution."},
                 "prefix_rule": {"type": "array", "items": {"type": "string"}, "description": "Suggested reusable prefix rule."},
@@ -1150,9 +1156,9 @@ def write_stdin_spec() -> dict[str, Any]:
         "parameters": _object_schema(
             {
                 "session_id": {"type": "number", "description": "Identifier of the running unified exec session."},
-                "chars": {"type": "string", "description": "Bytes to write to stdin; may be empty to poll."},
-                "yield_time_ms": {"type": "number", "description": "How long to wait in milliseconds."},
-                "max_output_tokens": {"type": "number", "description": "Maximum approximate tokens to return."},
+                "chars": {"type": "string", "description": "Bytes to write to stdin (may be empty to poll)."},
+                "yield_time_ms": {"type": "number", "description": "How long to wait (in milliseconds) for output before yielding."},
+                "max_output_tokens": {"type": "number", "description": "Maximum number of tokens to return. Excess output will be truncated."},
             },
             ["session_id"],
         ),
@@ -1413,9 +1419,12 @@ def wait_agent_spec() -> dict[str, Any]:
                 "targets": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Agent ids to wait on.",
+                    "description": "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first.",
                 },
-                "timeout_ms": {"type": "number", "description": "Optional timeout in milliseconds."},
+                "timeout_ms": {
+                    "type": "number",
+                    "description": "Optional timeout in milliseconds. Defaults to 30000, min 10000, max 3600000. Prefer longer waits (minutes) to avoid busy polling.",
+                },
             },
             ["targets"],
         ),
@@ -1531,6 +1540,62 @@ def _format_allowed_modes(modes: tuple[str, ...]) -> str:
     return "modes: " + ",".join(modes)
 
 
+def _normalize_request_user_input_questions(value: Any) -> list[dict[str, Any]] | ToolResult:
+    if not isinstance(value, list) or not value:
+        return ToolResult(False, "request_user_input requires one to three questions", {"questions": value})
+    if len(value) > 3:
+        return ToolResult(False, "request_user_input accepts at most three questions", {"questions": value})
+
+    questions: list[dict[str, Any]] = []
+    for question in value:
+        if not isinstance(question, dict):
+            return ToolResult(False, "request_user_input questions must be objects", {"question": question})
+        question_id = question.get("id")
+        header = question.get("header")
+        prompt = question.get("question")
+        if not isinstance(question_id, str) or not isinstance(header, str) or not isinstance(prompt, str):
+            return ToolResult(
+                False,
+                "request_user_input questions must include string id, header, and question fields",
+                {"question": question_id},
+            )
+        options = question.get("options")
+        if not isinstance(options, list) or not options:
+            return ToolResult(
+                False,
+                "request_user_input requires non-empty options for every question",
+                {"question": question_id},
+            )
+        normalized_options: list[dict[str, str]] = []
+        for option in options:
+            if not isinstance(option, dict):
+                return ToolResult(
+                    False,
+                    "request_user_input options must be objects",
+                    {"question": question_id, "option": option},
+                )
+            label = option.get("label")
+            description = option.get("description")
+            if not isinstance(label, str) or not isinstance(description, str):
+                return ToolResult(
+                    False,
+                    "request_user_input options must include string label and description fields",
+                    {"question": question_id},
+                )
+            normalized_options.append({"label": label, "description": description})
+        questions.append(
+            {
+                "id": question_id,
+                "header": header,
+                "question": prompt,
+                "isOther": True,
+                "isSecret": bool(question.get("isSecret", False)),
+                "options": normalized_options,
+            }
+        )
+    return questions
+
+
 def _expect_object(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         try:
@@ -1589,6 +1654,18 @@ def _approval_decision_for_session(decision: Any) -> bool:
 def _approval_cache_key(tool_name: str, *parts: Any) -> str:
     payload = [tool_name, *[str(part) for part in parts]]
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _approval_hook_tool_name(tool_name: str) -> str:
+    if tool_name in {"exec_command", "shell_command"}:
+        return "Bash"
+    return tool_name
+
+
+def _approval_hook_matcher_aliases(tool_name: str) -> list[str]:
+    if tool_name == "apply_patch":
+        return ["Write", "Edit"]
+    return []
 
 
 def _redacted_approval_request(request: dict[str, Any]) -> dict[str, Any]:
@@ -1767,7 +1844,7 @@ def _platform_sandbox_available() -> bool:
 
 def _macos_seatbelt_policy(config: CodexConfig, *, cwd: Path, workdir: Path) -> str:
     try:
-        base_policy = UPSTREAM_SEATBELT_BASE_POLICY.read_text(encoding="utf-8")
+        base_policy = SEATBELT_BASE_POLICY.read_text(encoding="utf-8")
     except OSError:
         base_policy = "(version 1)\n(deny default)\n(allow process-exec)\n(allow process-fork)\n"
     sections = [base_policy, "; allow read-only file operations\n(allow file-read*)"]
@@ -1912,7 +1989,7 @@ def _model_catalog_info(model: str) -> dict[str, Any] | None:
     if _MODEL_CATALOG_CACHE is None:
         _MODEL_CATALOG_CACHE = {}
         try:
-            data = json.loads(UPSTREAM_MODELS_JSON.read_text(encoding="utf-8"))
+            data = json.loads(MODEL_CATALOG_JSON.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             data = {}
         models = data.get("models") if isinstance(data, dict) else None

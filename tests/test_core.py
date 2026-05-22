@@ -4,6 +4,7 @@ import json
 import base64
 import io
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import tempfile
 import time
 import unittest
 
+from contextlib import redirect_stderr
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
@@ -63,8 +65,43 @@ from codex.model import collect_stream_response
 from codex.model import load_env_file
 from codex.prompts import build_base_instructions, build_environment_context, build_initial_context_items
 from codex.prompts import build_permissions_instructions, collect_agents_md
-from codex.parity import compare_assets_to_upstream
 from codex.prompts import verify_asset_hashes, read_model_catalog_instructions
+from codex.prompts import ASSETS_DIR as _CODEX_ASSETS_DIR
+
+
+# Inlined from codex.parity so codex.parity isn't part of the eval
+# surface (it's an audit/internal module — see codex-eval/SPEC.md). The
+# audit-side coverage of compare_assets_to_upstream lives in
+# tests/test_codex_parity_audit.py.
+_EVAL_UPSTREAM_ASSET_PATHS = {
+    "prompts/gpt_5_codex_prompt.md": "codex-rs/core/gpt_5_codex_prompt.md",
+    "prompts/gpt_5_2_prompt.md": "codex-rs/core/gpt_5_2_prompt.md",
+    "prompts/gpt-5.2-codex_prompt.md": "codex-rs/core/gpt-5.2-codex_prompt.md",
+    "prompts/prompt_with_apply_patch_instructions.md": "codex-rs/core/prompt_with_apply_patch_instructions.md",
+    "prompts/compact/prompt.md": "codex-rs/core/templates/compact/prompt.md",
+    "prompts/compact/summary_prefix.md": "codex-rs/core/templates/compact/summary_prefix.md",
+    "prompts/memories/read_path.md": "codex-rs/memories/read/templates/memories/read_path.md",
+    "prompts/memories/write/stage_one_system.md": "codex-rs/memories/write/templates/memories/stage_one_system.md",
+    "prompts/memories/write/stage_one_input.md": "codex-rs/memories/write/templates/memories/stage_one_input.md",
+    "prompts/memories/write/consolidation.md": "codex-rs/memories/write/templates/memories/consolidation.md",
+    "prompts/memories/write/extensions/ad_hoc/instructions.md": "codex-rs/memories/write/templates/extensions/ad_hoc/instructions.md",
+    "grammars/apply_patch.lark": "codex-rs/core/src/tools/handlers/apply_patch.lark",
+}
+
+
+def _eval_compare_assets_to_upstream() -> dict[str, bool]:
+    upstream_env = os.environ.get("CODEX_UPSTREAM_DIR")
+    upstream_dir = Path(upstream_env).expanduser() if upstream_env else (
+        Path(_CODEX_ASSETS_DIR).parent / "upstream" / "openai-codex"
+    )
+    result: dict[str, bool] = {}
+    for asset_path, upstream_path in _EVAL_UPSTREAM_ASSET_PATHS.items():
+        upstream = upstream_dir / upstream_path
+        result[asset_path] = (
+            upstream.exists()
+            and (Path(_CODEX_ASSETS_DIR) / asset_path).read_bytes() == upstream.read_bytes()
+        )
+    return result
 from codex.prompts import build_memory_consolidation_prompt
 from codex.prompts import build_memory_stage_one_input_message
 from codex.prompts import memory_stage_one_rollout_token_limit
@@ -79,7 +116,7 @@ from codex.state import extract_proposed_plan_text
 from codex.state import strip_memory_citations
 from codex.state import strip_proposed_plan_blocks
 from codex.state import summarization_prompt
-from codex.state import UPSTREAM_ROLLOUT_ITEM_TYPES
+from codex.state import CODEX_ROLLOUT_ITEM_TYPES
 import codex.tools as codex_tools
 from codex.tools import ToolRuntime
 from codex.tools import ToolResult
@@ -204,7 +241,7 @@ def _plain_terminal_output(text: str) -> str:
 class CodexCoreTests(unittest.TestCase):
     def test_prompt_assets_match_manifest(self) -> None:
         self.assertTrue(all(verify_asset_hashes().values()))
-        self.assertTrue(all(compare_assets_to_upstream().values()))
+        self.assertTrue(all(_eval_compare_assets_to_upstream().values()))
 
     def test_core_tool_schema_names(self) -> None:
         runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True))
@@ -296,6 +333,7 @@ class CodexCoreTests(unittest.TestCase):
     def test_request_user_input_provider_returns_upstream_response_shape(self) -> None:
         def provider(questions: list[dict]) -> dict:
             self.assertTrue(questions[0]["isOther"])
+            self.assertFalse(questions[0]["isSecret"])
             return {"answers": {"choice": {"answers": ["A"]}}}
 
         runtime = ToolRuntime(
@@ -304,6 +342,32 @@ class CodexCoreTests(unittest.TestCase):
                 ephemeral=True,
                 collaboration_mode="Plan",
                 request_user_input_provider=provider,
+            )
+        )
+        arguments = {
+            "questions": [
+                {
+                    "id": "choice",
+                    "header": "Choice",
+                    "question": "Pick one.",
+                    "options": [{"label": "A (Recommended)", "description": "Choose A."}],
+                }
+            ]
+        }
+        result = runtime.request_user_input(arguments)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(json.loads(result.output), {"answers": {"choice": {"answers": ["A"]}}})
+        self.assertNotIn("isOther", arguments["questions"][0])
+
+    def test_request_user_input_is_root_thread_only(self) -> None:
+        runtime = ToolRuntime(
+            CodexConfig(
+                skip_git_repo_check=True,
+                ephemeral=True,
+                collaboration_mode="Plan",
+                agent_depth=1,
+                request_user_input_answers={"choice": {"answers": ["A"]}},
             )
         )
         result = runtime.request_user_input(
@@ -318,9 +382,8 @@ class CodexCoreTests(unittest.TestCase):
                 ]
             }
         )
-
-        self.assertTrue(result.ok)
-        self.assertEqual(json.loads(result.output), {"answers": {"choice": {"answers": ["A"]}}})
+        self.assertFalse(result.ok)
+        self.assertIn("root thread", result.output)
 
     def test_update_plan_output_and_plan_mode_rejection_match_upstream_handler(self) -> None:
         runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True))
@@ -399,6 +462,15 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(spawn_output["nickname"], "worker")
         self.assertEqual(wait_output["status"][spawn_output["agent_id"]], {"completed": "child done"})
         self.assertFalse(wait_output["timed_out"])
+        notification_texts = [
+            part["text"]
+            for item in result.history
+            if item.get("type") == "message" and item.get("role") == "user"
+            for part in item.get("content", [])
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        self.assertTrue(any("<subagent_notification>" in text for text in notification_texts))
+        self.assertTrue(any('"status":{"completed":"child done"}' in text for text in notification_texts))
 
     def test_local_multi_agent_send_resume_and_close(self) -> None:
         session = CodexSession(
@@ -420,6 +492,129 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(closed["previous_status"], {"completed": "second child"})
         resumed = json.loads(session.tools.resume_agent({"id": agent_id}).output)
         self.assertEqual(resumed["status"], {"completed": "second child"})
+
+    def test_local_multi_agent_interrupts_running_child_for_send_input(self) -> None:
+        sleep_command = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'"
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=ScriptedResponsesModel(
+                [
+                    {
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "name": "exec_command",
+                                "call_id": "sleep-1",
+                                "arguments": json.dumps({"cmd": sleep_command, "yield_time_ms": 30000}),
+                            }
+                        ]
+                    },
+                    message("second child"),
+                ]
+            ),
+        )
+
+        spawned = session.tools.spawn_agent({"message": "first"})
+        agent_id = json.loads(spawned.output)["agent_id"]
+        time.sleep(0.2)
+        sent = session.tools.send_input({"target": agent_id, "message": "second", "interrupt": True})
+        self.assertTrue(sent.ok)
+        second_wait = json.loads(session.tools.wait_agent({"targets": [agent_id], "timeout_ms": 10000}).output)
+        self.assertEqual(second_wait["status"][agent_id], {"completed": "second child"})
+
+    def test_local_multi_agent_close_interrupts_running_child(self) -> None:
+        sleep_command = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'"
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=ScriptedResponsesModel(
+                [
+                    {
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "name": "exec_command",
+                                "call_id": "sleep-1",
+                                "arguments": json.dumps({"cmd": sleep_command, "yield_time_ms": 30000}),
+                            }
+                        ]
+                    }
+                ]
+            ),
+        )
+
+        spawned = session.tools.spawn_agent({"message": "first"})
+        agent_id = json.loads(spawned.output)["agent_id"]
+        time.sleep(0.2)
+        closed = json.loads(session.tools.close_agent({"target": agent_id}).output)
+        self.assertEqual(closed["previous_status"], "running")
+        wait = json.loads(session.tools.wait_agent({"targets": [agent_id], "timeout_ms": 10000}).output)
+        self.assertEqual(wait["status"][agent_id], "shutdown")
+
+    def test_local_multi_agent_wait_timeout_returns_empty_statuses(self) -> None:
+        import codex.core as core
+
+        old_min = core._MIN_AGENT_WAIT_TIMEOUT_MS
+        old_max = core._MAX_AGENT_WAIT_TIMEOUT_MS
+        core._MIN_AGENT_WAIT_TIMEOUT_MS = 1
+        core._MAX_AGENT_WAIT_TIMEOUT_MS = 10
+        try:
+            sleep_command = f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'"
+            session = CodexSession(
+                CodexConfig(skip_git_repo_check=True, ephemeral=True),
+                model_client=ScriptedResponsesModel(
+                    [
+                        {
+                            "output": [
+                                {
+                                    "type": "function_call",
+                                    "name": "exec_command",
+                                    "call_id": "sleep-1",
+                                    "arguments": json.dumps({"cmd": sleep_command, "yield_time_ms": 30000}),
+                                }
+                            ]
+                        }
+                    ]
+                ),
+            )
+            spawned = session.tools.spawn_agent({"message": "first"})
+            agent_id = json.loads(spawned.output)["agent_id"]
+            time.sleep(0.2)
+
+            wait = json.loads(session.tools.wait_agent({"targets": [agent_id], "timeout_ms": 1}).output)
+
+            self.assertEqual(wait, {"status": {}, "timed_out": True})
+            session.tools.close_agent({"target": agent_id})
+        finally:
+            core._MIN_AGENT_WAIT_TIMEOUT_MS = old_min
+            core._MAX_AGENT_WAIT_TIMEOUT_MS = old_max
+
+    def test_spawn_agent_fork_context_sanitizes_runtime_items(self) -> None:
+        model = ScriptedResponsesModel([message("child")])
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=model,
+        )
+        session.state.history = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "parent user"}]},
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call-1",
+                "arguments": json.dumps({"cmd": "pwd"}),
+            },
+            {"type": "function_call_output", "call_id": "call-1", "output": "parent tool output"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "parent final"}]},
+        ]
+
+        spawned = session.tools.spawn_agent({"message": "child", "fork_context": True})
+        agent_id = json.loads(spawned.output)["agent_id"]
+        wait = json.loads(session.tools.wait_agent({"targets": [agent_id], "timeout_ms": 10000}).output)
+        self.assertEqual(wait["status"][agent_id], {"completed": "child"})
+
+        child_input_types = [item.get("type") for item in model.requests[0].input]
+        self.assertIn("message", child_input_types)
+        self.assertNotIn("function_call", child_input_types)
+        self.assertNotIn("function_call_output", child_input_types)
 
     def test_load_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -919,6 +1114,127 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(len(tool_outputs), 1)
         self.assertIn("blocked by test hook", tool_outputs[0]["output"])
         self.assertTrue(any(event.type == "hook.completed" for event in result.events))
+
+    def test_pre_tool_use_hook_uses_bash_contract_and_can_rewrite_exec_command(self) -> None:
+        responses = [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "exec-1",
+                        "arguments": json.dumps({"cmd": "printf original"}),
+                    }
+                ]
+            },
+            message("done"),
+        ]
+        hook_calls: list[dict] = []
+
+        def hook_provider(request: dict) -> dict:
+            hook_calls.append(request)
+            if request["event"] == "pre_tool_use":
+                return {"updated_input": {"command": "printf rewritten"}}
+            return {}
+
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True, hook_provider=hook_provider),
+            model_client=ScriptedResponsesModel(responses),
+        )
+
+        result = session.run("run command")
+        pre = next(call for call in hook_calls if call["event"] == "pre_tool_use")
+        post = next(call for call in hook_calls if call["event"] == "post_tool_use")
+        tool_output = next(item for item in result.history if item.get("type") == "function_call_output")
+
+        self.assertEqual(pre["tool_name"], "Bash")
+        self.assertEqual(pre["tool_input"], {"command": "printf original"})
+        self.assertEqual(post["tool_name"], "Bash")
+        self.assertEqual(post["tool_input"], {"command": "printf rewritten"})
+        self.assertEqual(post["tool_response"], "rewritten")
+        self.assertIn("rewritten", tool_output["output"])
+        self.assertNotIn("original", tool_output["output"])
+
+    def test_apply_patch_hook_uses_command_contract_aliases_and_can_rewrite_patch(self) -> None:
+        original_patch = "*** Begin Patch\n*** Add File: a.txt\n+old\n*** End Patch"
+        rewritten_patch = "*** Begin Patch\n*** Add File: b.txt\n+new\n*** End Patch"
+        responses = [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "apply_patch",
+                        "call_id": "patch-1",
+                        "arguments": original_patch,
+                    }
+                ]
+            },
+            message("patched"),
+        ]
+        hook_calls: list[dict] = []
+
+        def hook_provider(request: dict) -> dict:
+            hook_calls.append(request)
+            if request["event"] == "pre_tool_use":
+                return {"updated_input": {"command": rewritten_patch}}
+            return {}
+
+        with tempfile.TemporaryDirectory() as temp:
+            session = CodexSession(
+                CodexConfig(
+                    cwd=Path(temp),
+                    skip_git_repo_check=True,
+                    ephemeral=True,
+                    hook_provider=hook_provider,
+                ),
+                model_client=ScriptedResponsesModel(responses),
+            )
+            result = session.run("patch file")
+
+            self.assertFalse((Path(temp) / "a.txt").exists())
+            self.assertEqual((Path(temp) / "b.txt").read_text(encoding="utf-8"), "new\n")
+
+        pre = next(call for call in hook_calls if call["event"] == "pre_tool_use")
+        post = next(call for call in hook_calls if call["event"] == "post_tool_use")
+        self.assertEqual(pre["tool_name"], "apply_patch")
+        self.assertEqual(pre["matcher_aliases"], ["Write", "Edit"])
+        self.assertEqual(pre["tool_input"], {"command": original_patch})
+        self.assertEqual(post["tool_name"], "apply_patch")
+        self.assertEqual(post["matcher_aliases"], ["Write", "Edit"])
+        self.assertEqual(post["tool_input"], {"command": rewritten_patch})
+        self.assertEqual(post["tool_response"], "Success. Updated the following files:\nA b.txt\n")
+        self.assertEqual(result.final_message, "patched")
+
+    def test_pre_post_tool_hooks_only_run_for_upstream_handlers_with_payloads(self) -> None:
+        responses = [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "update_plan",
+                        "call_id": "plan-1",
+                        "arguments": json.dumps({"plan": [{"step": "Inspect", "status": "in_progress"}]}),
+                    }
+                ]
+            },
+            message("done"),
+        ]
+        hook_events: list[str] = []
+
+        def hook_provider(request: dict) -> dict:
+            if request["event"] in {"pre_tool_use", "post_tool_use"}:
+                hook_events.append(request["event"])
+            return {}
+
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True, hook_provider=hook_provider),
+            model_client=ScriptedResponsesModel(responses),
+        )
+
+        result = session.run("plan")
+
+        self.assertEqual(result.final_message, "done")
+        self.assertEqual(hook_events, [])
 
     def test_permission_request_hook_events_are_emitted_during_tool_approval(self) -> None:
         responses = [
@@ -3379,7 +3695,7 @@ class CodexCoreTests(unittest.TestCase):
                 str(rollout_path.relative_to(codex_home)),
                 rf"^sessions/\d{{4}}/\d{{2}}/\d{{2}}/rollout-\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}-\d{{2}}-\d{{2}}-{result.thread_id}\.jsonl$",
             )
-            self.assertTrue(set(record_types) <= UPSTREAM_ROLLOUT_ITEM_TYPES)
+            self.assertTrue(set(record_types) <= CODEX_ROLLOUT_ITEM_TYPES)
             self.assertIn("turn_context", record_types)
             self.assertIn("response_item", record_types)
             self.assertIn("event_msg", record_types)
@@ -4325,11 +4641,34 @@ new file mode 100644
             "\"import os,sys; print(str(os.isatty(0))+' '+str(os.isatty(1)), flush=True); "
             "print('got:'+sys.stdin.readline().strip(), flush=True)\""
         )
-        first = runtime.exec_command({"cmd": command, "tty": True, "yield_time_ms": 250})
+        first = runtime.exec_command({"cmd": command, "tty": True, "yield_time_ms": 1000})
         self.assertIn("True True", first.output)
 
         second = runtime.write_stdin({"session_id": first.metadata["session_id"], "chars": "hello\n", "yield_time_ms": 1500})
         self.assertIn("got:hello", second.output)
+
+    @unittest.skipIf(sys.platform == "win32", "PTY semantics are not used by the Windows shell_command path")
+    def test_exec_command_tty_handles_sleep_then_input(self) -> None:
+        runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True))
+        command = (
+            f"{sys.executable!r} -c "
+            "\"import time; print('program started; sleeping 0.2s...', flush=True); "
+            "time.sleep(0.2); text = input('please input a sentence: '); "
+            "print('completed; got:', text, flush=True)\""
+        )
+        first = runtime.exec_command({"cmd": command, "tty": True, "yield_time_ms": 100})
+        self.assertIn("session_id", first.metadata)
+
+        second = runtime.write_stdin(
+            {
+                "session_id": first.metadata["session_id"],
+                "chars": "这是一句从 Codex 写入的测试输入。\n",
+                "yield_time_ms": 1500,
+            }
+        )
+
+        self.assertIn("please input a sentence:", second.output)
+        self.assertIn("completed; got: 这是一句从 Codex 写入的测试输入。", second.output)
 
     def test_write_stdin_requires_tty_for_non_empty_input(self) -> None:
         runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True))
@@ -4480,7 +4819,8 @@ new file mode 100644
         self.assertTrue(result.ok)
         self.assertIn("hook-approved", result.output)
         self.assertEqual(hooks[0]["event"], "permission_request")
-        self.assertEqual(hooks[0]["tool_name"], "exec_command")
+        self.assertEqual(hooks[0]["tool_name"], "Bash")
+        self.assertEqual(hooks[0]["tool_input"]["tool"], "exec_command")
 
     def test_exec_command_stops_when_approval_provider_denies_escalation(self) -> None:
         runtime = ToolRuntime(
@@ -4929,6 +5269,41 @@ new file mode 100644
         self.assertIn("\033[1m重点\033[0m", completed.stderr)
         self.assertIn("\033[36mcode\033[0m", completed.stderr)
         self.assertIn("\033[1m结果\033[0m", completed.stderr)
+
+    def test_cli_markdown_code_fences_use_syntax_highlighting_and_info_token(self) -> None:
+        import codex.cli as cli
+        from codex.cli import _ANSI_RE
+        from codex.cli import _AnsiStyle
+        from codex.cli import _render_markdown_for_terminal
+
+        old_theme = cli._CLI_SYNTAX_THEME
+        try:
+            self.assertTrue(cli._set_cli_syntax_theme("monokai-extended"))
+            self.assertEqual(cli._pygments_style_name(), "monokai")
+            rendered = _render_markdown_for_terminal(
+                "```python title=\"demo\"\ndef hello():\n    return 'ok'\n```",
+                _AnsiStyle(True),
+                terminal_width=80,
+            )
+            joined = "\n".join(rendered)
+            plain = _ANSI_RE.sub("", joined)
+        finally:
+            cli._CLI_SYNTAX_THEME = old_theme
+
+        self.assertNotIn("```", plain)
+        self.assertIn("def hello", plain)
+        self.assertIn("return 'ok'", plain)
+        self.assertRegex(joined, r"\x1b\[[0-9;]*m")
+
+    def test_cli_ansi_wrapping_preserves_color_boundaries(self) -> None:
+        from codex.cli import _ANSI_RE, _visible_len, _wrap_ansi_line
+
+        wrapped = _wrap_ansi_line("\033[31m" + ("x" * 24) + "\033[0m", 8)
+
+        self.assertEqual([_visible_len(line) for line in wrapped], [8, 8, 8])
+        self.assertTrue(all(line.startswith("\033[31m") for line in wrapped))
+        self.assertTrue(all(line.endswith("\033[0m") for line in wrapped))
+        self.assertEqual(_ANSI_RE.sub("", "".join(wrapped)), "x" * 24)
 
     def test_cli_human_output_preserves_intraword_underscores(self) -> None:
         env = {
@@ -6096,14 +6471,14 @@ new file mode 100644
             ],
             env=env,
             interactions=[
-                ("/permissions\r", "recognized from upstream Codex"),
+                ("/permissions\r", "recognized as a Codex command"),
                 ("/exit\r", None),
             ],
             timeout=10.0,
         )
         plain = _plain_terminal_output(output)
 
-        self.assertIn("'/permissions' is recognized from upstream Codex", plain)
+        self.assertIn("'/permissions' is recognized as a Codex command", plain)
         self.assertNotIn("model should not be called", plain)
 
     def test_cli_tty_unknown_slash_command_is_not_sent_to_model(self) -> None:
@@ -6795,7 +7170,8 @@ model_reasoning_effort = "low"
             ).run("saved")
             current = CodexSession(config, model_client=ScriptedResponsesModel([]))
 
-            resumed = cli._handle_interactive_slash_command(current, "/resume --last")
+            with redirect_stderr(io.StringIO()):
+                resumed = cli._handle_interactive_slash_command(current, "/resume --last")
 
             self.assertTrue(resumed.handled)
             self.assertIsNotNone(resumed.session)
@@ -6810,7 +7186,8 @@ model_reasoning_effort = "low"
                 ["saved answer"],
             )
 
-            forked = cli._handle_interactive_slash_command(resumed.session, "/fork")
+            with redirect_stderr(io.StringIO()):
+                forked = cli._handle_interactive_slash_command(resumed.session, "/fork")
 
             self.assertTrue(forked.handled)
             self.assertIsNotNone(forked.session)
@@ -6818,6 +7195,275 @@ model_reasoning_effort = "low"
             self.assertNotEqual(forked.session.state.thread_id, first.thread_id)
             self.assertEqual(forked.session.state.forked_from_id, first.thread_id)
             self.assertEqual(forked.session.state.history, resumed.session.state.history)
+
+    def test_interactive_new_and_clear_start_fresh_chat_session(self) -> None:
+        from codex import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = CodexConfig(cwd=root, skip_git_repo_check=True, ephemeral=True)
+            current = CodexSession(
+                config,
+                model_client=ScriptedResponsesModel([message("old answer")]),
+            )
+            current.run("old prompt")
+
+            with redirect_stderr(io.StringIO()):
+                new_result = cli._handle_interactive_slash_command(current, "/new")
+
+            self.assertTrue(new_result.handled)
+            self.assertIsNotNone(new_result.session)
+            assert new_result.session is not None
+            self.assertNotEqual(new_result.session.state.thread_id, current.state.thread_id)
+            self.assertEqual(new_result.session.state.history, [])
+            self.assertIs(new_result.session.model_client, current.model_client)
+
+            with redirect_stderr(io.StringIO()):
+                clear_result = cli._handle_interactive_slash_command(current, "/clear")
+
+            self.assertTrue(clear_result.handled)
+            self.assertIsNotNone(clear_result.session)
+            assert clear_result.session is not None
+            self.assertNotEqual(clear_result.session.state.thread_id, current.state.thread_id)
+            self.assertEqual(clear_result.session.state.history, [])
+
+    def test_interactive_ps_and_stop_manage_background_terminals(self) -> None:
+        from codex import cli
+
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=ScriptedResponsesModel([]),
+        )
+        command = f"{sys.executable!r} -c \"import time; time.sleep(5)\""
+        result = session.tools.exec_command({"cmd": command, "yield_time_ms": 10})
+        self.assertTrue(result.ok)
+        self.assertIn("session_id", result.metadata)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            ps_result = cli._handle_interactive_slash_command(session, "/ps")
+
+        self.assertTrue(ps_result.handled)
+        self.assertIn("Background terminals:", stderr.getvalue())
+        self.assertIn(str(result.metadata["session_id"]), stderr.getvalue())
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            stop_result = cli._handle_interactive_slash_command(session, "/stop")
+
+        self.assertTrue(stop_result.handled)
+        self.assertIn("Stopped 1 background terminal", stderr.getvalue())
+        self.assertEqual(cli._background_terminal_rows(session), [])
+
+    def test_cli_top_level_help_lists_resume_and_fork(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-m", "codex", "--help"],
+            text=True,
+            capture_output=True,
+            env={**os.environ, "PYTHONPATH": os.getcwd()},
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("resume", completed.stdout)
+        self.assertIn("fork", completed.stdout)
+
+    def test_rollout_picker_rows_use_first_user_message_preview_and_upstream_controls(self) -> None:
+        from codex import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            config = CodexConfig(
+                cwd=root,
+                codex_home=codex_home,
+                skip_git_repo_check=True,
+                ephemeral=False,
+            )
+            first = CodexSession(
+                config,
+                model_client=ScriptedResponsesModel([message("saved answer")]),
+            ).run("first saved prompt\nwith detail")
+
+            rows = cli._rollout_picker_rows(config)
+            row = next(item for item in rows if item.thread_id == first.thread_id)
+            self.assertEqual(row.preview, "first saved prompt with detail")
+
+            lines = cli._rollout_picker_display_lines(
+                [row],
+                title="Resume a previous session",
+                style=cli._AnsiStyle(False),
+                cwd=root,
+                show_all=False,
+                query="",
+                sort_key="updated",
+                selected=0,
+                offset=0,
+                density="comfortable",
+                toolbar_focus="filter",
+                expanded=True,
+            )
+            rendered = "\n".join(lines)
+            self.assertIn("Resume a previous session", rendered)
+            self.assertIn("Type to search", rendered)
+            self.assertIn("Filter:[Cwd]", rendered)
+            self.assertIn("Sort:[Updated]", rendered)
+            self.assertIn("❯ first saved prompt with detail", rendered)
+            self.assertIn("id: " + first.thread_id, rendered)
+            self.assertIn("enter resume", rendered)
+            self.assertIn("ctrl+o dense/comfortable", rendered)
+
+            many_rows = [
+                cli._RolloutPickerRow(
+                    path=root / f"rollout-{index}.jsonl",
+                    preview=f"session preview {index}",
+                    thread_id=f"thread-{index}",
+                    created_at=time.time() - index,
+                    updated_at=time.time() - index,
+                    cwd=str(root),
+                )
+                for index in range(30)
+            ]
+            many_lines = cli._rollout_picker_display_lines(
+                many_rows,
+                title="Resume a previous session",
+                style=cli._AnsiStyle(False),
+                cwd=root,
+                show_all=False,
+                query="",
+                sort_key="updated",
+                selected=0,
+                offset=0,
+                density="comfortable",
+                toolbar_focus="filter",
+                expanded=False,
+            )
+            many_rendered = "\n".join(many_lines)
+            self.assertIn("session preview 0", many_rendered)
+            self.assertIn("↓", many_rendered)
+            self.assertNotIn("session preview 29", many_rendered)
+
+    def test_cli_tty_top_level_resume_opens_picker_and_enters_chat(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            config = CodexConfig(
+                cwd=root,
+                codex_home=codex_home,
+                skip_git_repo_check=True,
+                ephemeral=False,
+            )
+            CodexSession(
+                config,
+                model_client=ScriptedResponsesModel([message("saved answer")]),
+            ).run("resume picker prompt")
+            env = {
+                **os.environ,
+                "TERM": "xterm-256color",
+                "CODEX_HOME": str(codex_home),
+                "PYTHONPATH": os.getcwd(),
+            }
+
+            output = self._run_cli_pty(
+                [
+                    sys.executable,
+                    "-m",
+                    "codex",
+                    "resume",
+                    "-C",
+                    str(root),
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                ],
+                env=env,
+                interactions=[
+                    ("", "resume picker prompt"),
+                    ("\r", "› "),
+                    ("/exit\r", None),
+                ],
+                timeout=10.0,
+            )
+            plain = _plain_terminal_output(output)
+
+            self.assertIn("Resume a previous session", plain)
+            self.assertIn("resume picker prompt", plain)
+            self.assertIn("saved answer", plain)
+            self.assertIn("Filter:[Cwd]", plain)
+            self.assertIn("Sort:[Updated]", plain)
+            self.assertNotIn("Select a chat number", plain)
+
+    def test_cli_tty_top_level_fork_uses_same_picker_surface(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            config = CodexConfig(
+                cwd=root,
+                codex_home=codex_home,
+                skip_git_repo_check=True,
+                ephemeral=False,
+            )
+            CodexSession(
+                config,
+                model_client=ScriptedResponsesModel([message("fork source answer")]),
+            ).run("fork picker prompt")
+            env = {
+                **os.environ,
+                "TERM": "xterm-256color",
+                "CODEX_HOME": str(codex_home),
+                "PYTHONPATH": os.getcwd(),
+            }
+
+            output = self._run_cli_pty(
+                [
+                    sys.executable,
+                    "-m",
+                    "codex",
+                    "fork",
+                    "-C",
+                    str(root),
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                ],
+                env=env,
+                interactions=[
+                    ("", "fork picker prompt"),
+                    ("\r", "› "),
+                    ("/exit\r", None),
+                ],
+                timeout=10.0,
+            )
+            plain = _plain_terminal_output(output)
+
+            self.assertIn("Fork a previous session", plain)
+            self.assertIn("fork picker prompt", plain)
+            self.assertIn("fork source answer", plain)
+            self.assertIn("Filter:[Cwd]", plain)
+            self.assertIn("Sort:[Updated]", plain)
+            self.assertNotIn("Select a chat number", plain)
+
+    def test_interactive_theme_slash_sets_python_cli_syntax_theme(self) -> None:
+        from codex import cli
+
+        old_theme = cli._CLI_SYNTAX_THEME
+        try:
+            session = CodexSession(
+                CodexConfig(skip_git_repo_check=True, ephemeral=True),
+                model_client=ScriptedResponsesModel([]),
+            )
+            with redirect_stderr(io.StringIO()):
+                result = cli._handle_interactive_slash_command(session, "/theme dracula")
+
+            self.assertTrue(result.handled)
+            self.assertEqual(cli._CLI_SYNTAX_THEME, "dracula")
+            self.assertEqual(cli._pygments_style_name(), "dracula")
+        finally:
+            cli._CLI_SYNTAX_THEME = old_theme
 
 
 if __name__ == "__main__":

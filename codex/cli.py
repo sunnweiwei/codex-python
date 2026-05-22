@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import datetime as _dt
 import json
 import os
 import queue
@@ -24,6 +25,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .core import CodexSession, SteerInputError, TurnInterrupted
+from .state import load_rollout_records, parse_command_actions, reconstruct_history_from_rollout
+from .types import CodexConfig, CodexEvent, _model_catalog_info
+from . import types as _types
+
+
+_CLI_SYNTAX_THEME = os.environ.get("PY_CODEX_SYNTAX_THEME", "monokai")
 
 
 def _set_raw_keep_opost(fd: int) -> None:
@@ -51,11 +58,6 @@ def _set_raw_keep_opost(fd: int) -> None:
     mode[6][termios.VMIN] = 1
     mode[6][termios.VTIME] = 0
     termios.tcsetattr(fd, termios.TCSAFLUSH, mode)
-from .parity import compare_exec_traces, format_parity_report, format_trace_report, load_jsonl_events, run_parity_checks
-from .parity import summarize_exec_trace
-from .state import parse_command_actions, reconstruct_history_from_rollout
-from .types import CodexConfig, CodexEvent, _model_catalog_info
-from . import types as _types
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,6 +77,10 @@ def _main(argv: list[str] | None = None) -> int:
         return _main_exec_resume(raw_argv[2:])
     if len(raw_argv) >= 2 and raw_argv[0] == "exec" and raw_argv[1] == "fork":
         return _main_exec_fork(raw_argv[2:])
+    if raw_argv and raw_argv[0] == "resume":
+        return _main_resume_chat(raw_argv[1:], fork=False)
+    if raw_argv and raw_argv[0] == "fork":
+        return _main_resume_chat(raw_argv[1:], fork=True)
     if raw_argv and raw_argv[0] == "chat":
         return _main_chat(raw_argv[1:], prog="python -m codex chat")
     if _should_route_to_chat(raw_argv):
@@ -85,6 +91,16 @@ def _main(argv: list[str] | None = None) -> int:
     chat_parser = subparsers.add_parser("chat")
     chat_parser.add_argument("prompt", nargs="?")
     _add_exec_options(chat_parser)
+    resume_parser = subparsers.add_parser("resume", help="resume a previous interactive session")
+    resume_parser.add_argument("session_id", nargs="?")
+    resume_parser.add_argument("--last", action="store_true")
+    resume_parser.add_argument("--all", action="store_true", dest="all_cwds")
+    _add_exec_options(resume_parser)
+    fork_parser = subparsers.add_parser("fork", help="fork a previous interactive session")
+    fork_parser.add_argument("session_id", nargs="?")
+    fork_parser.add_argument("--last", action="store_true")
+    fork_parser.add_argument("--all", action="store_true", dest="all_cwds")
+    _add_exec_options(fork_parser)
     exec_parser = subparsers.add_parser("exec")
     exec_parser.add_argument("prompt", nargs="?")
     _add_exec_options(exec_parser)
@@ -98,6 +114,8 @@ def _main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(raw_argv)
     if args.command == "parity":
+        from .parity import format_parity_report, run_parity_checks
+
         if args.parity_command in {None, "check"}:
             report = run_parity_checks()
             if getattr(args, "parity_json", False):
@@ -133,12 +151,14 @@ def _main(argv: list[str] | None = None) -> int:
 def _should_route_to_chat(raw_argv: list[str]) -> bool:
     if not raw_argv:
         return True
-    if raw_argv[0] in {"-h", "--help", "exec", "parity"}:
+    if raw_argv[0] in {"-h", "--help", "exec", "parity", "resume", "fork"}:
         return False
     return True
 
 
 def _run_parity_trace(args: argparse.Namespace) -> int:
+    from .parity import compare_exec_traces, format_trace_report, load_jsonl_events, summarize_exec_trace
+
     events_by_label = [(path, load_jsonl_events(path)) for path in args.jsonl]
     if getattr(args, "parity_trace_json", False):
         if len(events_by_label) == 2:
@@ -209,6 +229,56 @@ def _main_exec_fork(argv: list[str]) -> int:
     return _run_session(session, _read_prompt(args.prompt), json_events=args.json_events, color_mode=args.color)
 
 
+def _main_resume_chat(argv: list[str], *, fork: bool) -> int:
+    name = "fork" if fork else "resume"
+    parser = argparse.ArgumentParser(prog=f"python -m codex {name}")
+    parser.add_argument("session_id", nargs="?")
+    parser.add_argument("--last", action="store_true")
+    parser.add_argument("--all", action="store_true", dest="all_cwds")
+    _add_exec_options(parser)
+    args = parser.parse_args(argv)
+    if args.json_events:
+        print(f"`--json` is only supported for `exec`, not interactive {name}.", file=sys.stderr)
+        return 2
+
+    try:
+        config = _build_exec_config(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    try:
+        if args.session_id or args.last:
+            rollout_path = _resolve_resume_rollout(args, config)
+        else:
+            rollout_path = _prompt_rollout_picker(
+                config,
+                title="Fork a previous session" if fork else "Resume a previous session",
+                all_cwds=args.all_cwds,
+                color_mode=args.color,
+            )
+        if rollout_path is None:
+            if args.session_id or args.last:
+                selector = args.session_id or "--last"
+                print(f"No Codex rollout found for `{selector}`", file=sys.stderr)
+                return 1
+            session = CodexSession(config)
+        elif fork:
+            session = CodexSession.fork_from_rollout(rollout_path, config)
+        else:
+            session = CodexSession.resume_from_rollout(rollout_path, config)
+        return _run_chat(
+            session,
+            None,
+            color_mode=args.color,
+            replay_history=rollout_path is not None,
+            history_source_path=rollout_path,
+        )
+    except Exception as exc:
+        _print_cli_error(exc)
+        return 1
+
+
 def _main_chat(argv: list[str], *, prog: str = "python -m codex") -> int:
     parser = argparse.ArgumentParser(prog=prog)
     parser.add_argument("prompt", nargs="?")
@@ -263,6 +333,7 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
         print("warning: `--full-auto` is deprecated; use `--sandbox workspace-write` instead.", file=sys.stderr)
     output_schema = _load_output_schema(args.output_schema)
     cli_config = _load_cli_config(args)
+    _configure_cli_syntax_theme(cli_config)
     oss_provider = _resolve_oss_provider(args, cli_config)
     model = _exec_model(args, cli_config, oss_provider)
     model_provider_id = oss_provider or _string_config(cli_config, "model_provider") or "openai"
@@ -377,9 +448,20 @@ def _run_session_human(
     return 0 if final else 1
 
 
-def _run_chat(session: CodexSession, initial_prompt: str | None, *, color_mode: str = "auto") -> int:
+def _run_chat(
+    session: CodexSession,
+    initial_prompt: str | None,
+    *,
+    color_mode: str = "auto",
+    replay_history: bool = False,
+    history_source_path: Path | None = None,
+) -> int:
     prompt = initial_prompt
-    printed_transcript = False
+    printed_transcript = _render_resumed_transcript(
+        session,
+        source_path=history_source_path,
+        color_mode=color_mode,
+    ) if replay_history else False
     exit_status = 0
     queued_prompts: deque[str] = deque()
     while True:
@@ -426,6 +508,184 @@ def _run_chat(session: CodexSession, initial_prompt: str | None, *, color_mode: 
                 exit_status = status
             printed_transcript = True
         prompt = None
+
+
+def _render_resumed_transcript(
+    session: CodexSession,
+    *,
+    source_path: Path | None = None,
+    color_mode: str = "auto",
+) -> bool:
+    renderer = _HumanEventRenderer(color_mode=color_mode)
+    rendered = False
+    records: list[dict[str, Any]] = []
+    if source_path is not None:
+        try:
+            records = load_rollout_records(source_path)
+        except Exception:
+            records = []
+    if not records:
+        try:
+            records = session.state.read_rollout_records()
+        except Exception:
+            records = []
+    if records:
+        rendered = _render_rollout_transcript_records(records, renderer)
+    if not rendered:
+        rendered = _render_history_transcript_items(session.state.history, renderer)
+    if rendered:
+        renderer._flush_exploration()
+    return rendered
+
+
+def _render_rollout_transcript_records(records: list[dict[str, Any]], renderer: "_HumanEventRenderer") -> bool:
+    rendered = False
+    for record in records:
+        record_type = record.get("type")
+        payload = record.get("payload")
+        if record_type == "response_item" and isinstance(payload, dict):
+            rendered = _render_transcript_response_item(payload, renderer) or rendered
+        elif record_type == "event_msg" and isinstance(payload, dict):
+            rendered = _render_transcript_event_msg(payload, renderer) or rendered
+    return rendered
+
+
+def _render_history_transcript_items(history: list[dict[str, Any]], renderer: "_HumanEventRenderer") -> bool:
+    rendered = False
+    for item in history:
+        if isinstance(item, dict):
+            rendered = _render_transcript_response_item(item, renderer) or rendered
+    return rendered
+
+
+def _render_transcript_response_item(item: dict[str, Any], renderer: "_HumanEventRenderer") -> bool:
+    item_type = item.get("type")
+    if item_type == "message" and item.get("role") == "user":
+        text = _user_item_text(item)
+        if text and not _is_transcript_context_user_message(text):
+            renderer.render_user_message(text)
+            return True
+        return False
+    if item_type in {"message", "reasoning", "web_search_call"}:
+        before = renderer._printed_any_cell
+        renderer._render_item(item)
+        return renderer._printed_any_cell != before
+    return False
+
+
+def _render_transcript_event_msg(payload: dict[str, Any], renderer: "_HumanEventRenderer") -> bool:
+    event_type = str(payload.get("type") or "")
+    if event_type in {"user_message", "agent_message", "web_search_end"}:
+        return False
+    if event_type == "plan_update":
+        renderer.render(
+            CodexEvent(
+                "tool.completed",
+                {
+                    "name": "update_plan",
+                    "call_id": str(payload.get("call_id") or "resume-plan"),
+                    "ok": True,
+                    "metadata": {
+                        "explanation": payload.get("explanation"),
+                        "plan": payload.get("plan", []),
+                    },
+                },
+            )
+        )
+        return True
+    if event_type == "exec_command_end":
+        command = _event_msg_command_text(payload)
+        metadata = {
+            "command": command,
+            "exit_code": payload.get("exit_code"),
+            "aggregated_output": payload.get("aggregated_output") or payload.get("stdout") or "",
+            "output": payload.get("formatted_output") or payload.get("aggregated_output") or payload.get("stdout") or "",
+            "stdout": payload.get("stdout") or payload.get("aggregated_output") or "",
+            "stderr": payload.get("stderr") or "",
+            "wall_time_seconds": _duration_seconds_from_payload(payload.get("duration")),
+        }
+        renderer.render(
+            CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": str(payload.get("call_id") or "resume-exec"),
+                    "ok": _int_value(payload.get("exit_code")) == 0,
+                    "metadata": metadata,
+                },
+            )
+        )
+        return True
+    if event_type == "patch_apply_end":
+        success = bool(payload.get("success")) or str(payload.get("status") or "") == "completed"
+        output = str(payload.get("stdout") if success else payload.get("stderr") or "")
+        renderer.render(
+            CodexEvent(
+                "tool.completed",
+                {
+                    "name": "apply_patch",
+                    "call_id": str(payload.get("call_id") or "resume-patch"),
+                    "ok": success,
+                    "output": output,
+                    "metadata": {"changes": payload.get("changes", [])},
+                },
+            )
+        )
+        return True
+    if event_type == "view_image_tool_call":
+        renderer.render(
+            CodexEvent(
+                "tool.completed",
+                {
+                    "name": "view_image",
+                    "call_id": str(payload.get("call_id") or "resume-image"),
+                    "ok": True,
+                    "metadata": {"path": payload.get("path")},
+                },
+            )
+        )
+        return True
+    if event_type == "context_compacted":
+        renderer.render_info_message("Context compacted")
+        return True
+    if event_type in {"warning", "error", "stream_error"}:
+        message = str(payload.get("message") or payload.get("error") or "")
+        if message:
+            renderer.render_info_message(message)
+            return True
+    return False
+
+
+def _event_msg_command_text(payload: dict[str, Any]) -> str:
+    command = payload.get("command")
+    if isinstance(command, list):
+        return " ".join(str(part) for part in command if part is not None)
+    if isinstance(command, str):
+        return command
+    return ""
+
+
+def _duration_seconds_from_payload(raw: Any) -> float:
+    if isinstance(raw, dict):
+        try:
+            return float(raw.get("secs") or 0) + float(raw.get("nanos") or 0) / 1_000_000_000.0
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_transcript_context_user_message(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        _is_startup_context_preview(stripped)
+        or stripped.startswith("<hook_context>")
+        or stripped.startswith("<turn_aborted>")
+        or stripped.startswith("<subagent_notification>")
+        or stripped.startswith("<codex_memory>")
+    )
 
 
 def _run_session_human_interactive(
@@ -1993,7 +2253,7 @@ _SLASH_COMMANDS: tuple[_SlashCommandDef, ...] = (
     _SlashCommandDef("debug-config", "show config layers and requirement sources for debugging"),
     _SlashCommandDef("title", "configure terminal title items"),
     _SlashCommandDef("statusline", "configure status line items"),
-    _SlashCommandDef("theme", "choose a syntax highlighting theme", available_during_task=False),
+    _SlashCommandDef("theme", "choose a syntax highlighting theme", supports_inline_args=True, available_during_task=False),
     _SlashCommandDef("pets", "choose or hide the terminal pet", supports_inline_args=True, available_during_task=False, aliases=("pet",)),
     _SlashCommandDef("mcp", "list configured MCP tools", supports_inline_args=True),
     _SlashCommandDef("apps", "manage apps"),
@@ -2092,7 +2352,11 @@ def _handle_interactive_slash_command(
         return _InteractiveSlashResult(True, exit=True, status=0)
     if command == "clear":
         _clear_terminal()
-        return _InteractiveSlashResult(True)
+        return _InteractiveSlashResult(True, session=_new_chat_session(session))
+    if command == "new":
+        fresh = _new_chat_session(session)
+        print(f"Started new chat {fresh.state.thread_id}.", file=sys.stderr, flush=True)
+        return _InteractiveSlashResult(True, session=fresh)
     if command == "compact":
         if _interactive_turn_controls_available():
             _run_compact_human_interactive(session, color_mode=color_mode, queued_prompts=queued_prompts)
@@ -2104,16 +2368,22 @@ def _handle_interactive_slash_command(
         print("Switched to Plan mode.", file=sys.stderr, flush=True)
         return _InteractiveSlashResult(True, prompt=slash.rest.strip() or None)
     if command == "resume":
-        resumed = _interactive_resume_session(session, slash.rest.strip())
+        resumed = _interactive_resume_session(session, slash.rest.strip(), color_mode=color_mode)
         return _InteractiveSlashResult(True, session=resumed)
     if command == "fork":
-        forked = _interactive_fork_session(session, slash.rest.strip())
+        forked = _interactive_fork_session(session, slash.rest.strip(), color_mode=color_mode)
         return _InteractiveSlashResult(True, session=forked)
     if command == "status":
         _print_chat_status(session)
         return _InteractiveSlashResult(True)
     if command == "rollout":
         print(f"Current rollout path: {session.state.rollout_path()}", file=sys.stderr, flush=True)
+        return _InteractiveSlashResult(True)
+    if command == "ps":
+        _handle_ps_slash(session)
+        return _InteractiveSlashResult(True)
+    if command == "stop":
+        _handle_stop_slash(session)
         return _InteractiveSlashResult(True)
     if command == "init":
         init_target = session.config.resolved_cwd() / "AGENTS.md"
@@ -2124,6 +2394,9 @@ def _handle_interactive_slash_command(
     if command == "model":
         _handle_model_slash(session, slash.rest, color_mode=color_mode)
         return _InteractiveSlashResult(True)
+    if command == "theme":
+        _handle_theme_slash(slash.rest)
+        return _InteractiveSlashResult(True)
     if command == "raw":
         arg = slash.rest.strip().lower()
         if arg and arg not in {"on", "off"}:
@@ -2133,18 +2406,70 @@ def _handle_interactive_slash_command(
         return _InteractiveSlashResult(True)
 
     print(
-        f"'/{slash.name}' is recognized from upstream Codex but is not implemented in this Python CLI yet.",
+        f"'/{slash.name}' is recognized as a Codex command but is not implemented in this Python CLI yet.",
         file=sys.stderr,
         flush=True,
     )
     return _InteractiveSlashResult(True)
 
 
-def _interactive_resume_session(session: CodexSession, rest: str) -> CodexSession | None:
+def _handle_ps_slash(session: CodexSession) -> None:
+    rows = _background_terminal_rows(session)
+    if not rows:
+        print("No background terminals.", file=sys.stderr, flush=True)
+        return
+    print("Background terminals:", file=sys.stderr)
+    for session_id, status, tty, command in rows:
+        tty_label = "tty" if tty else "pipe"
+        command_label = _truncate_display_text(_command_display(command), max(20, _terminal_columns() - 24))
+        print(f"  {session_id} · {status} · {tty_label} · {command_label}", file=sys.stderr)
+    sys.stderr.flush()
+
+
+def _handle_stop_slash(session: CodexSession) -> None:
+    count = len(_background_terminal_rows(session))
+    interrupt_all = getattr(session.tools, "interrupt_all", None)
+    if callable(interrupt_all):
+        interrupt_all()
+    if count:
+        print(f"Stopped {count} background terminal{'s' if count != 1 else ''}.", file=sys.stderr, flush=True)
+    else:
+        print("No background terminals.", file=sys.stderr, flush=True)
+
+
+def _background_terminal_rows(session: CodexSession) -> list[tuple[int, str, bool, str]]:
+    runtime = getattr(session, "tools", None)
+    sessions = getattr(runtime, "_sessions", None)
+    if not isinstance(sessions, dict):
+        return []
+    lock = getattr(runtime, "_session_lock", None)
+    if lock is not None:
+        with lock:
+            items = list(sessions.items())
+    else:
+        items = list(sessions.items())
+    rows: list[tuple[int, str, bool, str]] = []
+    for session_id, running in items:
+        process = getattr(running, "process", None)
+        returncode = process.poll() if process is not None else None
+        status = "running" if returncode is None else f"exit {returncode}"
+        rows.append(
+            (
+                int(session_id),
+                status,
+                bool(getattr(running, "tty", False)),
+                str(getattr(running, "command", "")),
+            )
+        )
+    return rows
+
+
+def _interactive_resume_session(session: CodexSession, rest: str, *, color_mode: str = "auto") -> CodexSession | None:
     rollout_path = _resolve_interactive_rollout_selector(
         rest,
         session.config,
         title="Resume saved chat",
+        color_mode=color_mode,
     )
     if rollout_path is None:
         return None
@@ -2153,20 +2478,17 @@ def _interactive_resume_session(session: CodexSession, rest: str) -> CodexSessio
         session.config,
         model_client=session.model_client,
     )
-    print(
-        f"Resumed chat {resumed.state.thread_id} from {rollout_path}",
-        file=sys.stderr,
-        flush=True,
-    )
+    _render_resumed_transcript(resumed, source_path=rollout_path, color_mode=color_mode)
     return resumed
 
 
-def _interactive_fork_session(session: CodexSession, rest: str) -> CodexSession | None:
+def _interactive_fork_session(session: CodexSession, rest: str, *, color_mode: str = "auto") -> CodexSession | None:
     if rest:
         rollout_path = _resolve_interactive_rollout_selector(
             rest,
             session.config,
             title="Fork saved chat",
+            color_mode=color_mode,
         )
         if rollout_path is None:
             return None
@@ -2175,6 +2497,7 @@ def _interactive_fork_session(session: CodexSession, rest: str) -> CodexSession 
             session.config,
             model_client=session.model_client,
         )
+        _render_resumed_transcript(forked, source_path=rollout_path, color_mode=color_mode)
     else:
         forked = _fork_session_in_memory(session)
     print(
@@ -2201,7 +2524,17 @@ def _fork_session_in_memory(session: CodexSession) -> CodexSession:
     return forked
 
 
-def _resolve_interactive_rollout_selector(rest: str, config: CodexConfig, *, title: str) -> Path | None:
+def _new_chat_session(session: CodexSession) -> CodexSession:
+    return CodexSession(session.config, model_client=session.model_client)
+
+
+def _resolve_interactive_rollout_selector(
+    rest: str,
+    config: CodexConfig,
+    *,
+    title: str,
+    color_mode: str = "auto",
+) -> Path | None:
     try:
         tokens = shlex.split(rest)
     except ValueError as exc:
@@ -2221,7 +2554,7 @@ def _resolve_interactive_rollout_selector(rest: str, config: CodexConfig, *, tit
             print("Usage: /resume [--last|SESSION_ID|ROLLOUT_PATH] [--all]", file=sys.stderr, flush=True)
             return None
     if selector is None and not last:
-        return _prompt_rollout_picker(config, title=title, all_cwds=all_cwds)
+        return _prompt_rollout_picker(config, title=title, all_cwds=all_cwds, color_mode=color_mode)
     args = argparse.Namespace(session_id=selector, last=last, all_cwds=all_cwds)
     rollout_path = _resolve_resume_rollout(args, config)
     if rollout_path is None:
@@ -2230,21 +2563,41 @@ def _resolve_interactive_rollout_selector(rest: str, config: CodexConfig, *, tit
     return rollout_path
 
 
-def _prompt_rollout_picker(config: CodexConfig, *, title: str, all_cwds: bool) -> Path | None:
-    choices: list[Path] = []
-    for path in _iter_rollout_paths(config.resolved_codex_home()):
-        reconstruction = _safe_reconstruct_rollout(path)
-        if reconstruction is None:
-            continue
-        if all_cwds or _rollout_cwd_matches(reconstruction.session_meta, config.resolved_cwd()):
-            choices.append(path)
-    choices = choices[:10]
-    if not choices:
+@dataclass
+class _RolloutPickerRow:
+    path: Path
+    preview: str
+    thread_id: str
+    created_at: float
+    updated_at: float
+    cwd: str | None
+    git_branch: str | None = None
+
+
+def _prompt_rollout_picker(
+    config: CodexConfig,
+    *,
+    title: str,
+    all_cwds: bool,
+    color_mode: str = "auto",
+) -> Path | None:
+    rows = _rollout_picker_rows(config)
+    filtered = _filter_rollout_picker_rows(rows, cwd=config.resolved_cwd(), show_all=all_cwds, query="", sort_key="updated")
+    if not filtered:
         print("No saved Codex chats found.", file=sys.stderr, flush=True)
         return None
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        return _interactive_rollout_picker(
+            rows,
+            title=title,
+            cwd=config.resolved_cwd(),
+            initial_all_cwds=all_cwds,
+            color_mode=color_mode,
+        )
+    choices = filtered[:10]
     print(title, file=sys.stderr)
-    for index, path in enumerate(choices, start=1):
-        print(f"  {index}. {_format_rollout_picker_item(path)}", file=sys.stderr)
+    for index, row in enumerate(choices, start=1):
+        print(f"  {index}. {_format_rollout_picker_item(row.path)}", file=sys.stderr)
     print("Select a chat number, or press Enter to cancel: ", end="", file=sys.stderr, flush=True)
     if not sys.stdin.isatty():
         print(file=sys.stderr, flush=True)
@@ -2261,19 +2614,520 @@ def _prompt_rollout_picker(config: CodexConfig, *, title: str, all_cwds: bool) -
     if index < 1 or index > len(choices):
         print(f"Invalid selection `{raw}`.", file=sys.stderr, flush=True)
         return None
-    return choices[index - 1]
+    return choices[index - 1].path
+
+
+def _rollout_picker_rows(config: CodexConfig) -> list[_RolloutPickerRow]:
+    rows: list[_RolloutPickerRow] = []
+    for path in _iter_rollout_paths(config.resolved_codex_home()):
+        reconstruction = _safe_reconstruct_rollout(path)
+        if reconstruction is None:
+            continue
+        meta = reconstruction.session_meta if isinstance(reconstruction.session_meta, dict) else {}
+        raw_cwd = meta.get("cwd")
+        cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else None
+        rows.append(
+            _RolloutPickerRow(
+                path=path,
+                preview=_rollout_preview_text(reconstruction.history),
+                thread_id=_rollout_thread_id(meta) or _rollout_thread_id_from_path(path) or "unknown",
+                created_at=_rollout_created_at(meta, path),
+                updated_at=_safe_mtime(path),
+                cwd=cwd,
+                git_branch=_rollout_git_branch(path),
+            )
+        )
+    return rows
+
+
+def _filter_rollout_picker_rows(
+    rows: list[_RolloutPickerRow],
+    *,
+    cwd: Path,
+    show_all: bool,
+    query: str,
+    sort_key: str,
+) -> list[_RolloutPickerRow]:
+    normalized_query = _normalize_picker_query(query)
+    filtered: list[_RolloutPickerRow] = []
+    for row in rows:
+        if not show_all and not _picker_row_cwd_matches(row, cwd):
+            continue
+        if normalized_query and normalized_query not in _normalize_picker_query(_rollout_picker_search_text(row)):
+            continue
+        filtered.append(row)
+    if sort_key == "created":
+        return sorted(filtered, key=lambda row: (row.created_at, row.updated_at, row.path.name), reverse=True)
+    return sorted(filtered, key=lambda row: (row.updated_at, row.created_at, row.path.name), reverse=True)
+
+
+def _interactive_rollout_picker(
+    rows: list[_RolloutPickerRow],
+    *,
+    title: str,
+    cwd: Path,
+    initial_all_cwds: bool,
+    color_mode: str = "auto",
+) -> Path | None:
+    try:
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+    except Exception:
+        return None
+
+    style = _AnsiStyle(_should_use_color(color_mode))
+    selected = 0
+    offset = 0
+    query = ""
+    show_all = initial_all_cwds
+    sort_key = "updated"
+    density = "comfortable"
+    toolbar_focus = "filter"
+    expanded = False
+    rendered_rows = 0
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def current_rows() -> list[_RolloutPickerRow]:
+        return _filter_rollout_picker_rows(rows, cwd=cwd, show_all=show_all, query=query, sort_key=sort_key)
+
+    def clamp_selection(filtered: list[_RolloutPickerRow]) -> None:
+        nonlocal selected, offset
+        if not filtered:
+            selected = 0
+            offset = 0
+            return
+        selected = min(max(selected, 0), len(filtered) - 1)
+        visible = _rollout_picker_visible_count(density)
+        if selected < offset:
+            offset = selected
+        elif selected >= offset + visible:
+            offset = selected - visible + 1
+        offset = min(max(offset, 0), max(0, len(filtered) - visible))
+
+    def render(lines: list[str]) -> None:
+        nonlocal rendered_rows
+        cols = _terminal_columns()
+        _clear_prompt_lines(rendered_rows)
+        print("\n".join(lines), end="", file=sys.stderr, flush=True)
+        rendered_rows = _prompt_screen_rows(lines, cols)
+
+    def clear() -> None:
+        nonlocal rendered_rows
+        _clear_prompt_lines(rendered_rows)
+        rendered_rows = 0
+
+    def reset_view() -> None:
+        nonlocal selected, offset
+        selected = 0
+        offset = 0
+
+    try:
+        _set_raw_keep_opost(fd)
+        pending = b""
+        while True:
+            filtered = current_rows()
+            clamp_selection(filtered)
+            render(
+                _rollout_picker_display_lines(
+                    filtered,
+                    title=title,
+                    style=style,
+                    cwd=cwd,
+                    show_all=show_all,
+                    query=query,
+                    sort_key=sort_key,
+                    selected=selected,
+                    offset=offset,
+                    density=density,
+                    toolbar_focus=toolbar_focus,
+                    expanded=expanded,
+                )
+            )
+            chunk, pending = _read_tty_chunk(fd, pending)
+            if chunk == b"":
+                return None
+            if chunk == b"\x03":
+                return None
+            if chunk in {b"\r", b"\n"}:
+                filtered = current_rows()
+                if not filtered:
+                    return None
+                return filtered[selected].path
+            if chunk in {b"\x7f", b"\b"}:
+                if query:
+                    query = query[:-1]
+                    reset_view()
+                continue
+            if chunk == b"\t":
+                toolbar_focus = "sort" if toolbar_focus == "filter" else "filter"
+                continue
+            if chunk == b"\x0f":
+                density = "dense" if density == "comfortable" else "comfortable"
+                clamp_selection(current_rows())
+                continue
+            if chunk == b"\x05":
+                expanded = not expanded
+                continue
+            if chunk == b"\x1b":
+                sequence, pending = _read_escape_sequence(fd, pending)
+                if sequence == b"\x1b":
+                    if query:
+                        query = ""
+                        reset_view()
+                        continue
+                    return None
+                if sequence in {b"\x1b[A", b"\x1bOA"}:
+                    selected = max(0, selected - 1)
+                elif sequence in {b"\x1b[B", b"\x1bOB"}:
+                    selected = min(max(0, len(current_rows()) - 1), selected + 1)
+                elif sequence in {b"\x1b[5~"}:
+                    selected = max(0, selected - _rollout_picker_visible_count(density))
+                elif sequence in {b"\x1b[6~"}:
+                    selected = min(max(0, len(current_rows()) - 1), selected + _rollout_picker_visible_count(density))
+                elif sequence in {b"\x1b[D", b"\x1bOD", b"\x1b[C", b"\x1bOC"}:
+                    if toolbar_focus == "filter":
+                        show_all = not show_all
+                    else:
+                        sort_key = "created" if sort_key == "updated" else "updated"
+                    reset_view()
+                continue
+            text = decoder.decode(chunk, final=False)
+            if text and all(not unicodedata.category(ch).startswith("C") for ch in text):
+                query += text
+                reset_view()
+    except KeyboardInterrupt:
+        return None
+    finally:
+        clear()
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+
+
+def _rollout_picker_display_lines(
+    rows: list[_RolloutPickerRow],
+    *,
+    title: str,
+    style: "_AnsiStyle",
+    cwd: Path,
+    show_all: bool,
+    query: str,
+    sort_key: str,
+    selected: int,
+    offset: int,
+    density: str,
+    toolbar_focus: str,
+    expanded: bool,
+) -> list[str]:
+    cols = _terminal_columns()
+    width = max(40, cols)
+    out = [
+        style.bold(title),
+        _rollout_picker_search_line(
+            width,
+            style=style,
+            query=query,
+            show_all=show_all,
+            sort_key=sort_key,
+            toolbar_focus=toolbar_focus,
+        ),
+        "",
+    ]
+    if not rows:
+        out.append(style.dim("  No matching saved chats. Type to search, press Esc to cancel, or switch Filter to All."))
+    else:
+        visible_count = _rollout_picker_visible_count(density)
+        if offset > 0:
+            out.append(style.dim(f"  \u2191 {offset} more"))
+        visible = rows[offset : offset + visible_count]
+        for visible_index, row in enumerate(visible):
+            index = offset + visible_index
+            out.extend(
+                _rollout_picker_row_lines(
+                    row,
+                    style=style,
+                    width=width,
+                    selected=index == selected,
+                    density=density,
+                    expanded=expanded and index == selected,
+                    cwd=cwd,
+                )
+            )
+            if density == "comfortable" and visible_index < len(visible) - 1:
+                out.append("")
+        remaining = len(rows) - (offset + len(visible))
+        if remaining > 0:
+            out.append(style.dim(f"  \u2193 {remaining} more"))
+    out.append(_rollout_picker_separator(width, rows=rows, selected=selected, style=style))
+    out.append(style.dim("enter resume  esc cancel/clear search  tab focus sort/filter  \u2190/\u2192 change option"))
+    out.append(style.dim("ctrl+o dense/comfortable  ctrl+e expand  \u2191/\u2193 browse"))
+    return out
+
+
+def _rollout_picker_search_line(
+    width: int,
+    *,
+    style: "_AnsiStyle",
+    query: str,
+    show_all: bool,
+    sort_key: str,
+    toolbar_focus: str,
+) -> str:
+    search = f"Search: {query}" if query else "Type to search"
+    filter_label = f"Filter:[{'All' if show_all else 'Cwd'}]"
+    sort_label = f"Sort:[{'Created' if sort_key == 'created' else 'Updated'}]"
+    if toolbar_focus == "filter":
+        filter_label = style.bold(filter_label)
+    else:
+        filter_label = style.dim(filter_label)
+    if toolbar_focus == "sort":
+        sort_label = style.bold(sort_label)
+    else:
+        sort_label = style.dim(sort_label)
+    toolbar = f"{filter_label}  {sort_label}"
+    gap = max(1, width - _visible_len(search) - _visible_len(toolbar))
+    return f"{style.dim(search) if not query else search}{' ' * gap}{toolbar}"
+
+
+def _rollout_picker_row_lines(
+    row: _RolloutPickerRow,
+    *,
+    style: "_AnsiStyle",
+    width: int,
+    selected: bool,
+    density: str,
+    expanded: bool,
+    cwd: Path,
+) -> list[str]:
+    marker = "\u276f " if selected else "  "
+    if density == "dense":
+        label_width = max(16, width - 14)
+        preview = _truncate_display_text(row.preview, label_width)
+        line = f"{marker}{_format_picker_relative_time(row.updated_at):>10}  {preview}"
+        return [style.yellow(line) if selected else line]
+
+    preview_width = max(20, width - 2)
+    preview = _truncate_display_text(row.preview, preview_width)
+    head = f"{marker}{preview}"
+    if selected:
+        head = style.yellow(head)
+    meta = _rollout_picker_meta_line(row, cwd=cwd, width=max(12, width - 2))
+    lines = [head, style.dim(f"  {meta}")]
+    if expanded:
+        details = [
+            f"id: {row.thread_id}",
+            f"path: {row.path}",
+        ]
+        for detail in details:
+            lines.append(style.dim("  " + _truncate_display_text(detail, max(10, width - 2))))
+    return lines
+
+
+def _rollout_picker_meta_line(row: _RolloutPickerRow, *, cwd: Path, width: int) -> str:
+    parts = [_format_picker_relative_time(row.updated_at)]
+    if row.cwd:
+        cwd_label = "." if _picker_row_cwd_matches(row, cwd) else _short_path_display(row.cwd)
+        parts.append(cwd_label)
+    if row.git_branch:
+        parts.append(row.git_branch)
+    meta = "  \u00b7  ".join(parts)
+    return _truncate_display_text(meta, width)
+
+
+def _rollout_picker_separator(width: int, *, rows: list[_RolloutPickerRow], selected: int, style: "_AnsiStyle") -> str:
+    if not rows:
+        return style.dim("\u2500" * width)
+    total = len(rows)
+    position = min(max(selected + 1, 1), total)
+    percent = int(round(position * 100 / total))
+    label = f"{position} / {total} \u00b7 {percent}%"
+    left_width = max(0, width - _visible_len(label) - 1)
+    return style.dim("\u2500" * left_width + " " + label)
+
+
+def _rollout_picker_visible_count(density: str) -> int:
+    try:
+        terminal_lines = shutil.get_terminal_size((100, 24)).lines
+    except Exception:
+        terminal_lines = 24
+    body_lines = max(5, terminal_lines - 7)
+    if density == "dense":
+        return max(5, min(18, body_lines))
+    return max(3, min(8, body_lines // 3))
 
 
 def _format_rollout_picker_item(path: Path) -> str:
     reconstruction = _safe_reconstruct_rollout(path)
-    thread_id = _rollout_thread_id(reconstruction.session_meta if reconstruction else None) or "unknown"
+    if reconstruction is None:
+        thread_id = _rollout_thread_id_from_path(path) or "unknown"
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(_safe_mtime(path)))
+        return f"{thread_id} \u00b7 {stamp} \u00b7 unknown cwd"
+    meta = reconstruction.session_meta if isinstance(reconstruction.session_meta, dict) else {}
+    thread_id = _rollout_thread_id(meta) or _rollout_thread_id_from_path(path) or "unknown"
     cwd = "unknown cwd"
-    if reconstruction and isinstance(reconstruction.session_meta, dict):
-        raw_cwd = reconstruction.session_meta.get("cwd")
-        if isinstance(raw_cwd, str) and raw_cwd:
-            cwd = raw_cwd
+    raw_cwd = meta.get("cwd")
+    if isinstance(raw_cwd, str) and raw_cwd:
+        cwd = raw_cwd
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(_safe_mtime(path)))
-    return f"{thread_id} · {stamp} · {cwd}"
+    preview = _truncate_display_text(_rollout_preview_text(reconstruction.history), 48)
+    return f"{preview} \u00b7 {thread_id} \u00b7 {stamp} \u00b7 {cwd}"
+
+
+def _rollout_preview_text(history: list[dict[str, Any]]) -> str:
+    for role in ("user", "assistant"):
+        for item in history:
+            if item.get("type") != "message" or item.get("role") != role:
+                continue
+            text = _message_item_text(item)
+            if text and not _is_startup_context_preview(text):
+                return _normalize_picker_preview(text)
+    return "(no message yet)"
+
+
+def _is_startup_context_preview(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        stripped.startswith("<environment_context>")
+        or stripped.startswith("<user_instructions>")
+        or stripped.startswith("<subagent_notification>")
+    )
+
+
+def _message_item_text(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    pieces: list[str] = []
+    for part in content:
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str):
+                pieces.append(text)
+            elif isinstance(part.get("input_text"), str):
+                pieces.append(str(part["input_text"]))
+        elif isinstance(part, str):
+            pieces.append(part)
+    return "\n".join(piece for piece in pieces if piece)
+
+
+def _normalize_picker_preview(text: str) -> str:
+    preview = " ".join(text.strip().split())
+    return preview or "(no message yet)"
+
+
+def _rollout_picker_search_text(row: _RolloutPickerRow) -> str:
+    return " ".join(
+        value
+        for value in [row.preview, row.thread_id, row.cwd or "", row.git_branch or "", str(row.path)]
+        if value
+    )
+
+
+def _normalize_picker_query(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _picker_row_cwd_matches(row: _RolloutPickerRow, cwd: Path) -> bool:
+    if not row.cwd:
+        return False
+    try:
+        return Path(row.cwd).expanduser().resolve() == cwd.resolve()
+    except OSError:
+        return False
+
+
+def _rollout_thread_id_from_path(path: Path) -> str | None:
+    name = path.stem
+    match = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$", name)
+    return match.group(1) if match else None
+
+
+def _rollout_created_at(meta: dict[str, Any], path: Path) -> float:
+    raw = meta.get("timestamp")
+    if isinstance(raw, str):
+        parsed = _parse_iso_timestamp(raw)
+        if parsed is not None:
+            return parsed
+    return _safe_mtime(path)
+
+
+def _parse_iso_timestamp(raw: str) -> float | None:
+    value = raw.strip()
+    if not value:
+        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        return _dt.datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def _rollout_git_branch(path: Path) -> str | None:
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            record = json.loads(raw_line)
+            if not isinstance(record, dict) or record.get("type") != "session_meta":
+                continue
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            git = payload.get("git")
+            if isinstance(git, dict):
+                branch = git.get("branch")
+                if isinstance(branch, str) and branch:
+                    return branch
+            return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def _format_picker_relative_time(timestamp: float) -> str:
+    delta = max(0, int(time.time() - timestamp))
+    if delta < 60:
+        return "now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    if delta < 86400 * 30:
+        return f"{delta // 86400}d ago"
+    return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+
+def _short_path_display(path: str) -> str:
+    try:
+        candidate = Path(path).expanduser()
+    except Exception:
+        return path
+    parts = candidate.parts
+    if len(parts) <= 3:
+        return str(candidate)
+    return "\u2026/" + "/".join(parts[-2:])
+
+
+def _truncate_display_text(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if _visible_len(text) <= width:
+        return text
+    ellipsis = "\u2026"
+    target = max(1, width - _visible_len(ellipsis))
+    out = ""
+    current = 0
+    for char in text:
+        char_width = _display_width(char)
+        if current + char_width > target:
+            break
+        out += char
+        current += char_width
+    return out.rstrip() + ellipsis
 
 
 def _read_init_command_prompt() -> str:
@@ -2346,11 +3200,33 @@ def _print_chat_help() -> None:
     print(
         "Commands implemented locally: "
         f"{local}\n"
-        "Upstream commands are recognized and consumed locally; unsupported ones report a local message instead of being sent to the model.\n"
-        f"Examples from upstream: {recognized}, ...",
+        "Known Codex commands are recognized and consumed locally; unsupported ones report a local message instead of being sent to the model.\n"
+        f"Examples: {recognized}, ...",
         file=sys.stderr,
         flush=True,
     )
+
+
+def _handle_theme_slash(rest: str) -> None:
+    raw = rest.strip()
+    if not raw:
+        print(
+            f"Current syntax theme: {_CLI_SYNTAX_THEME}\n"
+            "Use `/theme NAME` to switch for this Python CLI session. "
+            "Common names: dracula, github, gruvbox-dark, gruvbox-light, monokai-extended, nord, solarized-dark, solarized-light, zenburn.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    try:
+        token = shlex.split(raw)[0]
+    except ValueError as exc:
+        print(f"Invalid /theme argument: {exc}", file=sys.stderr, flush=True)
+        return
+    if _set_cli_syntax_theme(token):
+        print(f"Syntax theme set to {token}.", file=sys.stderr, flush=True)
+    else:
+        print(f"Unknown syntax theme `{token}` for the Python CLI highlighter.", file=sys.stderr, flush=True)
 
 
 def _clear_terminal() -> None:
@@ -3295,6 +4171,9 @@ class _AnsiStyle:
     def green(self, text: str) -> str:
         return self._wrap("32", text)
 
+    def yellow(self, text: str) -> str:
+        return self._wrap("33", text)
+
     def red(self, text: str) -> str:
         return self._wrap("31", text)
 
@@ -3373,25 +4252,45 @@ def _split_visible_chunk(text: str, width: int) -> list[str]:
     pieces: list[str] = []
     current = ""
     current_width = 0
+    active_sgr = ""
     index = 0
     while index < len(text):
         match = _ANSI_RE.match(text, index)
         if match:
-            current += match.group(0)
+            sequence = match.group(0)
+            current += sequence
+            active_sgr = _next_active_sgr(active_sgr, sequence)
             index = match.end()
             continue
         char = text[index]
         char_width = _display_width(char)
         if current_width + char_width > width and current:
+            if active_sgr:
+                current += "\033[0m"
             pieces.append(current)
-            current = ""
+            current = active_sgr
             current_width = 0
         current += char
         current_width += char_width
         index += 1
     if current:
+        if active_sgr and not current.endswith("\033[0m"):
+            current += "\033[0m"
         pieces.append(current)
     return pieces or [text]
+
+
+def _next_active_sgr(active: str, sequence: str) -> str:
+    match = _ANSI_RE.fullmatch(sequence)
+    if match is None:
+        return active
+    params = sequence[2:-1]
+    values = [value for value in params.split(";") if value != ""]
+    if not values:
+        values = ["0"]
+    if any(value in {"0", "00", "39", "49"} for value in values):
+        return ""
+    return active + sequence
 
 
 def _ellipsis_text(omitted: int, *, transcript_hint: bool = False) -> str:
@@ -3419,7 +4318,6 @@ def _render_markdown_for_terminal(
     terminal_width: int | None = None,
 ) -> list[str]:
     lines: list[str] = []
-    in_code_fence = False
     normalized_text = _unwrap_markdown_fences(text)
     raw_lines = normalized_text.splitlines() or [normalized_text]
     index = 0
@@ -3427,13 +4325,19 @@ def _render_markdown_for_terminal(
     while index < len(raw_lines):
         raw_line = raw_lines[index]
         stripped = raw_line.strip()
-        if stripped.startswith(("```", "~~~")):
-            in_code_fence = not in_code_fence
+        fence = _markdown_fence(stripped)
+        if fence is not None:
+            marker, info = fence
+            code_lines: list[str] = []
             index += 1
-            continue
-        if in_code_fence:
-            lines.append(style.dim(raw_line))
-            index += 1
+            while index < len(raw_lines):
+                closing = _markdown_fence(raw_lines[index].strip())
+                if closing is not None and closing[0] == marker:
+                    index += 1
+                    break
+                code_lines.append(raw_lines[index])
+                index += 1
+            lines.extend(_render_code_block_for_terminal("\n".join(code_lines), info, style))
             continue
         table = _markdown_table_at(raw_lines, index)
         if table is not None:
@@ -3470,6 +4374,123 @@ def _render_markdown_for_terminal(
         lines.append(_format_inline_markdown(raw_line, style, emphasis=emphasis))
         index += 1
     return lines
+
+
+def _markdown_fence(stripped: str) -> tuple[str, str] | None:
+    for marker in ("```", "~~~"):
+        if stripped.startswith(marker):
+            return marker, stripped[len(marker) :].strip()
+    return None
+
+
+def _render_code_block_for_terminal(code: str, info: str, style: _AnsiStyle) -> list[str]:
+    lang = _code_fence_language(info)
+    if lang:
+        highlighted = _highlight_code_for_terminal(code, lang, style)
+        if highlighted is not None:
+            return highlighted
+    plain = code.splitlines()
+    if not plain:
+        return [""]
+    return [style.dim(line) for line in plain]
+
+
+def _code_fence_language(info: str) -> str | None:
+    if not info.strip():
+        return None
+    token = re.split(r"[, \t]+", info.strip(), maxsplit=1)[0]
+    token = token.strip("{}.")
+    if not token:
+        return None
+    aliases = {
+        "csharp": "c#",
+        "c-sharp": "c#",
+        "golang": "go",
+        "python3": "python",
+        "shell": "bash",
+        "sh": "bash",
+        "zsh": "bash",
+    }
+    return aliases.get(token.lower(), token.lower())
+
+
+def _highlight_code_for_terminal(code: str, lang: str, style: _AnsiStyle) -> list[str] | None:
+    if not style.enabled or not code:
+        return None
+    if len(code.encode("utf-8")) > 512 * 1024 or len(code.splitlines()) > 10_000:
+        return None
+    try:
+        from pygments import highlight
+        from pygments.formatters import Terminal256Formatter
+        from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
+        from pygments.util import ClassNotFound
+    except Exception:
+        return None
+    try:
+        lexer = get_lexer_by_name(lang)
+    except ClassNotFound:
+        try:
+            lexer = get_lexer_for_filename(f"snippet.{lang}")
+        except ClassNotFound:
+            return None
+    try:
+        rendered = highlight(code, lexer, Terminal256Formatter(style=_pygments_style_name()))
+    except Exception:
+        return None
+    rendered_lines = rendered.rstrip("\n").splitlines()
+    return rendered_lines or [""]
+
+
+_CODEX_THEME_TO_PYGMENTS = {
+    "1337": "native",
+    "ansi": "default",
+    "base16": "native",
+    "base16-256": "native",
+    "base16-eighties-dark": "paraiso-dark",
+    "base16-mocha-dark": "paraiso-dark",
+    "base16-ocean-dark": "native",
+    "base16-ocean-light": "default",
+    "catppuccin-frappe": "material",
+    "catppuccin-latte": "friendly",
+    "catppuccin-macchiato": "material",
+    "catppuccin-mocha": "material",
+    "coldark-cold": "friendly",
+    "coldark-dark": "native",
+    "dark-neon": "native",
+    "github": "github-dark",
+    "inspired-github": "github-dark",
+    "monokai-extended": "monokai",
+    "monokai-extended-bright": "monokai",
+    "monokai-extended-light": "monokai",
+    "monokai-extended-origin": "monokai",
+    "one-half-dark": "one-dark",
+    "one-half-light": "default",
+    "sublime-snazzy": "monokai",
+    "two-dark": "native",
+}
+
+
+def _pygments_style_name(name: str | None = None) -> str:
+    theme = (name or _CLI_SYNTAX_THEME or "monokai").strip().lower()
+    return _CODEX_THEME_TO_PYGMENTS.get(theme, theme)
+
+
+def _set_cli_syntax_theme(name: str) -> bool:
+    global _CLI_SYNTAX_THEME
+    theme = name.strip()
+    if not theme:
+        return False
+    try:
+        from pygments.styles import get_style_by_name
+    except Exception:
+        _CLI_SYNTAX_THEME = theme
+        return True
+    try:
+        get_style_by_name(_pygments_style_name(theme))
+    except Exception:
+        return False
+    _CLI_SYNTAX_THEME = theme
+    return True
 
 
 def _render_reasoning_for_terminal(
@@ -4120,6 +5141,12 @@ def _default_config_path() -> Path:
     return _default_codex_home() / "config.toml"
 
 
+def _configure_cli_syntax_theme(config: dict) -> None:
+    configured = _string_nested_config(config, ("tui", "theme"))
+    if configured:
+        _set_cli_syntax_theme(configured)
+
+
 def _parse_config_override(raw: str) -> tuple[str, object]:
     key, separator, value = raw.partition("=")
     key = key.strip()
@@ -4185,6 +5212,15 @@ def _bool_nested_config(config: dict, path: tuple[str, ...], default: bool) -> b
             return default
         value = value.get(part)
     return value if isinstance(value, bool) else default
+
+
+def _string_nested_config(config: dict, path: tuple[str, ...]) -> str | None:
+    value: object = config
+    for part in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value if isinstance(value, str) and value else None
 
 
 def _int_nested_config(config: dict, path: tuple[str, ...], default: int) -> int:

@@ -63,6 +63,9 @@ INTERRUPTED_TURN_GUIDANCE = (
     "processes may still be running in the background. If any tools/commands were "
     "aborted, they may have partially executed."
 )
+_MIN_AGENT_WAIT_TIMEOUT_MS = 10_000
+_DEFAULT_AGENT_WAIT_TIMEOUT_MS = 30_000
+_MAX_AGENT_WAIT_TIMEOUT_MS = 3_600_000
 
 
 class CodexSession:
@@ -94,10 +97,9 @@ class CodexSession:
     def steer_input(self, prompt: str, *, expected_turn_id: str | None = None) -> str:
         """Attach user input to the currently running regular turn.
 
-        This mirrors upstream `steer_input`: the queued input is drained into
-        history before the next model request, and the caller gets the active
-        turn id back. If no regular turn is running, callers should queue a
-        separate next turn instead.
+        Queued input is drained into history before the next model request,
+        and the caller gets the active turn id back. If no regular turn is
+        running, callers should queue a separate next turn instead.
         """
 
         item = _user_message(prompt, image_paths=(), cwd=self.config.resolved_cwd())
@@ -581,6 +583,8 @@ class CodexSession:
                         yield self.state.emit("turn.failed", error="pending input was blocked by user_prompt_submit hook")
                         return
 
+                yield from self._drain_agent_notifications()
+
                 reasoning = self.config.resolved_reasoning()
                 request = PromptRequest(
                     model=self.config.model,
@@ -843,10 +847,11 @@ class CodexSession:
             pre_hook = yield from self._run_tool_pre_hook(call)
             if pre_hook.should_block:
                 yield from flush_parallel()
+                hook_tool = _tool_hook_contract(call)
                 result = ToolResult(
                     False,
-                    pre_hook.block_reason or f"Tool call blocked by PreToolUse hook: {call['name']}",
-                    {"hook_blocked": True, "tool": call["name"]},
+                    _pre_tool_block_message(call, pre_hook.block_reason),
+                    {"hook_blocked": True, "tool": call["name"], "hook_tool_name": hook_tool.name},
                 )
                 yield self.state.emit(
                     "tool.started",
@@ -857,7 +862,23 @@ class CodexSession:
                 yield from self._record_tool_result(call, result)
                 continue
             if pre_hook.updated_input is not None:
-                call = {**call, "arguments": pre_hook.updated_input}
+                try:
+                    call = _tool_call_with_updated_hook_input(call, pre_hook.updated_input)
+                except ValueError as exc:
+                    yield from flush_parallel()
+                    result = ToolResult(
+                        False,
+                        str(exc),
+                        {"hook_updated_input_error": True, "tool": call["name"]},
+                    )
+                    yield self.state.emit(
+                        "tool.started",
+                        name=call["name"],
+                        call_id=call["call_id"],
+                        arguments=call["arguments"],
+                    )
+                    yield from self._record_tool_result(call, result)
+                    continue
             if parallel_enabled and self.tools.supports_parallel(call["name"]):
                 pending_parallel.append(call)
                 continue
@@ -890,32 +911,35 @@ class CodexSession:
 
     def _record_tool_result(self, call: dict[str, Any], result: Any) -> Iterator[CodexEvent]:
         if getattr(result, "ok", False):
-            post_hook = yield from self._run_hook(
-                "post_tool_use",
-                tool_name=call["name"],
-                tool_use_id=call["call_id"],
-                tool_input=call["arguments"],
-                tool_response={"output": result.output, "metadata": result.metadata},
-            )
-            replacement_text = (
-                post_hook.feedback_message
-                or (post_hook.stop_reason if post_hook.should_stop else None)
-            )
-            if replacement_text:
-                result = ToolResult(
-                    result.ok,
-                    replacement_text,
-                    {**result.metadata, "post_tool_use_replaced_output": True},
-                    result.response_output,
+            hook_contract = _post_tool_hook_contract(call, result)
+            if hook_contract is not None:
+                post_hook = yield from self._run_hook(
+                    "post_tool_use",
+                    tool_name=hook_contract.name,
+                    matcher_aliases=list(hook_contract.matcher_aliases),
+                    tool_use_id=hook_contract.tool_use_id or call["call_id"],
+                    tool_input=hook_contract.tool_input,
+                    tool_response=hook_contract.tool_response,
                 )
-            yield from self._record_hook_additional_contexts(post_hook)
-            if post_hook.should_stop:
-                result = ToolResult(
-                    False,
-                    result.output,
-                    {**result.metadata, "post_tool_use_stopped": True},
-                    result.response_output,
+                replacement_text = (
+                    post_hook.feedback_message
+                    or (post_hook.stop_reason if post_hook.should_stop else None)
                 )
+                if replacement_text:
+                    result = ToolResult(
+                        result.ok,
+                        replacement_text,
+                        {**result.metadata, "post_tool_use_replaced_output": True},
+                        result.response_output,
+                    )
+                yield from self._record_hook_additional_contexts(post_hook)
+                if post_hook.should_stop:
+                    result = ToolResult(
+                        False,
+                        result.output,
+                        {**result.metadata, "post_tool_use_stopped": True},
+                        result.response_output,
+                    )
         output_item = _tool_output_item(call, result)
         self.state.append_history(output_item)
         yield self.state.emit(
@@ -931,13 +955,29 @@ class CodexSession:
             if unified_diff is not None:
                 yield self.state.emit("turn_diff", unified_diff=unified_diff)
         yield self.state.emit("item.completed", item=output_item)
+        yield from self._drain_agent_notifications()
+
+    def _drain_agent_notifications(self) -> Iterator[CodexEvent]:
+        runtime = getattr(self.tools, "agent_runtime", None)
+        drain = getattr(runtime, "drain_notifications", None)
+        if not callable(drain):
+            return
+        for item in drain():
+            if not isinstance(item, dict):
+                continue
+            self.state.append_history(item)
+            yield self.state.emit("item.completed", item=item, subagent_notification=True)
 
     def _run_tool_pre_hook(self, call: dict[str, Any]) -> Iterator[CodexEvent]:
+        hook_contract = _pre_tool_hook_contract(call)
+        if hook_contract is None:
+            return _HookOutcome()
         outcome = yield from self._run_hook(
             "pre_tool_use",
-            tool_name=call["name"],
+            tool_name=hook_contract.name,
+            matcher_aliases=list(hook_contract.matcher_aliases),
             tool_use_id=call["call_id"],
-            tool_input=call["arguments"],
+            tool_input=hook_contract.tool_input,
         )
         yield from self._record_hook_additional_contexts(outcome)
         return outcome
@@ -1181,15 +1221,182 @@ class CodexSession:
             pass
 
 
+@dataclass(frozen=True)
+class _ToolHookContract:
+    name: str
+    matcher_aliases: tuple[str, ...]
+    tool_input: Any
+    tool_response: Any | None = None
+    tool_use_id: str | None = None
+
+
+def _tool_hook_contract(call: dict[str, Any], result: Any | None = None) -> _ToolHookContract:
+    name = str(call.get("name") or "")
+    args = _tool_call_arguments_object(call.get("arguments"))
+    if name == "exec_command":
+        command = str(args.get("cmd") or "")
+        return _ToolHookContract(
+            name="Bash",
+            matcher_aliases=(),
+            tool_input={"command": command},
+            tool_response=_post_tool_response_for_hook(name, result) if result is not None else None,
+            tool_use_id=_tool_result_event_call_id(result) or str(call.get("call_id") or ""),
+        )
+    if name == "write_stdin":
+        metadata = getattr(result, "metadata", None) if result is not None else None
+        command = ""
+        if isinstance(metadata, dict):
+            command = str(metadata.get("command") or "")
+        return _ToolHookContract(
+            name="Bash",
+            matcher_aliases=(),
+            tool_input={"command": command},
+            tool_response=_post_tool_response_for_hook(name, result) if result is not None else None,
+            tool_use_id=_tool_result_event_call_id(result) or str(call.get("call_id") or ""),
+        )
+    if name == "shell_command":
+        command = str(args.get("command") or "")
+        return _ToolHookContract(
+            name="Bash",
+            matcher_aliases=(),
+            tool_input={"command": command},
+            tool_response=_post_tool_response_for_hook(name, result) if result is not None else None,
+        )
+    if name == "apply_patch":
+        patch = _apply_patch_hook_command(call.get("arguments"))
+        return _ToolHookContract(
+            name="apply_patch",
+            matcher_aliases=("Write", "Edit"),
+            tool_input={"command": patch},
+            tool_response=_post_tool_response_for_hook(name, result) if result is not None else None,
+        )
+    return _ToolHookContract(
+        name=name,
+        matcher_aliases=(),
+        tool_input=call.get("arguments"),
+        tool_response=_post_tool_response_for_hook(name, result) if result is not None else None,
+    )
+
+
+def _pre_tool_hook_contract(call: dict[str, Any]) -> _ToolHookContract | None:
+    name = str(call.get("name") or "")
+    if name in {"exec_command", "shell_command", "apply_patch"}:
+        return _tool_hook_contract(call)
+    return None
+
+
+def _post_tool_hook_contract(call: dict[str, Any], result: Any) -> _ToolHookContract | None:
+    name = str(call.get("name") or "")
+    if name not in {"exec_command", "write_stdin", "shell_command", "apply_patch"}:
+        return None
+    contract = _tool_hook_contract(call, result)
+    if contract.tool_response is None:
+        return None
+    if name == "write_stdin" and isinstance(contract.tool_input, dict) and not contract.tool_input.get("command"):
+        return None
+    return contract
+
+
+def _tool_call_with_updated_hook_input(call: dict[str, Any], updated_input: Any) -> dict[str, Any]:
+    command = _updated_hook_command(updated_input)
+    name = str(call.get("name") or "")
+    if name == "exec_command":
+        args = _tool_call_arguments_object(call.get("arguments"))
+        return {**call, "arguments": {**args, "cmd": command}}
+    if name == "shell_command":
+        args = _tool_call_arguments_object(call.get("arguments"))
+        return {**call, "arguments": {**args, "command": command}}
+    if name == "apply_patch":
+        original = call.get("arguments")
+        if isinstance(original, dict):
+            return {**call, "arguments": {**original, "patch": command}}
+        return {**call, "arguments": command}
+    return {**call, "arguments": updated_input}
+
+
+def _updated_hook_command(updated_input: Any) -> str:
+    if isinstance(updated_input, dict):
+        value = updated_input.get("command")
+    else:
+        value = updated_input
+    if not isinstance(value, str) or not value:
+        raise ValueError("hook updated_input must contain a non-empty `command` string")
+    return value
+
+
+def _tool_call_arguments_object(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return dict(arguments)
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _apply_patch_hook_command(arguments: Any) -> str:
+    if isinstance(arguments, str):
+        return arguments
+    if isinstance(arguments, dict):
+        patch = arguments.get("patch")
+        return patch if isinstance(patch, str) else ""
+    return ""
+
+
+def _post_tool_response_for_hook(tool_name: str, result: Any | None) -> Any | None:
+    if result is None:
+        return None
+    metadata = getattr(result, "metadata", None)
+    if tool_name in {"exec_command", "write_stdin"}:
+        if not isinstance(metadata, dict) or "session_id" in metadata:
+            return None
+        output = metadata.get("output")
+        return output if isinstance(output, str) else ""
+    if tool_name == "shell_command":
+        return getattr(result, "output", "")
+    if tool_name == "apply_patch":
+        return getattr(result, "output", "")
+    if isinstance(metadata, dict):
+        response_text = metadata.get("response_text")
+        if isinstance(response_text, str) and response_text:
+            return response_text
+    return None
+
+
+def _tool_result_event_call_id(result: Any | None) -> str | None:
+    metadata = getattr(result, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("event_call_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _pre_tool_block_message(call: dict[str, Any], block_reason: str | None) -> str:
+    reason = block_reason or "blocked"
+    contract = _tool_hook_contract(call)
+    command = None
+    if isinstance(contract.tool_input, dict):
+        raw_command = contract.tool_input.get("command")
+        if isinstance(raw_command, str) and raw_command:
+            command = raw_command
+    if contract.name in {"Bash", "apply_patch"} and command:
+        return f"Command blocked by PreToolUse hook: {reason}. Command: {command}"
+    return f"Tool call blocked by PreToolUse hook: {reason}. Tool: {contract.name}"
+
+
 class _LocalAgentRecord:
-    def __init__(self, session: CodexSession, nickname: str | None):
+    def __init__(self, session: CodexSession, nickname: str | None, reference: str):
         self.session = session
         self.nickname = nickname
+        self.reference = reference
         self.condition = threading.Condition()
         self.pending: deque[str] = deque()
         self.thread: threading.Thread | None = None
         self.running = False
         self.shutdown = False
+        self.interrupted = False
         self.final_message: str | None = None
         self.error: str | None = None
 
@@ -1198,16 +1405,20 @@ class _LocalAgentRuntime:
     def __init__(self, parent: CodexSession):
         self.parent = parent
         self._agents: dict[str, _LocalAgentRecord] = {}
+        self._pending_notifications: deque[dict[str, Any]] = deque()
         self._lock = threading.Lock()
 
     def spawn_agent(self, arguments: dict[str, Any]) -> Any:
         prompt = _agent_prompt(arguments)
         if not prompt:
             return _agent_tool_error("spawn_agent requires message or text items")
+        child_depth = self.parent.config.agent_depth + 1
+        if child_depth > self.parent.config.max_agent_depth:
+            return _agent_tool_error("Agent depth limit reached. Solve the task yourself.")
         child = self._new_child_session(arguments)
         nickname = _agent_nickname(arguments)
-        record = _LocalAgentRecord(child, nickname)
         agent_id = child.state.thread_id
+        record = _LocalAgentRecord(child, nickname, _agent_reference(arguments, agent_id))
         with self._lock:
             self._agents[agent_id] = record
         self._start_agent(record, prompt)
@@ -1224,14 +1435,21 @@ class _LocalAgentRuntime:
             return _agent_tool_error(f"agent not found: {target}", {"status": "not_found"})
         submission_id = f"sub-{int(time.time() * 1000)}"
         start_prompt: str | None = None
+        interrupt_running = False
         with record.condition:
             if record.shutdown:
                 record.shutdown = False
             if record.running:
-                record.pending.append(prompt)
+                if bool(arguments.get("interrupt")):
+                    record.pending.appendleft(prompt)
+                    interrupt_running = True
+                else:
+                    record.pending.append(prompt)
             else:
                 start_prompt = prompt
             record.condition.notify_all()
+        if interrupt_running:
+            record.session.interrupt()
         if start_prompt is not None:
             self._start_agent(record, start_prompt)
         return _agent_tool_ok({"submission_id": submission_id})
@@ -1250,35 +1468,59 @@ class _LocalAgentRuntime:
         targets = arguments.get("targets")
         if not isinstance(targets, list) or not targets:
             return _agent_tool_error("wait_agent requires non-empty targets")
-        timeout_ms = int(arguments.get("timeout_ms", 30000))
-        deadline = time.monotonic() + max(timeout_ms, 0) / 1000
-        statuses: dict[str, Any] = {}
-        timed_out = False
-        for target in [str(item) for item in targets]:
-            record = self._agents.get(target)
-            if record is None:
-                statuses[target] = "not_found"
-                continue
-            with record.condition:
-                while record.running and time.monotonic() < deadline:
-                    record.condition.wait(timeout=max(0.0, deadline - time.monotonic()))
-                if record.running:
-                    timed_out = True
-                statuses[target] = _agent_status(record)
-        return _agent_tool_ok({"status": statuses, "timed_out": timed_out})
+        try:
+            requested_timeout_ms = int(arguments.get("timeout_ms", _DEFAULT_AGENT_WAIT_TIMEOUT_MS))
+        except (TypeError, ValueError):
+            requested_timeout_ms = _DEFAULT_AGENT_WAIT_TIMEOUT_MS
+        if requested_timeout_ms <= 0:
+            return _agent_tool_error("timeout_ms must be greater than zero")
+        timeout_ms = min(max(requested_timeout_ms, _MIN_AGENT_WAIT_TIMEOUT_MS), _MAX_AGENT_WAIT_TIMEOUT_MS)
+        target_ids = [str(item) for item in targets]
+        initial = self._final_agent_statuses(target_ids)
+        if initial:
+            return _agent_tool_ok({"status": initial, "timed_out": False})
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            statuses = self._final_agent_statuses(target_ids)
+            if statuses:
+                return _agent_tool_ok({"status": statuses, "timed_out": False})
+        return _agent_tool_ok({"status": {}, "timed_out": True})
 
     def close_agent(self, arguments: dict[str, Any]) -> Any:
         target = str(arguments.get("target") or "")
         record = self._agents.get(target)
         if record is None:
             return _agent_tool_ok({"previous_status": "not_found"})
+        interrupt_running = False
         with record.condition:
             previous = _agent_status(record)
             record.pending.clear()
             record.shutdown = True
-            if not record.running:
-                record.condition.notify_all()
+            interrupt_running = record.running
+            record.condition.notify_all()
+        if interrupt_running:
+            record.session.interrupt()
         return _agent_tool_ok({"previous_status": previous})
+
+    def drain_notifications(self) -> list[dict[str, Any]]:
+        with self._lock:
+            notifications = list(self._pending_notifications)
+            self._pending_notifications.clear()
+        return notifications
+
+    def _final_agent_statuses(self, targets: list[str]) -> dict[str, Any]:
+        statuses: dict[str, Any] = {}
+        for target in targets:
+            record = self._agents.get(target)
+            if record is None:
+                statuses[target] = "not_found"
+                continue
+            with record.condition:
+                status = _agent_status(record)
+            if _agent_status_is_final(status):
+                statuses[target] = status
+        return statuses
 
     def _new_child_session(self, arguments: dict[str, Any]) -> CodexSession:
         model = arguments.get("model") if isinstance(arguments.get("model"), str) else self.parent.config.model
@@ -1297,7 +1539,7 @@ class _LocalAgentRuntime:
         )
         child = CodexSession(child_config, model_client=self.parent.model_client)
         if bool(arguments.get("fork_context")):
-            child.state.history = list(self.parent.state.history)
+            child.state.history = _forked_agent_history(self.parent.state.history)
             child.state.forked_from_id = self.parent.state.thread_id
             child._initial_context_recorded = _history_has_initial_context(child.state.history)
         return child
@@ -1305,6 +1547,7 @@ class _LocalAgentRuntime:
     def _start_agent(self, record: _LocalAgentRecord, prompt: str) -> None:
         with record.condition:
             record.running = True
+            record.interrupted = False
             record.error = None
         thread = threading.Thread(target=self._run_agent_loop, args=(record, prompt), daemon=True)
         record.thread = thread
@@ -1317,19 +1560,38 @@ class _LocalAgentRuntime:
                 result = record.session.run(next_prompt)
                 final_message = result.final_message
                 error = None
+                interrupted = False
+            except TurnInterrupted:
+                final_message = None
+                error = None
+                interrupted = True
             except Exception as exc:  # pragma: no cover - exercised through model/tool failures.
                 final_message = None
                 error = f"{type(exc).__name__}: {exc}"
+                interrupted = False
             with record.condition:
                 record.final_message = final_message
                 record.error = error
+                record.interrupted = interrupted
                 if record.pending and not record.shutdown:
                     next_prompt = record.pending.popleft()
                     record.running = True
+                    record.interrupted = False
+                    record.error = None
                     continue
                 record.running = False
                 record.condition.notify_all()
-                return
+                should_notify = not record.shutdown and _agent_status_is_final(_agent_status(record))
+            if should_notify:
+                self._notify_parent_agent_completed(record)
+            return
+
+    def _notify_parent_agent_completed(self, record: _LocalAgentRecord) -> None:
+        with record.condition:
+            status = _agent_status(record)
+        item = _subagent_notification_message(record.reference, status)
+        with self._lock:
+            self._pending_notifications.append(item)
 
 
 def _agent_tool_ok(payload: dict[str, Any]) -> Any:
@@ -1372,14 +1634,40 @@ def _agent_nickname(arguments: dict[str, Any]) -> str | None:
     return agent_type if isinstance(agent_type, str) and agent_type else None
 
 
+def _agent_reference(arguments: dict[str, Any], agent_id: str) -> str:
+    task_name = arguments.get("task_name")
+    if isinstance(task_name, str) and task_name.strip():
+        return task_name.strip()
+    return agent_id
+
+
 def _agent_status(record: _LocalAgentRecord) -> Any:
     if record.shutdown:
         return "shutdown"
     if record.running:
         return "running"
+    if record.interrupted:
+        return "interrupted"
     if record.error is not None:
         return {"errored": record.error}
     return {"completed": record.final_message}
+
+
+def _agent_status_is_final(status: Any) -> bool:
+    if isinstance(status, dict):
+        return "completed" in status or "errored" in status
+    return status in {"interrupted", "shutdown", "not_found"}
+
+
+def _forked_agent_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    forked: list[dict[str, Any]] = []
+    for item in history:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        role = item.get("role")
+        if role in {"system", "developer", "user", "assistant"}:
+            forked.append(deepcopy(item))
+    return forked
 
 
 def _inside_git_repo(cwd: Any) -> bool:
@@ -1485,6 +1773,15 @@ def _turn_aborted_marker() -> dict[str, Any]:
 
 def _hook_context_message(text: str) -> dict[str, Any]:
     return _user_message(f"<hook_context>\n{text}\n</hook_context>")
+
+
+def _subagent_notification_message(agent_reference: str, status: Any) -> dict[str, Any]:
+    payload = json.dumps(
+        {"agent_path": agent_reference, "status": status},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return _user_message(f"<subagent_notification>\n{payload}\n</subagent_notification>")
 
 
 def _message_text(item: dict[str, Any]) -> str:

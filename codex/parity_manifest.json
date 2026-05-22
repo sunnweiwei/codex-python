@@ -188,6 +188,12 @@
           "exec_command_sandbox_denial_retry": "passed_static",
           "approval_cache": "passed_static",
           "permission_request_hook_events": "passed_static",
+          "permission_request_hook_tool_contract": "passed_static",
+          "pre_tool_use_hook_contracts": "passed_static",
+          "pre_tool_use_handler_coverage": "passed_static",
+          "pre_tool_use_updated_hook_input": "passed_static",
+          "post_tool_use_hook_contracts": "passed_static",
+          "post_tool_use_response_contracts": "passed_static",
           "platform_sandbox_metadata": "passed_static",
           "macos_seatbelt_argv_transform": "passed_static",
           "exec_command_real_pty": "passed_static",
@@ -199,6 +205,8 @@
           "apply_patch_change_metadata": "passed_static",
           "apply_patch_turn_diff_tracker": "passed_static",
           "apply_patch_runtime_committed_delta": "passed_static",
+          "apply_patch_core_verify_before_write": "passed_static",
+          "standalone_apply_patch_cli_partial_failure": "out_of_scope",
           "apply_patch_shell_heredoc_normalization": "passed_static",
           "apply_patch_safety_approval": "passed_static",
           "update_plan_output": "passed_static",
@@ -209,12 +217,19 @@
           "request_user_input": "partial",
           "request_user_input_provider": "passed_static",
           "request_user_input_local_cli_provider": "passed_static",
+          "request_user_input_root_thread_gate": "passed_static",
+          "request_user_input_normalization_copy": "passed_static",
           "multi_agent_runtime": "partial",
+          "multi_agent_interrupt": "passed_static",
+          "multi_agent_close_interrupt": "passed_static",
+          "multi_agent_wait_final_status_only": "passed_static",
+          "multi_agent_subagent_notification": "passed_static",
+          "multi_agent_fork_context_sanitization": "passed_static",
           "parallel_tool_dispatch": "passed_static",
           "parallel_tool_drain_order": "passed_static",
           "tests": "passed"
         },
-        "next_gate": "Unified exec/write_stdin/update_plan, local freeform apply_patch, apply_patch workspace-write path bounds/change metadata/turn-diff tracking/partial-failure committed deltas/shell-heredoc normalization, provider-backed sandbox/default approvals, permission-request hook events, session approval cache, on-failure sandbox-denial retry, macOS seatbelt argv transformation/metadata, view_image processing/catalog gating, request_user_input provider flow plus local CLI answer bridge, local multi-agent v1, and ordered parallel tool dispatch/drain are closer to upstream; remaining gates are full platform sandbox enforcement on every supported OS/environment, complete apply_patch hook/verification semantics, and exact ratatui/app-server request_user_input overlay replay/resolution semantics."
+                "next_gate": "Unified exec/write_stdin/update_plan, local freeform apply_patch, apply_patch workspace-write path bounds/change metadata/turn-diff tracking/runtime committed deltas/shell-heredoc normalization, Codex-core verify-before-write behavior, provider-backed sandbox/default approvals, canonical Bash/apply_patch pre/post/permission hook contracts including updated hook input rewrites and upstream-shaped post-hook responses, session approval cache, on-failure sandbox-denial retry, macOS seatbelt argv transformation/metadata, view_image processing/catalog gating, request_user_input provider flow plus local CLI answer bridge/root-thread gate/normalized question copies, local multi-agent v1 with interrupt/close/wait notification/fork sanitization, and ordered parallel tool dispatch/drain are closer to upstream. The standalone apply_patch CLI partial-failure fixture is tracked as out-of-scope for Codex exec because the upstream Codex tool handler pre-verifies before runtime apply. Remaining gates are full platform sandbox enforcement on every supported OS/environment, exact parser error wording/streaming patch-progress parity, persisted descendant-tree multi-agent shutdown/resume, and exact ratatui/app-server request_user_input overlay replay/resolution semantics."
       },
       "hosted_tools": {
         "status": "partial",
@@ -449,11 +464,19 @@
           "interactive_queued_compact_command": "passed_static",
           "interactive_plan_command": "passed_static",
           "interactive_inline_plan_command": "passed_static",
+          "interactive_new_command": "passed_static",
+          "interactive_clear_starts_new_chat": "passed_static",
+          "interactive_background_terminal_ps_stop": "passed_static",
           "interactive_ratatui_tui": "missing",
           "interactive_interrupts": "partial",
           "interactive_approval_overlay": "missing",
-          "interactive_resume_picker": "partial",
-          "interactive_fork_picker": "partial",
+          "interactive_resume_picker": "passed_static",
+          "interactive_fork_picker": "passed_static",
+          "top_level_resume_picker": "passed_static",
+          "top_level_fork_picker": "passed_static",
+          "top_level_help_resume_fork": "passed_static",
+          "resume_transcript_replay": "passed_static",
+          "resume_picker_viewport": "passed_static",
           "ansi_human_renderer": "passed_static",
           "human_cell_spacing": "passed_static",
           "wrapped_text_continuation_indent": "passed_static",
@@ -495,7 +518,7 @@
           "parity_check_command": "passed_static",
           "tests": "passed"
         },
-        "next_gate": "Useful exec args, aliases, JSON events, non-JSON stderr progress rendering, color auto/always/never, cell spacing, active CJK-aware wrapping with continuation indentation, full-cell agent message indentation, work-before-answer separators, lightweight Markdown human rendering with upstream-style boxed/wrapped table rendering and markdown-fence table unwrapping, indented reasoning/thinking cells, upstream-style plan-update/web-search/request-user-input history cells, upstream-style apply_patch file-change blocks, final-message stream deduplication, a partial upstream TUI-style ExecCell renderer for Ran/Explored/Read/List/Search with command continuation gutters and middle output truncation, normalized trace summaries, last-message output, output schema, image attachments, config.toml profile loading, dotted -c overrides, local rollout resume/fork, OSS provider CLI/config selection, bracketed-paste-aware multiline interactive input, basic cursor editing, bottom-anchored live Working/Compacting status rows with elapsed time, API-backed context token display, logical session-context carryover across compactions, and cumulative API-backed session reasoning token usage, running-turn pending input submission, local request_user_input prompting with arrow-key option selection and Other freeform notes, an upstream-derived slash-command catalog that prevents known/unknown commands from leaking to the model, local /status, /rollout, /resume, and /fork, upstream-style /compact result rendering plus queued /compact dispatch after an active turn, /plan and /default interactive mode switching including /plan <prompt> inline submission, prompt erase-on-submit to avoid duplicate user-message echo, and a partial Esc interrupt path for local model/tool work are covered. The earlier Python curses full-screen experiment is removed from the default path because it was not an upstream-equivalent port of the ratatui product surface. Remaining CLI gaps are the real ratatui-style interactive shell: exact layout/colors, exact status row shimmer/details/timer scheduling, Shift+Tab mode cycling, full composer editing/keybindings/history search/paste placeholders/attachments, active transcript rewriting, approval overlays, full implementation of popup-backed slash commands (/model, /permissions, /mcp, /apps, /plugins, /agent, /side, /goal, /theme, /pets, etc.), exact ratatui resume/fork picker visuals, exact request_user_input overlay/replay UI including unanswered-confirmation and notes layout parity, complete model-transport cancellation parity, a full port of codex-rs/shell-command parse_command.rs, app-server/thread-store resume names, full upstream config surface/permission profiles, local OSS provider transport/readiness, upstream exit-code edge cases, and automated official Codex oracle runs for trace comparison."
+        "next_gate": "Useful exec args, aliases, JSON events, non-JSON stderr progress rendering, color auto/always/never, cell spacing, active CJK-aware wrapping with continuation indentation, ANSI-safe wrapping for colored long lines, full-cell agent message indentation, work-before-answer separators, lightweight Markdown human rendering with upstream-style boxed/wrapped table rendering, markdown-fence table unwrapping, fenced-code syntax highlighting with upstream-style info-token extraction and [tui].theme//theme support, indented reasoning/thinking cells, upstream-style plan-update/web-search/request-user-input history cells, upstream-style apply_patch file-change blocks, final-message stream deduplication, a partial upstream TUI-style ExecCell renderer for Ran/Explored/Read/List/Search with command continuation gutters and middle output truncation, normalized trace summaries, last-message output, output schema, image attachments, config.toml profile loading, dotted -c overrides, local rollout resume/fork, top-level resume/fork chat entrypoints with raw-TTY picker controls and main-help visibility, bounded large-list resume picker viewport, transcript replay after resume/fork, OSS provider CLI/config selection, bracketed-paste-aware multiline interactive input, basic cursor editing, bottom-anchored live Working/Compacting status rows with elapsed time, API-backed context token display, logical session-context carryover across compactions, and cumulative API-backed session reasoning token usage, running-turn pending input submission, local request_user_input prompting with arrow-key option selection and Other freeform notes, an upstream-derived slash-command catalog that prevents known/unknown commands from leaking to the model, local /status, /rollout, /resume, /fork, /theme, /new, /clear, /ps, and /stop, upstream-style /compact result rendering plus queued /compact dispatch after an active turn, /plan and /default interactive mode switching including /plan <prompt> inline submission, prompt erase-on-submit to avoid duplicate user-message echo, and a partial Esc interrupt path for local model/tool work are covered. The earlier Python curses full-screen experiment is removed from the default path because it was not an upstream-equivalent port of the ratatui product surface. Remaining CLI gaps are the real ratatui-style interactive shell: exact layout/colors, exact status row shimmer/details/timer scheduling, Shift+Tab mode cycling, full composer editing/keybindings/history search/paste placeholders/attachments, active transcript rewriting, approval overlays, full implementation of popup-backed slash commands (/model, /permissions, /mcp, /apps, /plugins, /agent, /side, /goal, /pets, etc.), exact ratatui resume/fork picker colors/expanded transcript preview/app-server thread names, exact request_user_input overlay/replay UI including unanswered-confirmation and notes layout parity, complete model-transport cancellation parity, a full port of codex-rs/shell-command parse_command.rs, full upstream config surface/permission profiles, local OSS provider transport/readiness, upstream exit-code edge cases, and automated official Codex oracle runs for trace comparison."
       },
       "mcp_plugins": {
         "status": "missing",
@@ -628,7 +651,7 @@
       "exec_command": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Uses upstream-style response text, yield bounds, byte-level output capture, real PTY for tty=true on Unix, tty-gated stdin, approval/retry paths, macOS seatbelt argv transformation when available, and structured rollout metadata; full cross-platform sandbox orchestration remains partial."
+        "notes": "Uses upstream-style response text, yield bounds, byte-level output capture, real PTY for tty=true on Unix, tty-gated stdin, approval/retry paths, canonical hook-facing Bash contracts with updated-command rewrites, macOS seatbelt argv transformation when available, and structured rollout metadata; full cross-platform sandbox orchestration remains partial."
       },
       "write_stdin": {
         "status": "partial",
@@ -644,7 +667,7 @@
       "apply_patch": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Copied grammar is executable for local add/update/delete patches, including upstream overwrite, move, A/M/D summary, verify-before-write handling for predictable correctness errors, runtime committed-delta turn_diff events, shell heredoc normalization from supported exec_command invocations, configured workspace-write path bounds, plus git-diff fallback; exact approval/orchestrator hooks and full codex_apply_patch grammar/runtime semantics remain incomplete."
+        "notes": "Copied grammar is executable for local add/update/delete patches, including upstream overwrite, move, A/M/D summary, Codex-core verify-before-write handling for predictable correctness errors, canonical apply_patch hook contracts with Write/Edit aliases, patch rewrites, and string post-hook responses, runtime committed-delta turn_diff events for write failures, shell heredoc normalization from supported exec_command invocations, configured workspace-write path bounds, plus git-diff fallback; remaining gaps are exact Rust parser error wording and streaming patch-progress parity. The standalone apply_patch CLI partial-failure fixture is not a Codex exec parity requirement."
       },
       "update_plan": {
         "status": "partial",
@@ -665,17 +688,17 @@
       "request_user_input": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Schema, default unavailable-in-Default-mode handler, normalized isOther flag, local provider response path, local CLI answer bridge, and upstream-style result history cell are present. Exact ratatui overlay/app-server replay and resolution semantics remain incomplete."
+        "notes": "Schema, default unavailable-in-Default-mode handler, root-thread-only gate, copied normalized question payloads with isOther/isSecret, local provider response path, local CLI answer bridge, and upstream-style result history cell are present. Exact ratatui overlay/app-server replay and resolution semantics remain incomplete."
       },
       "spawn_agent": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local Python subagent sessions can spawn/run in background; app-server/cloud thread management and full recursive worker semantics remain incomplete."
+        "notes": "Model-visible schema is present and local Python subagent sessions can spawn/run in background, enforce the depth limit, inherit effective model/reasoning, and sanitize fork_context history to upstream-allowed message items. App-server/cloud thread management and persisted recursive tree semantics remain incomplete."
       },
       "send_input": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local Python subagent sessions accept queued follow-up input; true interruption semantics remain incomplete."
+        "notes": "Model-visible schema is present and local Python subagent sessions accept queued follow-up input; interrupt=true aborts the active child turn/tools before running the new prompt."
       },
       "resume_agent": {
         "status": "partial",
@@ -685,12 +708,12 @@
       "wait_agent": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local waits return running/completed/errored/not_found statuses."
+        "notes": "Model-visible schema is present and local waits return only final statuses, return an empty status map on timeout, and queue upstream-style subagent completion notifications for the parent context."
       },
       "close_agent": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local agents can be marked shutdown; hard cancellation of running child work remains incomplete."
+        "notes": "Model-visible schema is present and local agents can be marked shutdown; running child turns/tools are interrupted, while persisted descendant-tree shutdown remains incomplete."
       },
       "web_search": {
         "status": "partial",
