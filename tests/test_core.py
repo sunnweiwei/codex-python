@@ -7577,5 +7577,262 @@ model_reasoning_effort = "low"
             cli._CLI_SYNTAX_THEME = old_theme
 
 
+    # ------------------------------------------------------------------
+    # Sanity / smoke tests for the basics agents have shipped broken.
+    # ------------------------------------------------------------------
+
+    def test_codex_package_imports_cleanly(self) -> None:
+        """`python3 -c "import codex; import codex.X..."` must succeed for every
+        submodule the eval reaches into. Catches NameErrors / missing typing
+        imports / circular-import explosions that prevent the suite from
+        starting at all."""
+        env = dict(os.environ)
+        env.pop("PY_CODEX_FAKE_RESPONSES", None)
+        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import codex; "
+                "import codex.types; import codex.state; import codex.prompts; "
+                "import codex.tools; import codex.model; import codex.memory; "
+                "import codex.cli",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_python_m_codex_help_lists_known_subcommands(self) -> None:
+        """`python3 -m codex --help` must succeed and mention `exec`. Catches
+        agents that ship without a top-level CLI (no `__main__`, no parser)."""
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+        completed = subprocess.run(
+            [sys.executable, "-m", "codex", "--help"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("exec", completed.stdout)
+        completed = subprocess.run(
+            [sys.executable, "-m", "codex", "exec", "--help"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_default_model_client_is_openai_responses_when_no_fake_env(self) -> None:
+        """Without `PY_CODEX_FAKE_RESPONSES`, `default_model_client()` must
+        return an `OpenAIResponsesModel` instance — the live API client.
+        Catches agents that ship hardcoded stubs as the default."""
+        env = dict(os.environ)
+        env.pop("PY_CODEX_FAKE_RESPONSES", None)
+        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os\n"
+                "os.environ.pop('PY_CODEX_FAKE_RESPONSES', None)\n"
+                "from codex.model import default_model_client, OpenAIResponsesModel\n"
+                "client = default_model_client()\n"
+                "assert isinstance(client, OpenAIResponsesModel), "
+                "'default_model_client() must return OpenAIResponsesModel when "
+                "no PY_CODEX_FAKE_RESPONSES is set; got %s' % type(client).__name__\n",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_codex_session_default_model_client_is_openai_responses(self) -> None:
+        """A bare `CodexSession()` (no explicit model_client) must wire to
+        `OpenAIResponsesModel`. Catches agents whose CodexSession constructor
+        silently picks a stub."""
+        env = dict(os.environ)
+        env.pop("PY_CODEX_FAKE_RESPONSES", None)
+        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os\n"
+                "os.environ.pop('PY_CODEX_FAKE_RESPONSES', None)\n"
+                "from codex import CodexConfig, CodexSession\n"
+                "from codex.model import OpenAIResponsesModel\n"
+                "session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True))\n"
+                "assert isinstance(session.model_client, OpenAIResponsesModel), "
+                "'CodexSession.model_client must default to OpenAIResponsesModel; "
+                "got %s' % type(session.model_client).__name__\n",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_py_codex_fake_responses_env_is_honored_by_default_client(self) -> None:
+        """Inverse guard: when `PY_CODEX_FAKE_RESPONSES` IS set,
+        `default_model_client()` must return a `ScriptedResponsesModel` —
+        catching agents that ignore the env var and unconditionally call
+        OpenAI even in CI / test runs."""
+        env = dict(os.environ)
+        env["PY_CODEX_FAKE_RESPONSES"] = json.dumps([
+            {"output": [{"type": "message", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "ok"}]}]}
+        ])
+        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from codex.model import default_model_client, ScriptedResponsesModel\n"
+                "client = default_model_client()\n"
+                "assert isinstance(client, ScriptedResponsesModel), "
+                "'PY_CODEX_FAKE_RESPONSES set must yield ScriptedResponsesModel; "
+                "got %s' % type(client).__name__\n",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_codex_session_stream_routes_through_model_client(self) -> None:
+        """`session.run(prompt)` must invoke the configured `model_client`
+        (via `.stream(...)` or `.create(...)`) at least once. Catches agents
+        whose `session.stream()` yields hardcoded events and bypasses the
+        client entirely (teamwork-style fake REPL output)."""
+        calls: list[Any] = []
+
+        class _TrackingModel:
+            def stream(self, request: PromptRequest):
+                calls.append(("stream", request))
+                yield ModelStreamEvent(
+                    type="response.completed",
+                    payload={"id": "track-1", "output": [
+                        {"type": "message", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "ok"}]}
+                    ]},
+                )
+
+            def create(self, request: PromptRequest):
+                calls.append(("create", request))
+                return type("R", (), {"id": "track-1", "output": [
+                    {"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "ok"}]}
+                ], "raw": {}})()
+
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=_TrackingModel(),
+        )
+        session.run("hello")
+        self.assertGreaterEqual(
+            len(calls), 1,
+            "session.run() did not invoke model_client.stream/create — "
+            "implementation is yielding hardcoded events instead of using "
+            "the configured model client.",
+        )
+
+    def test_session_run_raises_when_no_api_key_and_no_fake_responses(self) -> None:
+        """With no `OPENAI_API_KEY` and no `PY_CODEX_FAKE_RESPONSES`, calling
+        `session.run("hi")` must raise an error (not silently emit placeholder
+        events). Catches agents that swallow the missing-credentials case."""
+        env = dict(os.environ)
+        env.pop("OPENAI_API_KEY", None)
+        env.pop("PY_CODEX_FAKE_RESPONSES", None)
+        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+        script = (
+            "import os\n"
+            "os.environ.pop('OPENAI_API_KEY', None)\n"
+            "os.environ.pop('PY_CODEX_FAKE_RESPONSES', None)\n"
+            "from codex import CodexConfig, CodexSession\n"
+            "session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True))\n"
+            "raised = False\n"
+            "try:\n"
+            "    session.run('hi')\n"
+            "except Exception:\n"
+            "    raised = True\n"
+            "assert raised, 'session.run() did not raise when neither "
+            "OPENAI_API_KEY nor PY_CODEX_FAKE_RESPONSES was set'\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_cli_exec_exit_codes_reflect_outcome(self) -> None:
+        """`python3 -m codex exec` must exit 0 on success and non-zero on
+        failure. Catches CLIs that always exit 0 (downstream CI cannot tell
+        success from failure)."""
+        env_ok = dict(os.environ)
+        env_ok["PY_CODEX_FAKE_RESPONSES"] = json.dumps([
+            {"output": [{"type": "message", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "ok"}]}]}
+        ])
+        env_ok["PYTHONPATH"] = os.getcwd() + os.pathsep + env_ok.get("PYTHONPATH", "")
+        ok = subprocess.run(
+            [sys.executable, "-m", "codex", "exec",
+             "--skip-git-repo-check", "--ephemeral", "say hi"],
+            env=env_ok,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+
+        env_bad = dict(os.environ)
+        env_bad["PY_CODEX_FAKE_RESPONSES"] = "not-json"
+        env_bad["PYTHONPATH"] = os.getcwd() + os.pathsep + env_bad.get("PYTHONPATH", "")
+        bad = subprocess.run(
+            [sys.executable, "-m", "codex", "exec",
+             "--skip-git-repo-check", "--ephemeral", "say hi"],
+            env=env_bad,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(bad.returncode, 0,
+                            "exec must exit non-zero when the model layer fails")
+
+    def test_apply_patch_rejects_stale_context_without_modifying_files(self) -> None:
+        """`apply_patch` must reject a hunk whose context line doesn't match
+        the file, AND must not leave any partial modifications behind.
+        Atomicity matters — half-applied patches corrupt the workspace."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "file.txt"
+            target.write_text("real line A\nreal line B\nreal line C\n",
+                              encoding="utf-8")
+            original = target.read_text(encoding="utf-8")
+            runtime = ToolRuntime(CodexConfig(
+                cwd=tmp,
+                writable_roots=(tmp,),
+                skip_git_repo_check=True,
+                ephemeral=True,
+            ))
+            stale_patch = (
+                "*** Begin Patch\n"
+                "*** Update File: file.txt\n"
+                "@@\n"
+                " WRONG CONTEXT LINE\n"
+                "-real line B\n"
+                "+real line B!!!\n"
+                "*** End Patch\n"
+            )
+            result = runtime.apply_patch({"patch": stale_patch})
+            self.assertFalse(result.ok,
+                             f"apply_patch should fail on stale context; got ok=True, output={result.output!r}")
+            self.assertEqual(target.read_text(encoding="utf-8"), original,
+                             "apply_patch must leave the file untouched when "
+                             "the patch is rejected")
+
+
 if __name__ == "__main__":
     unittest.main()
