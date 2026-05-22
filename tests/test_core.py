@@ -20,57 +20,106 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-import codex.types as codex_types
-from codex import CodexConfig, CodexSession
-from codex.memory import MemoryStageOneRecord
-from codex.memory import MemoryStateStore
-from codex.memory import MemoryThreadRecord
-from codex.memory import MemoryWorkspaceChange
-from codex.memory import load_memory_rollout
-from codex.memory import memory_rollout_candidates
-from codex.memory import memory_rollout_is_stage1_startup_eligible
-from codex.memory import memory_workspace_diff
-from codex.memory import memory_extensions_root
-from codex.memory import memory_rate_limit_allows_startup
-from codex.memory import prepare_memory_workspace
-from codex.memory import prune_old_extension_resources
-from codex.memory import prune_stage1_records_for_retention
-from codex.memory import reset_memory_workspace_baseline
-from codex.memory import run_memory_stage_one_for_rollout
-from codex.memory import run_memory_startup_once
-from codex.memory import sanitize_response_item_for_memories
-from codex.memory import seed_extension_instructions
-from codex.memory import serialize_filtered_rollout_response_items
-from codex.memory import select_phase2_memory_inputs
-from codex.memory import build_memory_consolidation_config
-from codex.memory import rebuild_raw_memories_file_from_memories
-from codex.memory import render_memory_workspace_diff_file
-from codex.memory import rollout_summaries_dir
-from codex.memory import rollout_summary_file_stem
-from codex.memory import extract_memory_stage_one
-from codex.memory import memory_stage_one_output_schema
-from codex.memory import parse_memory_stage_one_output
-from codex.memory import raw_memories_file
-from codex.memory import run_memory_consolidation_session
-from codex.memory import run_memory_phase2_once
-from codex.memory import run_memory_startup_pipeline_once
-from codex.memory import start_memory_startup_task
-from codex.memory import sync_rollout_summaries_from_memories
-from codex.memory import sync_phase2_workspace_inputs
-from codex.memory import write_current_memory_workspace_diff
-from codex.memory import write_memory_workspace_diff
-from codex.model import ScriptedResponsesModel
-from codex.model import ModelStreamEvent
-from codex.model import collect_stream_response
-from codex.model import load_env_file
-from codex.prompts import build_base_instructions, build_environment_context, build_initial_context_items
-from codex.prompts import build_permissions_instructions, collect_agents_md
-from codex.prompts import verify_asset_hashes, read_model_catalog_instructions
-from codex.prompts import ASSETS_DIR as _CODEX_ASSETS_DIR
+# --- safe import shim (do not remove) -------------------------------------
+# Every `from codex.* import X` below is wrapped so that if a candidate
+# implementation is missing symbol X, the test module still loads. Only the
+# tests that actually touch X fail (with a clear ImportError) instead of the
+# whole suite collapsing at import time.
+import importlib as _importlib
+
+def _codex_unavail(qualname, exc):
+    msg = "{} is not implemented in this codex package: {}: {}".format(
+        qualname, type(exc).__name__, exc
+    )
+    class _Unavailable:
+        def __call__(self, *a, **k): raise ImportError(msg)
+        def __getattr__(self, n): raise ImportError(msg)
+        def __iter__(self): raise ImportError(msg)
+        def __bool__(self): return False
+        def __repr__(self): return "<unavailable {}>".format(qualname)
+    _Unavailable.__name__ = qualname.rsplit(".", 1)[-1]
+    return _Unavailable()
+
+def _codex_safe_from(modname, *names_with_aliases):
+    """names_with_aliases items are either 'Name' or 'Name as Alias'."""
+    pairs = []
+    for spec in names_with_aliases:
+        spec = spec.strip()
+        if " as " in spec:
+            name, alias = [p.strip() for p in spec.split(" as ")]
+        else:
+            name = alias = spec
+        pairs.append((name, alias))
+    try:
+        mod = _importlib.import_module(modname)
+    except Exception as _e:
+        for name, alias in pairs:
+            globals()[alias] = _codex_unavail(modname + "." + name, _e)
+        return
+    for name, alias in pairs:
+        try:
+            globals()[alias] = getattr(mod, name)
+        except AttributeError as _e:
+            globals()[alias] = _codex_unavail(modname + "." + name, _e)
+
+def _codex_safe_import(modname, alias):
+    try:
+        globals()[alias] = _importlib.import_module(modname)
+    except Exception as _e:
+        globals()[alias] = _codex_unavail(modname, _e)
+# --- end safe import shim -------------------------------------------------
+
+_codex_safe_import("codex.types", "codex_types")
+_codex_safe_from("codex", "CodexConfig", "CodexSession")
+_codex_safe_from("codex.memory", "MemoryStageOneRecord")
+_codex_safe_from("codex.memory", "MemoryStateStore")
+_codex_safe_from("codex.memory", "MemoryThreadRecord")
+_codex_safe_from("codex.memory", "MemoryWorkspaceChange")
+_codex_safe_from("codex.memory", "load_memory_rollout")
+_codex_safe_from("codex.memory", "memory_rollout_candidates")
+_codex_safe_from("codex.memory", "memory_rollout_is_stage1_startup_eligible")
+_codex_safe_from("codex.memory", "memory_workspace_diff")
+_codex_safe_from("codex.memory", "memory_extensions_root")
+_codex_safe_from("codex.memory", "memory_rate_limit_allows_startup")
+_codex_safe_from("codex.memory", "prepare_memory_workspace")
+_codex_safe_from("codex.memory", "prune_old_extension_resources")
+_codex_safe_from("codex.memory", "prune_stage1_records_for_retention")
+_codex_safe_from("codex.memory", "reset_memory_workspace_baseline")
+_codex_safe_from("codex.memory", "run_memory_stage_one_for_rollout")
+_codex_safe_from("codex.memory", "run_memory_startup_once")
+_codex_safe_from("codex.memory", "sanitize_response_item_for_memories")
+_codex_safe_from("codex.memory", "seed_extension_instructions")
+_codex_safe_from("codex.memory", "serialize_filtered_rollout_response_items")
+_codex_safe_from("codex.memory", "select_phase2_memory_inputs")
+_codex_safe_from("codex.memory", "build_memory_consolidation_config")
+_codex_safe_from("codex.memory", "rebuild_raw_memories_file_from_memories")
+_codex_safe_from("codex.memory", "render_memory_workspace_diff_file")
+_codex_safe_from("codex.memory", "rollout_summaries_dir")
+_codex_safe_from("codex.memory", "rollout_summary_file_stem")
+_codex_safe_from("codex.memory", "extract_memory_stage_one")
+_codex_safe_from("codex.memory", "memory_stage_one_output_schema")
+_codex_safe_from("codex.memory", "parse_memory_stage_one_output")
+_codex_safe_from("codex.memory", "raw_memories_file")
+_codex_safe_from("codex.memory", "run_memory_consolidation_session")
+_codex_safe_from("codex.memory", "run_memory_phase2_once")
+_codex_safe_from("codex.memory", "run_memory_startup_pipeline_once")
+_codex_safe_from("codex.memory", "start_memory_startup_task")
+_codex_safe_from("codex.memory", "sync_rollout_summaries_from_memories")
+_codex_safe_from("codex.memory", "sync_phase2_workspace_inputs")
+_codex_safe_from("codex.memory", "write_current_memory_workspace_diff")
+_codex_safe_from("codex.memory", "write_memory_workspace_diff")
+_codex_safe_from("codex.model", "ScriptedResponsesModel")
+_codex_safe_from("codex.model", "ModelStreamEvent")
+_codex_safe_from("codex.model", "collect_stream_response")
+_codex_safe_from("codex.model", "load_env_file")
+_codex_safe_from("codex.prompts", "build_base_instructions", "build_environment_context", "build_initial_context_items")
+_codex_safe_from("codex.prompts", "build_permissions_instructions", "collect_agents_md")
+_codex_safe_from("codex.prompts", "verify_asset_hashes", "read_model_catalog_instructions")
+_codex_safe_from("codex.prompts", "ASSETS_DIR as _CODEX_ASSETS_DIR")
 
 
 # Inlined from codex.parity so codex.parity isn't part of the eval
-# surface (it's an audit/internal module — see codex-eval/SPEC.md). The
+# surface (it's an audit/internal module — see codex-impl/SPEC.md). The
 # audit-side coverage of compare_assets_to_upstream lives in
 # tests/test_codex_parity_audit.py.
 _EVAL_UPSTREAM_ASSET_PATHS = {
