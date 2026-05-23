@@ -11,7 +11,10 @@ import shlex
 import shutil
 import select
 import sys
-import termios
+try:
+    import termios
+except ImportError:  # pragma: no cover - Windows has no termios; raw-TTY paths degrade to line input.
+    termios = None  # type: ignore[assignment]
 import textwrap
 import threading
 import time

@@ -48,8 +48,9 @@ class OpenAIResponsesModel:
     def stream(self, request: PromptRequest) -> Iterable[ModelStreamEvent]:
         try:
             from openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError("Install the openai package to use OpenAIResponsesModel") from exc
+        except ImportError:
+            yield from self._stream_via_http(request)
+            return
 
         client = OpenAI(api_key=self.api_key) if self.api_key else OpenAI()
         kwargs = request.to_responses_kwargs()
@@ -65,6 +66,81 @@ class OpenAIResponsesModel:
             return
         data = _model_dump(response)
         yield from _scripted_stream_events(data)
+
+    def _stream_via_http(self, request: PromptRequest) -> Iterable[ModelStreamEvent]:
+        """Fallback path used when the `openai` package is not installed.
+
+        Sends the same payload as the SDK to POST {base_url}/responses, parsing
+        SSE for stream=True and a single JSON body otherwise.
+        """
+        body_dict = request.to_responses_kwargs()
+        body_dict = {k: v for k, v in body_dict.items() if v is not None}
+        body = json.dumps(body_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if request.stream else "application/json",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if os.environ.get("OPENAI_ORGANIZATION"):
+            headers["OpenAI-Organization"] = os.environ["OPENAI_ORGANIZATION"]
+        if os.environ.get("OPENAI_PROJECT"):
+            headers["OpenAI-Project"] = os.environ["OPENAI_PROJECT"]
+        url = f"{self.base_url.rstrip('/')}/responses"
+        http_request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            response = urllib.request.urlopen(http_request, timeout=600)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"responses request failed with HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"responses request failed: {exc.reason}") from exc
+
+        if not request.stream:
+            with response:
+                payload = json.loads(response.read().decode("utf-8"))
+            yield from _scripted_stream_events(payload)
+            return
+
+        with response:
+            yield from iter_model_stream_events(_iter_sse_events(response))
+
+
+def _iter_sse_events(stream: Any) -> Iterable[dict[str, Any]]:
+    """Parse an OpenAI Responses SSE stream into raw event dicts.
+
+    Each event looks like:
+        event: <name>
+        data: <json>
+        <blank line>
+    The JSON payload already carries `type`, so the event name is informational.
+    """
+    data_lines: list[str] = []
+    for raw_line in stream:
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, (bytes, bytearray)) else str(raw_line)
+        line = line.rstrip("\r\n")
+        if line == "":
+            if data_lines:
+                payload = "\n".join(data_lines)
+                data_lines = []
+                if payload == "[DONE]":
+                    return
+                try:
+                    yield json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
+    if data_lines:
+        payload = "\n".join(data_lines)
+        if payload and payload != "[DONE]":
+            try:
+                yield json.loads(payload)
+            except json.JSONDecodeError:
+                pass
 
     def compact(
         self,

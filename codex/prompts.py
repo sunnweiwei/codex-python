@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 
 from datetime import datetime
@@ -374,7 +375,12 @@ def _approval_asset_name(policy: ApprovalPolicy) -> str:
 
 
 def _default_shell() -> str:
-    return os.environ.get("SHELL", "/bin/bash")
+    explicit = os.environ.get("SHELL")
+    if explicit:
+        return explicit
+    if sys.platform == "win32":
+        return os.environ.get("ComSpec") or "cmd.exe"
+    return "/bin/bash"
 
 
 def _default_shell_name() -> str:

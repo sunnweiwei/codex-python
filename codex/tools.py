@@ -186,7 +186,7 @@ class ToolRuntime:
             return call
         if not isinstance(command, str):
             return call
-        shell = str(args.get("shell") or os.environ.get("SHELL") or "/bin/bash")
+        shell = str(args.get("shell") or _default_shell())
         login = bool(args.get("login", True))
         if not _can_intercept_apply_patch_shell(shell, login):
             return call
@@ -231,7 +231,7 @@ class ToolRuntime:
         workdir = self._resolve_workdir(args.get("workdir"))
         yield_time_ms = _clamp_exec_yield_time(int(args.get("yield_time_ms", DEFAULT_EXEC_YIELD_TIME_MS)))
         max_output_tokens = int(args.get("max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS))
-        shell = str(args.get("shell") or os.environ.get("SHELL") or "/bin/bash")
+        shell = str(args.get("shell") or _default_shell())
         login = bool(args.get("login", True))
         tty = bool(args.get("tty", False))
 
@@ -375,7 +375,7 @@ class ToolRuntime:
         timeout = max(int(args.get("timeout_ms", 120000)) / 1000, 1)
         start = time.monotonic()
         completed = subprocess.run(
-            _shell_argv(os.environ.get("SHELL") or "/bin/bash", command, bool(args.get("login", True))),
+            _shell_argv(_default_shell(), command, bool(args.get("login", True))),
             cwd=workdir,
             text=True,
             capture_output=True,
@@ -1757,6 +1757,21 @@ def _resolve_apply_patch_shell_workdir(base_workdir: Path, workdir: str | None) 
     if not path.is_absolute():
         path = base_workdir / path
     return path.resolve()
+
+
+def _default_shell() -> str:
+    """Pick the platform-appropriate default shell.
+
+    On Windows there is no `SHELL` env var by convention; fall back to
+    `ComSpec` (typically `cmd.exe`) so the POSIX `/bin/bash` default doesn't
+    leak into Windows subprocess invocations.
+    """
+    explicit = os.environ.get("SHELL")
+    if explicit:
+        return explicit
+    if sys.platform == "win32":
+        return os.environ.get("ComSpec") or "cmd.exe"
+    return "/bin/bash"
 
 
 def _can_intercept_apply_patch_shell(shell: str, login: bool) -> bool:
