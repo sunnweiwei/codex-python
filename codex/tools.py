@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from .goal import GoalToolOperationResult
+from .goal import create_goal_spec, get_goal_spec, update_goal_spec
 from .prompts import read_asset
 from .types import CodexConfig
 
@@ -93,10 +95,16 @@ class AgentRuntime(Protocol):
 
 
 class ToolRuntime:
-    def __init__(self, config: CodexConfig, agent_runtime: AgentRuntime | None = None):
+    def __init__(
+        self,
+        config: CodexConfig,
+        agent_runtime: AgentRuntime | None = None,
+        goal_runtime: Any | None = None,
+    ):
         self.config = config
         self.cwd = config.resolved_cwd()
         self.agent_runtime = agent_runtime
+        self.goal_runtime = goal_runtime
         self._sessions: dict[int, RunningCommand] = {}
         self._active_commands: list[RunningCommand] = []
         self._next_session_id = 1
@@ -116,6 +124,14 @@ class ToolRuntime:
             )
         if self.config.include_update_plan_tool:
             tools.append(ToolDefinition("update_plan", update_plan_spec(), self.update_plan))
+        if self._goal_tools_available():
+            tools.extend(
+                [
+                    ToolDefinition("get_goal", get_goal_spec(), self.get_goal),
+                    ToolDefinition("create_goal", create_goal_spec(), self.create_goal),
+                    ToolDefinition("update_goal", update_goal_spec(), self.update_goal),
+                ]
+            )
         if self.config.include_request_user_input_tool:
             tools.append(
                 ToolDefinition(
@@ -170,6 +186,39 @@ class ToolRuntime:
             return tool.handler(arguments)
         except Exception as exc:
             return ToolResult(False, f"{type(exc).__name__}: {exc}", {"tool": name})
+
+    def _goal_tools_available(self) -> bool:
+        if not self.config.goals_enabled or not self.config.include_goal_tools:
+            return False
+        runtime = self.goal_runtime
+        available = getattr(runtime, "tools_available", None)
+        return bool(callable(available) and available())
+
+    def _goal_tool_result(self, result: GoalToolOperationResult) -> ToolResult:
+        for event in result.events:
+            self._record_runtime_event(event.type, **event.payload)
+        return ToolResult(result.ok, result.output, result.metadata, result.response_output)
+
+    def get_goal(self, arguments: Any) -> ToolResult:
+        runtime = self.goal_runtime
+        handler = getattr(runtime, "get_goal_tool", None)
+        if not callable(handler):
+            return ToolResult(False, "goals feature is unavailable", {"tool": "get_goal"})
+        return self._goal_tool_result(handler(arguments))
+
+    def create_goal(self, arguments: Any) -> ToolResult:
+        runtime = self.goal_runtime
+        handler = getattr(runtime, "create_goal", None)
+        if not callable(handler):
+            return ToolResult(False, "goals feature is unavailable", {"tool": "create_goal"})
+        return self._goal_tool_result(handler(arguments))
+
+    def update_goal(self, arguments: Any) -> ToolResult:
+        runtime = self.goal_runtime
+        handler = getattr(runtime, "update_goal", None)
+        if not callable(handler):
+            return ToolResult(False, "goals feature is unavailable", {"tool": "update_goal"})
+        return self._goal_tool_result(handler(arguments))
 
     def normalize_tool_call(self, call: dict[str, Any]) -> dict[str, Any]:
         name = str(call.get("name") or "")

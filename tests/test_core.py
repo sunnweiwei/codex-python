@@ -4,6 +4,7 @@ import json
 import base64
 import io
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -800,6 +801,20 @@ class CodexCoreTests(unittest.TestCase):
         self.assertNotIn("include", payload)
         self.assertNotIn("tool_choice", payload)
         self.assertEqual(payload["text"], {"verbosity": "low"})
+
+    def test_openai_responses_model_exposes_remote_compact_endpoint(self) -> None:
+        model = OpenAIResponsesModel(api_key="sk-test", base_url="https://example.test/v1")
+        self.assertTrue(callable(model.compact))
+        self.assertEqual(model._compact_url(), "https://example.test/v1/responses/compact")
+        headers = model._compact_headers(
+            session_id="session-1",
+            thread_id="thread-1",
+            installation_id="install-1",
+        )
+        self.assertEqual(headers["Authorization"], "Bearer sk-test")
+        self.assertEqual(headers["x-codex-installation-id"], "install-1")
+        self.assertEqual(headers["session-id"], "session-1")
+        self.assertEqual(headers["thread-id"], "thread-1")
 
     def test_prompt_request_matches_upstream_empty_tools_shape(self) -> None:
         request = PromptRequest(
@@ -5725,7 +5740,7 @@ new file mode 100644
         self.assertIn("ERROR: JSONDecodeError:", completed.stderr)
         self.assertNotIn("Traceback (most recent call last)", completed.stderr)
         self.assertNotIn("<frozen runpy>", completed.stderr)
-        self.assertNotIn("codex/__main__.py", completed.stderr)
+        self.assertNotIn("agents/codex/__main__.py", completed.stderr)
 
     def test_cli_module_entrypoint_errors_do_not_show_traceback(self) -> None:
         env = {
@@ -5754,7 +5769,7 @@ new file mode 100644
         self.assertIn("ERROR: JSONDecodeError:", completed.stderr)
         self.assertNotIn("Traceback (most recent call last)", completed.stderr)
         self.assertNotIn("<frozen runpy>", completed.stderr)
-        self.assertNotIn("codex/cli.py", completed.stderr)
+        self.assertNotIn("agents/codex/cli.py", completed.stderr)
 
     def test_cli_chat_route_errors_do_not_show_traceback(self) -> None:
         env = {
@@ -6625,6 +6640,207 @@ new file mode 100644
         self.assertIn("Unrecognized command '/definitely-not-real'", plain)
         self.assertNotIn("model should not be called", plain)
 
+    def test_cli_tty_first_prompt_is_not_rendered_as_queued_follow_up(self) -> None:
+        # An idle REPL receiving its first prompt must flow straight into the
+        # normal turn renderer. Previous solutions were also echoing the input
+        # under a "Queued follow-up inputs" banner before the turn started,
+        # which both duplicated the prompt and falsely suggested it was being
+        # deferred.
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        env = {
+            **os.environ,
+            "TERM": "xterm-256color",
+            "PY_CODEX_FAKE_RESPONSES": json.dumps([message("hi back")]),
+            "PYTHONPATH": os.getcwd(),
+        }
+        output = self._run_cli_pty(
+            [
+                sys.executable,
+                "-m",
+                "codex",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+            ],
+            env=env,
+            interactions=[
+                ("hello there\r", "hi back"),
+                ("/exit\r", None),
+            ],
+            timeout=15.0,
+        )
+        plain = _plain_terminal_output(output)
+
+        prelude = plain.split("hi back", 1)[0]
+        self.assertNotIn("Queued follow-up inputs", prelude)
+        self.assertNotIn("Messages to be submitted after next tool call", prelude)
+        self.assertLessEqual(
+            prelude.count("hello there"),
+            2,
+            msg=f"prompt should not be echoed more than twice; got:\n{prelude}",
+        )
+
+    def test_cli_tty_chat_accepts_input_after_esc_interrupt(self) -> None:
+        # After the user presses ESC to abort a running turn, the REPL must
+        # still accept and dispatch the next prompt. A previous regression
+        # tore down the keyboard reader thread on ESC, leaving the REPL
+        # blocked on an empty input queue forever.
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        responses = [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "sleep-1",
+                        "arguments": json.dumps({"cmd": "sleep 10", "yield_time_ms": 30000}),
+                    }
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+            },
+            message("post-interrupt-reply"),
+        ]
+        env = {
+            **os.environ,
+            "TERM": "xterm-256color",
+            "PY_CODEX_FAKE_RESPONSES": json.dumps(responses),
+            "PYTHONPATH": os.getcwd(),
+        }
+        output = self._run_cli_pty(
+            [
+                sys.executable,
+                "-m",
+                "codex",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+            ],
+            env=env,
+            interactions=[
+                ("run slow\r", "Working"),
+                ("\x1b", "Conversation interrupted"),
+                ("ping again\r", "post-interrupt-reply"),
+                ("/exit\r", None),
+            ],
+            timeout=20.0,
+        )
+        plain = _plain_terminal_output(output)
+
+        self.assertIn("Conversation interrupted", plain)
+        self.assertIn("post-interrupt-reply", plain)
+
+    def test_cli_tty_render_uses_crlf_line_endings_in_raw_mode(self) -> None:
+        # In interactive TUI mode the tty is in raw mode (no OPOST/ONLCR
+        # translation), so a bare LF only advances the cursor row, leaving
+        # the column wherever the previous line ended. Successive tool
+        # cells therefore drift right until they fall off-screen. The
+        # renderer must emit CR+LF for every line break, either by
+        # leaving OPOST on or by writing "\r\n" explicitly.
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        responses = [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "arguments": json.dumps({"cmd": "echo first", "yield_time_ms": 2000}),
+                    }
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+            },
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "cmd-2",
+                        "arguments": json.dumps({"cmd": "echo second", "yield_time_ms": 2000}),
+                    }
+                ],
+                "usage": {"input_tokens": 12, "output_tokens": 2, "total_tokens": 14},
+            },
+            message("done"),
+        ]
+        env = {
+            **os.environ,
+            "TERM": "xterm-256color",
+            "PY_CODEX_FAKE_RESPONSES": json.dumps(responses),
+            "PYTHONPATH": os.getcwd(),
+        }
+        output = self._run_cli_pty(
+            [
+                sys.executable,
+                "-m",
+                "codex",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+            ],
+            env=env,
+            interactions=[
+                ("run two\r", "done"),
+                ("/exit\r", None),
+            ],
+            timeout=20.0,
+        )
+
+        crlf_count = output.count("\r\n")
+        bare_lf_count = len(re.findall(r"(?<!\r)\n", output))
+        self.assertGreater(
+            crlf_count,
+            5,
+            msg=f"expected many CRLF line endings in raw-mode TUI output; "
+                f"saw crlf={crlf_count} bare_lf={bare_lf_count}",
+        )
+        self.assertLess(
+            bare_lf_count,
+            crlf_count,
+            msg=f"raw-mode TUI emitted more bare LFs than CRLFs "
+                f"(crlf={crlf_count} bare_lf={bare_lf_count}); "
+                f"successive cells will drift right",
+        )
+
+    def test_cli_tty_model_slash_command_is_recognized(self) -> None:
+        # `/model` is part of the upstream slash-command surface. Solutions
+        # have shipped without it, falling through to "Unrecognized command",
+        # which both breaks the upstream workflow and confuses the user.
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        env = {
+            **os.environ,
+            "TERM": "xterm-256color",
+            "PY_CODEX_FAKE_RESPONSES": json.dumps([message("model should not be called")]),
+            "PYTHONPATH": os.getcwd(),
+        }
+        output = self._run_cli_pty(
+            [
+                sys.executable,
+                "-m",
+                "codex",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+            ],
+            env=env,
+            interactions=[
+                ("/model\r", None),
+                ("/exit\r", None),
+            ],
+            timeout=10.0,
+        )
+        plain = _plain_terminal_output(output)
+
+        self.assertNotIn("Unrecognized command '/model'", plain)
+        self.assertNotIn("model should not be called", plain)
+
     def test_cli_tty_status_slash_command_renders_local_status(self) -> None:
         if sys.platform == "win32":
             self.skipTest("PTY smoke is Unix-only")
@@ -6911,8 +7127,8 @@ new file mode 100644
 
     def test_command_actions_classify_common_exploration_commands(self) -> None:
         self.assertEqual(parse_command_actions("rg --files | head -n 50")[0]["type"], "list_files")
-        self.assertEqual(parse_command_actions("rg -n foo codex")[0]["type"], "search")
-        self.assertEqual(parse_command_actions("cat codex/cli.py")[0]["type"], "read")
+        self.assertEqual(parse_command_actions("rg -n foo agents/codex")[0]["type"], "search")
+        self.assertEqual(parse_command_actions("cat agents/codex/cli.py")[0]["type"], "read")
 
     def test_cli_exec_accepts_upstream_short_aliases_and_compat_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

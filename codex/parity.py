@@ -751,7 +751,7 @@ class CodexCLIResult:
 class CodexCLIOracle:
     """Parity helper that may call the official Codex CLI.
 
-    Native `codex` execution never uses this class.
+    Native `agents.codex` execution never uses this class.
     """
 
     def __init__(self, options: CodexExecOptions | None = None):

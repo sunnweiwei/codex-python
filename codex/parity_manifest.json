@@ -26,12 +26,12 @@
       "pinned_upstream": {
         "status": "parity",
         "owner_files": [
-          "codex/prompts.py",
-          "codex/parity.py",
-          "codex/parity_manifest.json"
+          "agents/codex/prompts.py",
+          "agents/codex/parity.py",
+          "agents/codex/parity_manifest.json"
         ],
         "upstream_refs": [
-          "git rev-parse HEAD at codex/upstream/openai-codex"
+          "git rev-parse HEAD at agents/codex/upstream/openai-codex"
         ],
         "gates": {
           "commit_locked": "passed",
@@ -42,7 +42,7 @@
       "package_layout": {
         "status": "complete",
         "owner_files": [
-          "codex",
+          "agents/codex",
           "tests"
         ],
         "upstream_refs": [
@@ -58,13 +58,13 @@
       "parity_framework": {
         "status": "complete",
         "owner_files": [
-          "codex/parity.py",
-          "codex/cli.py",
-          "codex/PARITY_AUDIT.md",
-          "codex/parity_manifest.json"
+          "agents/codex/parity.py",
+          "agents/codex/cli.py",
+          "agents/codex/PARITY_AUDIT.md",
+          "agents/codex/parity_manifest.json"
         ],
         "upstream_refs": [
-          "codex/upstream/openai-codex"
+          "agents/codex/upstream/openai-codex"
         ],
         "gates": {
           "manifest_lifecycle": "passed",
@@ -72,13 +72,13 @@
           "audit_coverage": "passed_static",
           "module_status_policy": "passed"
         },
-        "next_gate": "Each future module batch must update this manifest and pass python -m codex parity check."
+        "next_gate": "Each future module batch must update this manifest and pass python -m agents.codex parity check."
       },
       "prompt_assets": {
         "status": "parity",
         "owner_files": [
-          "codex/assets",
-          "codex/prompts.py"
+          "agents/codex/assets",
+          "agents/codex/prompts.py"
         ],
         "upstream_refs": [
           "codex-rs/core prompt assets",
@@ -95,8 +95,8 @@
       "prompt_assembly": {
         "status": "complete",
         "owner_files": [
-          "codex/prompts.py",
-          "codex/core.py"
+          "agents/codex/prompts.py",
+          "agents/codex/core.py"
         ],
         "upstream_refs": [
           "codex-rs/core/src/client_common.rs",
@@ -119,9 +119,9 @@
       "request_shape": {
         "status": "partial",
         "owner_files": [
-          "codex/types.py",
-          "codex/model.py",
-          "codex/core.py"
+          "agents/codex/types.py",
+          "agents/codex/model.py",
+          "agents/codex/core.py"
         ],
         "upstream_refs": [
           "codex-rs/core/src/client.rs",
@@ -149,8 +149,8 @@
       "tool_surface": {
         "status": "complete",
         "owner_files": [
-          "codex/tools.py",
-          "codex/parity_manifest.json"
+          "agents/codex/tools.py",
+          "agents/codex/parity_manifest.json"
         ],
         "upstream_refs": [
           "codex-rs/core/src/tools/spec_plan.rs",
@@ -169,8 +169,8 @@
       "tool_runtime": {
         "status": "partial",
         "owner_files": [
-          "codex/tools.py",
-          "codex/core.py"
+          "agents/codex/tools.py",
+          "agents/codex/core.py"
         ],
         "upstream_refs": [
           "codex-rs/tools/src",
@@ -234,9 +234,9 @@
       "hosted_tools": {
         "status": "partial",
         "owner_files": [
-          "codex/tools.py",
-          "codex/core.py",
-          "codex/model.py"
+          "agents/codex/tools.py",
+          "agents/codex/core.py",
+          "agents/codex/model.py"
         ],
         "upstream_refs": [
           "codex-rs/core/src/tools/hosted_spec.rs"
@@ -253,10 +253,10 @@
       "session_lifecycle": {
         "status": "complete",
         "owner_files": [
-          "codex/core.py",
-          "codex/state.py",
-          "codex/types.py",
-          "codex/model.py"
+          "agents/codex/core.py",
+          "agents/codex/state.py",
+          "agents/codex/types.py",
+          "agents/codex/model.py"
         ],
         "upstream_refs": [
           "codex-rs/core/src/session",
@@ -293,9 +293,9 @@
       "state_rollout": {
         "status": "complete",
         "owner_files": [
-          "codex/state.py",
-          "codex/core.py",
-          "codex/memory.py"
+          "agents/codex/state.py",
+          "agents/codex/core.py",
+          "agents/codex/memory.py"
         ],
         "upstream_refs": [
           "codex-rs/core rollout/session/thread store"
@@ -333,9 +333,9 @@
       "memory": {
         "status": "partial",
         "owner_files": [
-          "codex/memory.py",
-          "codex/prompts.py",
-          "codex/core.py"
+          "agents/codex/memory.py",
+          "agents/codex/prompts.py",
+          "agents/codex/core.py"
         ],
         "upstream_refs": [
           "codex-rs/memories/read",
@@ -383,11 +383,11 @@
       "compaction": {
         "status": "partial",
         "owner_files": [
-          "codex/state.py",
-          "codex/core.py",
-          "codex/prompts.py",
-          "codex/model.py",
-          "codex/types.py"
+          "agents/codex/state.py",
+          "agents/codex/core.py",
+          "agents/codex/prompts.py",
+          "agents/codex/model.py",
+          "agents/codex/types.py"
         ],
         "upstream_refs": [
           "codex-rs/core/src/compact.rs",
@@ -421,11 +421,51 @@
         },
         "next_gate": "Local manual/auto compaction now covers model-catalog context-window limits, streamed token usage, upstream-ordered pre-sampling compaction before current context/user input, last-API-usage-plus-local-items accounting, mid-turn follow-up compaction, previous-model downshift compaction, and pre/post compact hook gates that can inject context or abort. OpenAI-style /responses/compact remote compaction now sends the upstream endpoint payload shape, processes replacement history, and can fall back to local prompt compact in auto mode. Remaining gaps are image-specific token-estimator adjustments, websocket reset semantics, remote compaction v2, remote trace checkpoint recording, and upstream's own TODO for pending incoming context/user estimation."
       },
+      "goals": {
+        "status": "complete",
+        "owner_files": [
+          "agents/codex/goal.py",
+          "agents/codex/core.py",
+          "agents/codex/tools.py",
+          "agents/codex/cli.py",
+          "agents/codex/state.py",
+          "agents/codex/assets/prompts/goals"
+        ],
+        "upstream_refs": [
+          "latest codex-rs/core/src/goals.rs",
+          "latest codex-rs/core/src/tools/handlers/goal_spec.rs",
+          "latest codex-rs/core/src/tools/handlers/goal",
+          "latest codex-rs/state/src/runtime/goals.rs",
+          "latest codex-rs/tui/src/app/thread_goal_actions.rs",
+          "latest codex-rs/tui/src/chatwidget/goal_menu.rs",
+          "latest codex-rs/core/templates/goals"
+        ],
+        "gates": {
+          "latest_upstream_source_audit": "passed_static",
+          "asset_templates": "passed",
+          "feature_gate_default": "passed_static",
+          "persisted_thread_tool_surface": "passed",
+          "tool_order": "passed",
+          "create_goal_contract": "passed",
+          "get_goal_contract": "passed",
+          "update_goal_contract": "passed",
+          "status_wire_shape": "passed",
+          "token_accounting": "passed",
+          "budget_limit_steering": "passed",
+          "automatic_continuation": "passed",
+          "plan_mode_skip": "passed_static",
+          "rollout_events": "passed_static",
+          "slash_command": "passed_static",
+          "storage_backend_exact_db": "not_applicable",
+          "tests": "passed"
+        },
+        "next_gate": "Core goal-mode behavior/protocol is implemented against the latest source audit: persisted-thread-only tools, tool order, create/get/update semantics, non-cached-input-plus-output token accounting, budget-limit steering, hidden continuation prompts, Plan-mode skip, rollout events, and local /goal controls. The Python port uses a self-contained JSON goal store instead of the Rust state DB; exact ratatui popups and DB internals remain tracked under CLI/state product parity rather than blocking the Python core runtime."
+      },
       "cli_exec": {
         "status": "partial",
         "owner_files": [
-          "codex/cli.py",
-          "codex/__main__.py"
+          "agents/codex/cli.py",
+          "agents/codex/__main__.py"
         ],
         "upstream_refs": [
           "codex-rs/exec",
@@ -518,12 +558,12 @@
           "parity_check_command": "passed_static",
           "tests": "passed"
         },
-        "next_gate": "Useful exec args, aliases, JSON events, non-JSON stderr progress rendering, color auto/always/never, cell spacing, active CJK-aware wrapping with continuation indentation, ANSI-safe wrapping for colored long lines, full-cell agent message indentation, work-before-answer separators, lightweight Markdown human rendering with upstream-style boxed/wrapped table rendering, markdown-fence table unwrapping, fenced-code syntax highlighting with upstream-style info-token extraction and [tui].theme//theme support, indented reasoning/thinking cells, upstream-style plan-update/web-search/request-user-input history cells, upstream-style apply_patch file-change blocks, final-message stream deduplication, a partial upstream TUI-style ExecCell renderer for Ran/Explored/Read/List/Search with command continuation gutters and middle output truncation, normalized trace summaries, last-message output, output schema, image attachments, config.toml profile loading, dotted -c overrides, local rollout resume/fork, top-level resume/fork chat entrypoints with raw-TTY picker controls and main-help visibility, bounded large-list resume picker viewport, transcript replay after resume/fork, OSS provider CLI/config selection, bracketed-paste-aware multiline interactive input, basic cursor editing, bottom-anchored live Working/Compacting status rows with elapsed time, API-backed context token display, logical session-context carryover across compactions, and cumulative API-backed session reasoning token usage, running-turn pending input submission, local request_user_input prompting with arrow-key option selection and Other freeform notes, an upstream-derived slash-command catalog that prevents known/unknown commands from leaking to the model, local /status, /rollout, /resume, /fork, /theme, /new, /clear, /ps, and /stop, upstream-style /compact result rendering plus queued /compact dispatch after an active turn, /plan and /default interactive mode switching including /plan <prompt> inline submission, prompt erase-on-submit to avoid duplicate user-message echo, and a partial Esc interrupt path for local model/tool work are covered. The earlier Python curses full-screen experiment is removed from the default path because it was not an upstream-equivalent port of the ratatui product surface. Remaining CLI gaps are the real ratatui-style interactive shell: exact layout/colors, exact status row shimmer/details/timer scheduling, Shift+Tab mode cycling, full composer editing/keybindings/history search/paste placeholders/attachments, active transcript rewriting, approval overlays, full implementation of popup-backed slash commands (/model, /permissions, /mcp, /apps, /plugins, /agent, /side, /goal, /pets, etc.), exact ratatui resume/fork picker colors/expanded transcript preview/app-server thread names, exact request_user_input overlay/replay UI including unanswered-confirmation and notes layout parity, complete model-transport cancellation parity, a full port of codex-rs/shell-command parse_command.rs, full upstream config surface/permission profiles, local OSS provider transport/readiness, upstream exit-code edge cases, and automated official Codex oracle runs for trace comparison."
+        "next_gate": "Useful exec args, aliases, JSON events, non-JSON stderr progress rendering, color auto/always/never, cell spacing, active CJK-aware wrapping with continuation indentation, ANSI-safe wrapping for colored long lines, full-cell agent message indentation, work-before-answer separators, lightweight Markdown human rendering with upstream-style boxed/wrapped table rendering, markdown-fence table unwrapping, fenced-code syntax highlighting with upstream-style info-token extraction and [tui].theme//theme support, indented reasoning/thinking cells, upstream-style plan-update/web-search/request-user-input history cells, upstream-style apply_patch file-change blocks, final-message stream deduplication, a partial upstream TUI-style ExecCell renderer for Ran/Explored/Read/List/Search with command continuation gutters and middle output truncation, normalized trace summaries, last-message output, output schema, image attachments, config.toml profile loading, dotted -c overrides, local rollout resume/fork, top-level resume/fork chat entrypoints with raw-TTY picker controls and main-help visibility, bounded large-list resume picker viewport, transcript replay after resume/fork, OSS provider CLI/config selection, bracketed-paste-aware multiline interactive input, basic cursor editing, bottom-anchored live Working/Compacting status rows with elapsed time, API-backed context token display, logical session-context carryover across compactions, and cumulative API-backed session reasoning token usage, running-turn pending input submission, local request_user_input prompting with arrow-key option selection and Other freeform notes, an upstream-derived slash-command catalog that prevents known/unknown commands from leaking to the model, local /status, /rollout, /resume, /fork, /theme, /new, /clear, /goal, /ps, and /stop, upstream-style /compact result rendering plus queued /compact dispatch after an active turn, /plan and /default interactive mode switching including /plan <prompt> inline submission, prompt erase-on-submit to avoid duplicate user-message echo, and a partial Esc interrupt path for local model/tool work are covered. The earlier Python curses full-screen experiment is removed from the default path because it was not an upstream-equivalent port of the ratatui product surface. Remaining CLI gaps are the real ratatui-style interactive shell: exact layout/colors, exact status row shimmer/details/timer scheduling, Shift+Tab mode cycling, full composer editing/keybindings/history search/paste placeholders/attachments, active transcript rewriting, approval overlays, full implementation of popup-backed slash commands (/model, /permissions, /mcp, /apps, /plugins, /agent, /side, /pets, etc.), exact ratatui /goal popup/replace-confirm visuals, exact ratatui resume/fork picker colors/expanded transcript preview/app-server thread names, exact request_user_input overlay/replay UI including unanswered-confirmation and notes layout parity, complete model-transport cancellation parity, a full port of codex-rs/shell-command parse_command.rs, full upstream config surface/permission profiles, local OSS provider transport/readiness, upstream exit-code edge cases, and automated official Codex oracle runs for trace comparison."
       },
       "mcp_plugins": {
         "status": "missing",
         "owner_files": [
-          "codex/tools.py"
+          "agents/codex/tools.py"
         ],
         "upstream_refs": [
           "codex-rs/core MCP and plugin dynamic tool paths"
@@ -539,7 +579,7 @@
   },
   "upstream": {
     "repository": "https://github.com/openai/codex",
-    "local_path": "codex/upstream/openai-codex",
+    "local_path": "agents/codex/upstream/openai-codex",
     "commit": "392e94e9ea756cffd89f35941e881d29b2a81a6e",
     "license": "Apache-2.0",
     "public_exec_core_target": true,
@@ -551,6 +591,7 @@
       "prompt_request": "codex-rs/core/src/client_common.rs",
       "session": "codex-rs/core/src/session",
       "compaction": "codex-rs/core/src/compact.rs",
+      "goals_latest": "latest codex-rs/core/src/goals.rs and codex-rs/core/templates/goals",
       "memory_read": "codex-rs/memories/read",
       "memory_write": "codex-rs/memories/write"
     },
@@ -628,17 +669,51 @@
           "codex-rs/core/templates/compact/summary_prefix.md"
         ]
       },
+      "goals": {
+        "default_behavior": "stable feature, enabled by default, exposed only when persisted thread-goal storage is available and disabled for ephemeral sessions/review subagents",
+        "status_in_python": "complete_core_runtime",
+        "latest_source_commit": "7d47056ea42636271ac020b86347fbbef49490aa",
+        "tools": [
+          "get_goal",
+          "create_goal",
+          "update_goal"
+        ],
+        "prompt_assets": [
+          "codex-rs/core/templates/goals/continuation.md",
+          "codex-rs/core/templates/goals/budget_limit.md",
+          "codex-rs/core/templates/goals/objective_updated.md"
+        ]
+      },
       "mcp_and_plugins": {
         "default_behavior": "config/runtime dependent",
         "status_in_python": "missing"
       }
     }
   },
+  "latest_upstream": {
+    "repository": "https://github.com/openai/codex",
+    "local_path": "/private/tmp/openai-codex-latest",
+    "commit": "7d47056ea42636271ac020b86347fbbef49490aa",
+    "commit_subject": "fix: plugin bundle archive handling for upload and install (#23983)",
+    "goal_source_refs": [
+      "codex-rs/core/src/goals.rs",
+      "codex-rs/core/src/tools/handlers/goal_spec.rs",
+      "codex-rs/core/src/tools/handlers/goal/create_goal.rs",
+      "codex-rs/core/src/tools/handlers/goal/get_goal.rs",
+      "codex-rs/core/src/tools/handlers/goal/update_goal.rs",
+      "codex-rs/state/src/runtime/goals.rs",
+      "codex-rs/tui/src/app/thread_goal_actions.rs",
+      "codex-rs/tui/src/chatwidget/goal_menu.rs",
+      "codex-rs/tui/src/goal_display.rs",
+      "codex-rs/core/templates/goals"
+    ]
+  },
   "python_current": {
-    "package_path": "codex",
+    "package_path": "agents/codex",
     "core_modules": {
-        "cli.py": "python -m codex exec subset with JSONL, profile/config loading, dotted -c overrides, output schema, images, local rollout resume, OSS provider flags, and last-message output",
+        "cli.py": "python -m agents.codex exec subset with JSONL, profile/config loading, dotted -c overrides, output schema, images, local rollout resume, OSS provider flags, and last-message output",
       "core.py": "session and follow-up tool-call loop with active-turn pending input and interrupt abort markers",
+      "goal.py": "thread goal store/runtime, goal tool specs, latest goal prompt rendering, token/time accounting, and continuation steering",
       "model.py": "OpenAI Responses API wrapper plus scripted fake model",
         "memory.py": "Memory rollout loader/filter, Phase 1 output schema, request builder, parser, explicit extractor, upstream secret redaction, thread-store metadata backfill and source/idle/age/current-thread filtered DB startup claims, DB-claimed startup pipeline, detached background startup task, rate-limit guard, automatic session startup hook support, Stage 1 storage file helpers, Phase 2 workspace git baseline/diff rendering, and explicit consolidation session runner",
       "tools.py": "compact native tool registry and handlers",
@@ -673,6 +748,27 @@
         "status": "partial",
         "upstream_default_non_windows": true,
         "notes": "Returns upstream `Plan updated`, rejects Plan mode, and persists plan_update EventMsg; richer UI plan state remains incomplete."
+      },
+      "get_goal": {
+        "status": "conditional_complete",
+        "model_visible_by_default": false,
+        "model_visible_when_persisted_thread": true,
+        "upstream_default_non_windows": false,
+        "notes": "Latest Goal-mode tool schema and handler are exposed only for persisted, non-ephemeral threads when goals are enabled; returns the current thread goal, status, usage, and remaining budget fields."
+      },
+      "create_goal": {
+        "status": "conditional_complete",
+        "model_visible_by_default": false,
+        "model_visible_when_persisted_thread": true,
+        "upstream_default_non_windows": false,
+        "notes": "Latest Goal-mode tool schema and handler create goals only on explicit request, reject duplicates, validate objective/budget, baseline existing usage, emit thread-goal update events, and start active accounting."
+      },
+      "update_goal": {
+        "status": "conditional_complete",
+        "model_visible_by_default": false,
+        "model_visible_when_persisted_thread": true,
+        "upstream_default_non_windows": false,
+        "notes": "Latest Goal-mode tool schema and handler allow only complete/blocked status changes, account usage before completion, report completion-budget guidance, and leave user/system-only pause/resume/budget status changes outside model control."
       },
       "view_image": {
         "status": "partial",

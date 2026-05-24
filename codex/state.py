@@ -303,6 +303,32 @@ class CodexState:
         if event.type == "token_count":
             records.append(_rollout_line("event_msg", _token_count_payload(event)))
             return records
+        if event.type == "thread.goal.updated":
+            goal = event.payload.get("goal")
+            if isinstance(goal, dict):
+                records.append(
+                    _rollout_line(
+                        "event_msg",
+                        {
+                            "type": "thread_goal_updated",
+                            "thread_id": self.thread_id,
+                            "turn_id": event.payload.get("turn_id"),
+                            "goal": goal,
+                        },
+                    )
+                )
+            return records
+        if event.type == "thread.goal.cleared":
+            records.append(
+                _rollout_line(
+                    "event_msg",
+                    {
+                        "type": "thread_goal_cleared",
+                        "thread_id": self.thread_id,
+                    },
+                )
+            )
+            return records
         if event.type == "turn_diff":
             records.append(
                 _rollout_line("event_msg", {"type": "turn_diff", "unified_diff": str(event.payload.get("unified_diff") or "")})
@@ -1029,6 +1055,10 @@ def _is_contextual_user_message(item: dict[str, Any]) -> bool:
             text,
             "<subagent_notification>",
             "</subagent_notification>",
+        ) or _matches_context_fragment(
+            text,
+            "<goal_context>",
+            "</goal_context>",
         ):
             saw_context = True
             continue

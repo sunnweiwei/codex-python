@@ -5,6 +5,7 @@ The native implementation in this package does not call the official
 """
 
 from .core import CodexSession
+from .goal import GoalRuntime, GoalStore, ThreadGoal
 from .memory import MemoryRollout
 from .memory import MemoryStageOneRecord
 from .memory import MemoryStageOneOutput
@@ -17,9 +18,12 @@ __all__ = [
     "CodexEvent",
     "CodexResult",
     "CodexSession",
+    "GoalRuntime",
+    "GoalStore",
     "MemoryRollout",
     "MemoryStageOneOutput",
     "MemoryStageOneRecord",
     "MemoryStartupResult",
     "MemoryWorkspaceChange",
+    "ThreadGoal",
 ]

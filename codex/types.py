@@ -61,8 +61,13 @@ COMPACTION_LIFECYCLE: tuple[LifecycleStep, ...] = (
     LifecycleStep("compaction_warning", "warning", "diagnostic"),
 )
 
+GOAL_LIFECYCLE: tuple[LifecycleStep, ...] = (
+    LifecycleStep("thread_goal_updated", "thread.goal.updated", "thread", mutates_history=False),
+    LifecycleStep("thread_goal_cleared", "thread.goal.cleared", "thread", mutates_history=False),
+)
+
 KNOWN_EVENT_TYPES = frozenset(
-    step.event_type for step in (*EXEC_LIFECYCLE, *COMPACTION_LIFECYCLE)
+    step.event_type for step in (*EXEC_LIFECYCLE, *COMPACTION_LIFECYCLE, *GOAL_LIFECYCLE)
 )
 TERMINAL_TURN_EVENT_TYPES = frozenset(
     step.event_type for step in EXEC_LIFECYCLE if step.terminal
@@ -70,7 +75,7 @@ TERMINAL_TURN_EVENT_TYPES = frozenset(
 
 
 def lifecycle_event_types() -> tuple[str, ...]:
-    return tuple(dict.fromkeys(step.event_type for step in (*EXEC_LIFECYCLE, *COMPACTION_LIFECYCLE)))
+    return tuple(dict.fromkeys(step.event_type for step in (*EXEC_LIFECYCLE, *COMPACTION_LIFECYCLE, *GOAL_LIFECYCLE)))
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,8 @@ class CodexConfig:
     include_request_user_input_tool: bool = True
     include_view_image_tool: bool = True
     include_multi_agent_tools: bool = True
+    goals_enabled: bool = True
+    include_goal_tools: bool = True
     agent_depth: int = 0
     max_agent_depth: int = 1
     include_web_search_tool: bool = True

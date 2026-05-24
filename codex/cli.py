@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .core import CodexSession, SteerInputError, TurnInterrupted
+from .goal import GOAL_STATUS_FROM_WIRE, GoalStatus, goal_summary
 from .state import load_rollout_records, parse_command_actions, reconstruct_history_from_rollout
 from .types import CodexConfig, CodexEvent, _model_catalog_info
 from . import types as _types
@@ -85,11 +86,11 @@ def _main(argv: list[str] | None = None) -> int:
     if raw_argv and raw_argv[0] == "fork":
         return _main_resume_chat(raw_argv[1:], fork=True)
     if raw_argv and raw_argv[0] == "chat":
-        return _main_chat(raw_argv[1:], prog="python -m codex chat")
+        return _main_chat(raw_argv[1:], prog="python -m agents.codex chat")
     if _should_route_to_chat(raw_argv):
         return _main_chat(raw_argv)
 
-    parser = argparse.ArgumentParser(prog="python -m codex")
+    parser = argparse.ArgumentParser(prog="python -m agents.codex")
     subparsers = parser.add_subparsers(dest="command")
     chat_parser = subparsers.add_parser("chat")
     chat_parser.add_argument("prompt", nargs="?")
@@ -132,7 +133,7 @@ def _main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "chat":
-        return _main_chat(raw_argv[1:], prog="python -m codex chat")
+        return _main_chat(raw_argv[1:], prog="python -m agents.codex chat")
 
     if args.command != "exec":
         parser.print_help(sys.stderr)
@@ -175,7 +176,7 @@ def _run_parity_trace(args: argparse.Namespace) -> int:
 
 
 def _main_exec_resume(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="python -m codex exec resume")
+    parser = argparse.ArgumentParser(prog="python -m agents.codex exec resume")
     parser.add_argument("session_id", nargs="?")
     parser.add_argument("prompt", nargs="?")
     parser.add_argument("--last", action="store_true")
@@ -205,7 +206,7 @@ def _main_exec_resume(argv: list[str]) -> int:
 
 
 def _main_exec_fork(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="python -m codex exec fork")
+    parser = argparse.ArgumentParser(prog="python -m agents.codex exec fork")
     parser.add_argument("session_id", nargs="?")
     parser.add_argument("prompt", nargs="?")
     parser.add_argument("--last", action="store_true")
@@ -234,7 +235,7 @@ def _main_exec_fork(argv: list[str]) -> int:
 
 def _main_resume_chat(argv: list[str], *, fork: bool) -> int:
     name = "fork" if fork else "resume"
-    parser = argparse.ArgumentParser(prog=f"python -m codex {name}")
+    parser = argparse.ArgumentParser(prog=f"python -m agents.codex {name}")
     parser.add_argument("session_id", nargs="?")
     parser.add_argument("--last", action="store_true")
     parser.add_argument("--all", action="store_true", dest="all_cwds")
@@ -282,7 +283,7 @@ def _main_resume_chat(argv: list[str], *, fork: bool) -> int:
         return 1
 
 
-def _main_chat(argv: list[str], *, prog: str = "python -m codex") -> int:
+def _main_chat(argv: list[str], *, prog: str = "python -m agents.codex") -> int:
     parser = argparse.ArgumentParser(prog=prog)
     parser.add_argument("prompt", nargs="?")
     _add_exec_options(parser)
@@ -384,6 +385,11 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
         bypass_hook_trust=args.bypass_hook_trust or _bool_config(cli_config, "bypass_hook_trust", False),
         include_environment_context=_bool_config(cli_config, "include_environment_context", True),
         include_permissions_instructions=_bool_config(cli_config, "include_permissions_instructions", True),
+        goals_enabled=_bool_nested_config(
+            cli_config,
+            ("features", "goals"),
+            _bool_config(cli_config, "goals", True),
+        ),
         collaboration_mode=_collaboration_mode_config(cli_config),
         request_user_input_available_modes=_request_user_input_available_modes(cli_config),
         output_schema=output_schema,
@@ -451,6 +457,44 @@ def _run_session_human(
     return 0 if final else 1
 
 
+def _run_goal_continuations_human(
+    session: CodexSession,
+    *,
+    color_mode: str = "auto",
+    queued_prompts: deque[str] | None = None,
+) -> int:
+    exit_status = 0
+    while not queued_prompts:
+        runtime = getattr(session, "goals", None)
+        candidate = getattr(runtime, "continuation_item_if_active", None)
+        if not callable(candidate) or candidate() is None:
+            return exit_status
+        renderer = _HumanEventRenderer(color_mode=color_mode)
+        final = ""
+        failed = False
+        try:
+            for event in session.stream_goal_continuation():
+                renderer.render(event)
+                if event.type == "turn.completed":
+                    final = str(event.payload.get("final_message", ""))
+                elif event.type in {"turn.aborted", "turn.failed"}:
+                    failed = True
+                    if event.type == "turn.failed":
+                        renderer.render_error(str(event.payload.get("error") or "turn failed"))
+        except TurnInterrupted:
+            failed = True
+            renderer.render_interrupted()
+        except Exception as exc:
+            failed = True
+            renderer.render_error(_exception_display_message(exc))
+        renderer.finish(final, print_to_stdout=False)
+        if failed or not final:
+            return 1
+        goal = runtime.get_goal() if hasattr(runtime, "get_goal") else None
+        if goal is None or getattr(goal, "status", None) != "active":
+            return exit_status
+
+
 def _run_chat(
     session: CodexSession,
     initial_prompt: str | None,
@@ -510,6 +554,13 @@ def _run_chat(
             if status != 0:
                 exit_status = status
             printed_transcript = True
+            continuation_status = _run_goal_continuations_human(
+                session,
+                color_mode=color_mode,
+                queued_prompts=queued_prompts,
+            )
+            if continuation_status != 0:
+                exit_status = continuation_status
         prompt = None
 
 
@@ -2376,6 +2427,9 @@ def _handle_interactive_slash_command(
     if command == "fork":
         forked = _interactive_fork_session(session, slash.rest.strip(), color_mode=color_mode)
         return _InteractiveSlashResult(True, session=forked)
+    if command == "goal":
+        _handle_goal_slash(session, slash.rest.strip(), color_mode=color_mode)
+        return _InteractiveSlashResult(True)
     if command == "status":
         _print_chat_status(session)
         return _InteractiveSlashResult(True)
@@ -2414,6 +2468,139 @@ def _handle_interactive_slash_command(
         flush=True,
     )
     return _InteractiveSlashResult(True)
+
+
+def _handle_goal_slash(session: CodexSession, rest: str, *, color_mode: str = "auto") -> None:
+    style = _AnsiStyle(_should_use_color(color_mode))
+    runtime = getattr(session, "goals", None)
+    available = getattr(runtime, "tools_available", None)
+    if not callable(available) or not available():
+        print(
+            "Goals need a saved session. This session is temporary.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    rest = rest.strip()
+    if not rest:
+        goal = runtime.get_goal()
+        if goal is None:
+            print("Usage: /goal <objective>", file=sys.stderr)
+            print("No goal is currently set.", file=sys.stderr, flush=True)
+            return
+        _print_goal_summary(goal, style)
+        return
+    try:
+        command, remainder = _parse_goal_command(rest)
+        if command == "clear":
+            cleared, events = runtime.clear_goal_external()
+            _emit_goal_runtime_events(session, events)
+            print("Goal cleared" if cleared else "No goal to clear", file=sys.stderr, flush=True)
+            return
+        if command in {"pause", "resume"}:
+            status: GoalStatus = "paused" if command == "pause" else "active"
+            goal, events = runtime.set_goal_external(status=status)
+            _emit_goal_runtime_events(session, events)
+            print(f"Goal {_goal_status_label(goal.status)}", file=sys.stderr)
+            print(goal_summary(goal), file=sys.stderr, flush=True)
+            return
+        if command == "edit":
+            if not remainder.strip():
+                print("Usage: /goal edit <objective>", file=sys.stderr, flush=True)
+                return
+            goal, events = runtime.set_goal_external(objective=remainder.strip())
+            _emit_goal_runtime_events(session, events)
+            print(f"Goal {_goal_status_label(goal.status)}", file=sys.stderr)
+            print(goal_summary(goal), file=sys.stderr, flush=True)
+            return
+        objective = rest
+        existing = runtime.get_goal()
+        replace = existing is not None and existing.status == "complete"
+        if existing is not None and existing.status != "complete":
+            if not _confirm_replace_goal(existing.objective, objective, color_mode=color_mode):
+                print("Cancelled.", file=sys.stderr, flush=True)
+                return
+            replace = True
+        goal, events = runtime.set_goal_external(objective=objective, status="active", token_budget=None, replace_existing=replace)
+        _emit_goal_runtime_events(session, events)
+        print(f"Goal {_goal_status_label(goal.status)}", file=sys.stderr)
+        print(goal_summary(goal), file=sys.stderr, flush=True)
+    except Exception as exc:
+        print(f"Failed to update thread goal: {_exception_display_message(exc)}", file=sys.stderr, flush=True)
+
+
+def _parse_goal_command(rest: str) -> tuple[str | None, str]:
+    first, _, remainder = rest.partition(" ")
+    lowered = first.lower()
+    if lowered in {"edit", "pause", "resume", "clear"}:
+        return lowered, remainder
+    return None, rest
+
+
+def _emit_goal_runtime_events(session: CodexSession, events: tuple[Any, ...]) -> None:
+    for event in events:
+        event_type = getattr(event, "type", None)
+        payload = getattr(event, "payload", None)
+        if isinstance(event_type, str) and isinstance(payload, dict):
+            session.state.emit(event_type, **payload)
+
+
+def _print_goal_summary(goal: Any, style: "_AnsiStyle") -> None:
+    print(style.bold("Goal"), file=sys.stderr)
+    print(f"{style.dim('Status:')} {_goal_status_label(goal.status)}", file=sys.stderr)
+    print(f"{style.dim('Objective:')} {goal.objective}", file=sys.stderr)
+    print(f"{style.dim('Time used:')} {_format_goal_elapsed_seconds(goal.time_used_seconds)}", file=sys.stderr)
+    print(f"{style.dim('Tokens used:')} {_format_tokens_compact(goal.tokens_used)}", file=sys.stderr)
+    if goal.token_budget is not None:
+        print(f"{style.dim('Token budget:')} {_format_tokens_compact(goal.token_budget)}", file=sys.stderr)
+    if goal.status == "active":
+        hint = "Commands: /goal edit, /goal pause, /goal clear"
+    elif goal.status in {"paused", "blocked", "usage_limited"}:
+        hint = "Commands: /goal edit, /goal resume, /goal clear"
+    else:
+        hint = "Commands: /goal edit, /goal clear"
+    print(file=sys.stderr)
+    print(style.dim(hint), file=sys.stderr, flush=True)
+
+
+def _confirm_replace_goal(current: str, new: str, *, color_mode: str = "auto") -> bool:
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        return False
+    print("Replace goal?", file=sys.stderr)
+    print(f"Current objective: {current}", file=sys.stderr)
+    print(f"New objective: {new}", file=sys.stderr)
+    print("Replace current goal? [y/N] ", end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline().strip().lower()
+    return answer in {"y", "yes"}
+
+
+def _goal_status_label(status: str) -> str:
+    return {
+        "active": "active",
+        "paused": "paused",
+        "blocked": "blocked",
+        "usage_limited": "usage limited",
+        "budget_limited": "limited by budget",
+        "complete": "complete",
+    }.get(GOAL_STATUS_FROM_WIRE.get(status, status), status)
+
+
+def _format_goal_elapsed_seconds(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    remaining_minutes = minutes % 60
+    if hours >= 24:
+        days = hours // 24
+        remaining_hours = hours % 24
+        return f"{days}d {remaining_hours}h {remaining_minutes}m"
+    if remaining_minutes == 0:
+        return f"{hours}h"
+    return f"{hours}h {remaining_minutes}m"
 
 
 def _handle_ps_slash(session: CodexSession) -> None:
@@ -3273,6 +3460,12 @@ class _HumanEventRenderer:
             self._line(str(event.payload.get("message") or "Reconnecting..."))
         elif event.type == "turn.aborted":
             self.render_interrupted()
+        elif event.type == "thread.goal.updated":
+            goal = event.payload.get("goal")
+            if isinstance(goal, dict):
+                self._render_goal_updated(goal)
+        elif event.type == "thread.goal.cleared":
+            self.render_info_message("Goal cleared")
 
     def render_error(self, message: str) -> None:
         self._begin_cell()
@@ -3450,6 +3643,15 @@ class _HumanEventRenderer:
             output = str(payload.get("output") or "")
             if output.strip() and name in {"wait_agent", "close_agent"}:
                 self._line(output)
+        elif name in {"get_goal", "create_goal", "update_goal"}:
+            self._flush_exploration()
+            self._begin_work_cell()
+            status = self._style.green("completed") if ok else self._style.red("failed")
+            self._line(f"{self._style.bold('goal tool:')} {name} {status}")
+            if not ok:
+                output = str(payload.get("output") or "")
+                if output.strip():
+                    self._line(output)
         elif not ok:
             self._flush_exploration()
             self._begin_work_cell()
@@ -3470,6 +3672,27 @@ class _HumanEventRenderer:
         text = " ".join(part for part in [self._style.bold(header), detail or query] if part)
         self._emit_prefixed_lines(
             [text],
+            first_prefix=f"{self._style.dim('•')} ",
+            rest_prefix="  ",
+        )
+
+    def _render_goal_updated(self, goal: dict[str, Any]) -> None:
+        self._flush_exploration()
+        self._begin_work_cell()
+        status = _goal_status_label(str(goal.get("status") or ""))
+        objective = str(goal.get("objective") or "")
+        summary = f"Goal {status}"
+        details: list[str] = []
+        if objective:
+            details.append(f"Objective: {objective}")
+        if goal.get("timeUsedSeconds"):
+            details.append(f"Time: {_format_goal_elapsed_seconds(int(goal.get('timeUsedSeconds') or 0))}.")
+        if goal.get("tokenBudget") is not None:
+            details.append(
+                f"Tokens: {_format_tokens_compact(int(goal.get('tokensUsed') or 0))}/{_format_tokens_compact(int(goal.get('tokenBudget') or 0))}."
+            )
+        self._emit_prefixed_lines(
+            [self._style.bold(summary), *details],
             first_prefix=f"{self._style.dim('•')} ",
             rest_prefix="  ",
         )

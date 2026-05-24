@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .goal import GoalAccountingResult, GoalRuntime
 from .memory import MemoryBackgroundTask, MemoryStateStore, MemoryStartupResult, MemoryThreadRecord
 from .memory import run_memory_startup_pipeline_once, start_memory_startup_task
 from .model import ModelClient, ModelStreamEvent, default_model_client, model_response_to_stream_events
@@ -75,7 +76,12 @@ class CodexSession:
         self.config = _config_with_memory_state_store(config or CodexConfig())
         self.state = CodexState(self.config)
         self.model_client = model_client or default_model_client()
-        self.tools = ToolRuntime(self.config, agent_runtime=_LocalAgentRuntime(self))
+        self.goals = GoalRuntime(self.config, self.state)
+        self.tools = ToolRuntime(
+            self.config,
+            agent_runtime=_LocalAgentRuntime(self),
+            goal_runtime=self.goals,
+        )
         self._initial_context_recorded = False
         self._memory_startup_ran = False
         self._session_start_hook_ran = False
@@ -212,6 +218,12 @@ class CodexSession:
 
     def stream_compact(self, prompt: str | None = None) -> Iterator[CodexEvent]:
         yield from self._stream_compact(prompt, trigger="manual", reason="manual", phase="standalone_turn")
+
+    def stream_goal_continuation(self) -> Iterator[CodexEvent]:
+        item = self.goals.continuation_item_if_active()
+        if item is None:
+            return
+        yield from self.stream(_message_text(item))
 
     def _stream_compact(
         self,
@@ -480,6 +492,7 @@ class CodexSession:
 
             yield self.state.emit("thread.started", cwd=str(cwd), model=self.config.model)
             yield self.state.emit("turn.started")
+            self.goals.on_turn_start()
             self._check_interrupted()
 
             if not self._session_start_hook_ran:
@@ -655,6 +668,7 @@ class CodexSession:
                             error=after_agent_hook.stop_reason or "after_agent hook stopped the turn",
                         )
                         return
+                    yield from self._emit_goal_accounting_result(self.goals.on_turn_finished(completed=True))
                     self.state.write_last_message(final_message)
                     yield self.state.emit("turn.completed", final_message=final_message)
                     return
@@ -665,6 +679,7 @@ class CodexSession:
 
             yield self.state.emit("turn.failed", error="max_iterations exceeded")
         except TurnInterrupted:
+            yield from self._emit_goal_accounting_result(self.goals.on_turn_aborted())
             self._record_interrupted_turn_marker()
             yield self.state.emit("turn.aborted", reason="interrupted")
             return
@@ -779,6 +794,7 @@ class CodexSession:
             if stream_event.type == "token_count":
                 usage = stream_event.payload.get("usage")
                 self.state.record_token_usage(usage if isinstance(usage, dict) else None)
+                self.goals.record_token_usage(usage if isinstance(usage, dict) else None)
                 payload = dict(stream_event.payload)
                 payload.setdefault("info", self.state.token_usage_info())
                 yield self.state.emit(
@@ -955,7 +971,26 @@ class CodexSession:
             if unified_diff is not None:
                 yield self.state.emit("turn_diff", unified_diff=unified_diff)
         yield self.state.emit("item.completed", item=output_item)
+        handler_executed = not bool(result.metadata.get("hook_blocked")) and call.get("name") != "unknown"
+        yield from self._emit_goal_accounting_result(
+            self.goals.on_tool_finished(call["name"], handler_executed=handler_executed)
+        )
         yield from self._drain_agent_notifications()
+
+    def _emit_goal_accounting_result(self, result: GoalAccountingResult) -> Iterator[CodexEvent]:
+        yield from self._emit_goal_events(result.events)
+        if result.steering_items:
+            try:
+                self.inject_response_items(list(result.steering_items), expected_turn_id=self.state.turn_id)
+            except SteerInputError:
+                pass
+
+    def _emit_goal_events(self, events: tuple[Any, ...]) -> Iterator[CodexEvent]:
+        for event in events:
+            event_type = getattr(event, "type", None)
+            payload = getattr(event, "payload", None)
+            if isinstance(event_type, str) and isinstance(payload, dict):
+                yield self.state.emit(event_type, **payload)
 
     def _drain_agent_notifications(self) -> Iterator[CodexEvent]:
         runtime = getattr(self.tools, "agent_runtime", None)

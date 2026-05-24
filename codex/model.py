@@ -105,43 +105,6 @@ class OpenAIResponsesModel:
         with response:
             yield from iter_model_stream_events(_iter_sse_events(response))
 
-
-def _iter_sse_events(stream: Any) -> Iterable[dict[str, Any]]:
-    """Parse an OpenAI Responses SSE stream into raw event dicts.
-
-    Each event looks like:
-        event: <name>
-        data: <json>
-        <blank line>
-    The JSON payload already carries `type`, so the event name is informational.
-    """
-    data_lines: list[str] = []
-    for raw_line in stream:
-        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, (bytes, bytearray)) else str(raw_line)
-        line = line.rstrip("\r\n")
-        if line == "":
-            if data_lines:
-                payload = "\n".join(data_lines)
-                data_lines = []
-                if payload == "[DONE]":
-                    return
-                try:
-                    yield json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-            continue
-        if line.startswith(":"):
-            continue
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip(" "))
-    if data_lines:
-        payload = "\n".join(data_lines)
-        if payload and payload != "[DONE]":
-            try:
-                yield json.loads(payload)
-            except json.JSONDecodeError:
-                pass
-
     def compact(
         self,
         request: PromptRequest,
@@ -210,6 +173,43 @@ def _iter_sse_events(stream: Any) -> Iterable[dict[str, Any]]:
             headers["thread_id"] = thread_id
             headers["thread-id"] = thread_id
         return headers
+
+
+def _iter_sse_events(stream: Any) -> Iterable[dict[str, Any]]:
+    """Parse an OpenAI Responses SSE stream into raw event dicts.
+
+    Each event looks like:
+        event: <name>
+        data: <json>
+        <blank line>
+    The JSON payload already carries `type`, so the event name is informational.
+    """
+    data_lines: list[str] = []
+    for raw_line in stream:
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, (bytes, bytearray)) else str(raw_line)
+        line = line.rstrip("\r\n")
+        if line == "":
+            if data_lines:
+                payload = "\n".join(data_lines)
+                data_lines = []
+                if payload == "[DONE]":
+                    return
+                try:
+                    yield json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
+    if data_lines:
+        payload = "\n".join(data_lines)
+        if payload and payload != "[DONE]":
+            try:
+                yield json.loads(payload)
+            except json.JSONDecodeError:
+                pass
 
 
 class ScriptedResponsesModel:
