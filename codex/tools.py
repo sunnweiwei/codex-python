@@ -42,9 +42,13 @@ except ImportError:  # pragma: no cover - Pillow is present in the supported tes
 MIN_YIELD_TIME_MS = 250
 MIN_EMPTY_YIELD_TIME_MS = 5_000
 MAX_YIELD_TIME_MS = 30_000
+DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS = 300_000
 DEFAULT_EXEC_YIELD_TIME_MS = 10_000
 DEFAULT_WRITE_STDIN_YIELD_TIME_MS = 250
 DEFAULT_MAX_OUTPUT_TOKENS = 10_000
+APPROX_BYTES_PER_TOKEN = 4
+UNIFIED_EXEC_OUTPUT_MAX_BYTES = 1024 * 1024
+MAX_UNIFIED_EXEC_PROCESSES = 64
 MAX_PROMPT_IMAGE_DIMENSION = 2048
 MODEL_CATALOG_JSON = Path(__file__).resolve().parent / "assets" / "models.json"
 SEATBELT_BASE_POLICY = Path(__file__).resolve().parent / "assets" / "seatbelt_base_policy.sbpl"
@@ -620,11 +624,18 @@ class ToolRuntime:
         return self.agent_runtime.close_agent(_expect_object(arguments))
 
     def _register_session(self, running: "RunningCommand") -> int:
+        pruned: RunningCommand | None = None
         with self._session_lock:
+            if len(self._sessions) >= MAX_UNIFIED_EXEC_PROCESSES:
+                prune_id = _session_id_to_prune(self._sessions)
+                if prune_id is not None:
+                    pruned = self._sessions.pop(prune_id, None)
             session_id = self._next_session_id
             self._next_session_id += 1
             self._sessions[session_id] = running
-            return session_id
+        if pruned is not None:
+            pruned.interrupt()
+        return session_id
 
     def _register_active_command(self, running: "RunningCommand") -> None:
         with self._session_lock:
@@ -1012,11 +1023,12 @@ class RunningCommand:
         self.event_call_id = event_call_id
         self.pty_fd = pty_fd
         self.sandbox_metadata = dict(sandbox_metadata or {})
+        self.last_used = time.monotonic()
         self._lock = threading.Lock()
-        self._stdout: list[str] = []
-        self._stderr: list[str] = []
-        self._all_stdout: list[str] = []
-        self._all_stderr: list[str] = []
+        self._stdout = _HeadTailTextBuffer()
+        self._stderr = _HeadTailTextBuffer()
+        self._all_stdout = _HeadTailTextBuffer()
+        self._all_stderr = _HeadTailTextBuffer()
         self._threads: list[threading.Thread] = []
 
     def start_readers(self) -> None:
@@ -1071,15 +1083,16 @@ class RunningCommand:
         self._close_pipes()
 
     def snapshot(self, start: float, max_output_tokens: int) -> dict[str, Any]:
+        self.last_used = time.monotonic()
         if self.process.poll() is not None:
             for thread in self._threads:
                 thread.join(timeout=0.1)
             self._close_pipes()
         with self._lock:
-            stdout = "".join(self._stdout)
-            stderr = "".join(self._stderr)
-            aggregated_stdout = "".join(self._all_stdout)
-            aggregated_stderr = "".join(self._all_stderr)
+            stdout = self._stdout.to_text()
+            stderr = self._stderr.to_text()
+            aggregated_stdout = self._all_stdout.to_text()
+            aggregated_stderr = self._all_stderr.to_text()
             output = _join_output(stdout, stderr)
             aggregated_output = _join_output(aggregated_stdout, aggregated_stderr)
             self._stdout.clear()
@@ -1096,7 +1109,7 @@ class RunningCommand:
             **self.sandbox_metadata,
         }
 
-    def _read_stream(self, stream: Any, target: list[str]) -> None:
+    def _read_stream(self, stream: Any, target: _HeadTailTextBuffer) -> None:
         fd = stream.fileno()
         while True:
             try:
@@ -1166,6 +1179,72 @@ class RunningCommand:
             except OSError:
                 pass
             self.pty_fd = None
+
+
+class _HeadTailTextBuffer:
+    def __init__(self, max_bytes: int = UNIFIED_EXEC_OUTPUT_MAX_BYTES):
+        self.max_bytes = max(0, int(max_bytes))
+        self.head_budget = self.max_bytes // 2
+        self.tail_budget = self.max_bytes - self.head_budget
+        self._head: list[bytes] = []
+        self._tail: list[bytes] = []
+        self._head_bytes = 0
+        self._tail_bytes = 0
+
+    def append(self, text: str) -> None:
+        self._push_chunk(text.encode("utf-8", errors="replace"))
+
+    def clear(self) -> None:
+        self._head.clear()
+        self._tail.clear()
+        self._head_bytes = 0
+        self._tail_bytes = 0
+
+    def to_text(self) -> str:
+        return b"".join([*self._head, *self._tail]).decode("utf-8", errors="replace")
+
+    def _push_chunk(self, chunk: bytes) -> None:
+        if not chunk or self.max_bytes == 0:
+            return
+        if self._head_bytes < self.head_budget:
+            remaining_head = self.head_budget - self._head_bytes
+            if len(chunk) <= remaining_head:
+                self._head.append(chunk)
+                self._head_bytes += len(chunk)
+                return
+            head_part = chunk[:remaining_head]
+            tail_part = chunk[remaining_head:]
+            if head_part:
+                self._head.append(head_part)
+                self._head_bytes += len(head_part)
+            self._push_tail(tail_part)
+            return
+        self._push_tail(chunk)
+
+    def _push_tail(self, chunk: bytes) -> None:
+        if self.tail_budget == 0:
+            return
+        if len(chunk) >= self.tail_budget:
+            kept = chunk[-self.tail_budget :]
+            self._tail = [kept]
+            self._tail_bytes = len(kept)
+            return
+        self._tail.append(chunk)
+        self._tail_bytes += len(chunk)
+        self._trim_tail()
+
+    def _trim_tail(self) -> None:
+        excess = self._tail_bytes - self.tail_budget
+        while excess > 0 and self._tail:
+            first = self._tail[0]
+            if excess >= len(first):
+                excess -= len(first)
+                self._tail_bytes -= len(first)
+                self._tail.pop(0)
+                continue
+            self._tail[0] = first[excess:]
+            self._tail_bytes -= excess
+            break
 
 
 def exec_command_spec() -> dict[str, Any]:
@@ -1979,11 +2058,68 @@ def _decode_output_chunk(chunk: bytes | str) -> str:
 
 
 def _truncate_output(output: str, max_output_tokens: int) -> tuple[str, int]:
-    approx_tokens = (len(output) + 3) // 4
-    max_chars = max(max_output_tokens, 1) * 4
-    if len(output) <= max_chars:
+    approx_tokens = _approx_token_count(output)
+    byte_budget = max(0, int(max_output_tokens)) * APPROX_BYTES_PER_TOKEN
+    if len(output.encode("utf-8")) <= byte_budget:
         return output, approx_tokens
-    return output[:max_chars] + "\n[output truncated]", approx_tokens
+    return _formatted_truncate_text_tokens(output, max(0, int(max_output_tokens))), approx_tokens
+
+
+def _formatted_truncate_text_tokens(text: str, max_tokens: int) -> str:
+    if len(text.encode("utf-8")) <= max_tokens * APPROX_BYTES_PER_TOKEN:
+        return text
+    total_lines = len(text.splitlines())
+    return f"Total output lines: {total_lines}\n\n{_truncate_middle_tokens(text, max_tokens)}"
+
+
+def _truncate_middle_tokens(text: str, max_tokens: int) -> str:
+    if not text:
+        return ""
+    max_bytes = max(0, max_tokens) * APPROX_BYTES_PER_TOKEN
+    if max_bytes == 0:
+        return _truncation_marker(_approx_token_count(text))
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    left_budget = max_bytes // 2
+    right_budget = max_bytes - left_budget
+    prefix, suffix = _split_text_for_byte_budget(text, left_budget, right_budget)
+    removed_tokens = _approx_tokens_from_byte_count(len(text.encode("utf-8")) - max_bytes)
+    return f"{prefix}{_truncation_marker(removed_tokens)}{suffix}"
+
+
+def _split_text_for_byte_budget(text: str, left_budget: int, right_budget: int) -> tuple[str, str]:
+    total_bytes = len(text.encode("utf-8"))
+    tail_start_target = max(0, total_bytes - right_budget)
+    prefix: list[str] = []
+    suffix: list[str] = []
+    byte_index = 0
+    suffix_started = False
+    for char in text:
+        char_len = len(char.encode("utf-8"))
+        char_start = byte_index
+        char_end = byte_index + char_len
+        if char_end <= left_budget:
+            prefix.append(char)
+        elif char_start >= tail_start_target:
+            suffix_started = True
+            suffix.append(char)
+        elif suffix_started:
+            suffix.append(char)
+        byte_index = char_end
+    return "".join(prefix), "".join(suffix)
+
+
+def _truncation_marker(removed_tokens: int) -> str:
+    return f"…{max(0, int(removed_tokens))} tokens truncated…"
+
+
+def _approx_token_count(text: str) -> int:
+    return _approx_tokens_from_byte_count(len(text.encode("utf-8")))
+
+
+def _approx_tokens_from_byte_count(byte_count: int) -> int:
+    byte_count = max(0, int(byte_count))
+    return (byte_count + APPROX_BYTES_PER_TOKEN - 1) // APPROX_BYTES_PER_TOKEN
 
 
 def _clamp_exec_yield_time(yield_time_ms: int) -> int:
@@ -1991,9 +2127,25 @@ def _clamp_exec_yield_time(yield_time_ms: int) -> int:
 
 
 def _write_stdin_yield_time(yield_time_ms: int, chars: str) -> int:
+    time_ms = max(MIN_YIELD_TIME_MS, int(yield_time_ms))
     if chars:
-        return max(MIN_YIELD_TIME_MS, min(MAX_YIELD_TIME_MS, yield_time_ms))
-    return max(MIN_EMPTY_YIELD_TIME_MS, min(MAX_YIELD_TIME_MS, yield_time_ms))
+        return min(MAX_YIELD_TIME_MS, time_ms)
+    return max(MIN_EMPTY_YIELD_TIME_MS, min(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS, time_ms))
+
+
+def _session_id_to_prune(sessions: dict[int, RunningCommand]) -> int | None:
+    if not sessions:
+        return None
+    ordered = sorted(sessions.items(), key=lambda item: item[1].last_used, reverse=True)
+    protected = {session_id for session_id, _ in ordered[:8]}
+    lru = sorted(sessions.items(), key=lambda item: item[1].last_used)
+    for session_id, running in lru:
+        if session_id not in protected and running.process.poll() is not None:
+            return session_id
+    for session_id, _running in lru:
+        if session_id not in protected:
+            return session_id
+    return None
 
 
 def _wait_for_process_or_timeout(process: subprocess.Popen[str], yield_time_ms: int) -> None:

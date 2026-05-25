@@ -1993,7 +1993,7 @@ def run_memory_consolidation_session(
     from .model import default_model_client
 
     config = build_memory_consolidation_config(memory_root=memory_root, base_config=base_config)
-    session = CodexSession(config, model_client=model_client or default_model_client())
+    session = CodexSession(config, model_client=model_client or default_model_client(config))
     return session.run(build_memory_consolidation_prompt(memory_root))
 
 

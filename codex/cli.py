@@ -105,6 +105,15 @@ def _main(argv: list[str] | None = None) -> int:
     fork_parser.add_argument("--last", action="store_true")
     fork_parser.add_argument("--all", action="store_true", dest="all_cwds")
     _add_exec_options(fork_parser)
+    login_parser = subparsers.add_parser("login", help="sign in to ChatGPT for Codex")
+    login_parser.add_argument("login_command", nargs="?", choices=["status"])
+    login_parser.add_argument("--json", action="store_true", dest="login_json")
+    login_parser.add_argument("--device-auth", action="store_true", help="sign in with a browser device code")
+    login_parser.add_argument("--with-api-key", action="store_true", dest="with_api_key", help="read an OpenAI API key from stdin")
+    login_parser.add_argument("--api-key", action="store_true", dest="with_api_key", help=argparse.SUPPRESS)
+    login_parser.add_argument("--no-open-browser", action="store_true", help="print the login URL instead of opening a browser")
+    login_parser.add_argument("--experimental_issuer", help=argparse.SUPPRESS)
+    login_parser.add_argument("--experimental_client-id", dest="experimental_client_id", help=argparse.SUPPRESS)
     exec_parser = subparsers.add_parser("exec")
     exec_parser.add_argument("prompt", nargs="?")
     _add_exec_options(exec_parser)
@@ -135,6 +144,9 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "chat":
         return _main_chat(raw_argv[1:], prog="python -m agents.codex chat")
 
+    if args.command == "login":
+        return _main_login(args)
+
     if args.command != "exec":
         parser.print_help(sys.stderr)
         return 2
@@ -155,9 +167,85 @@ def _main(argv: list[str] | None = None) -> int:
 def _should_route_to_chat(raw_argv: list[str]) -> bool:
     if not raw_argv:
         return True
-    if raw_argv[0] in {"-h", "--help", "exec", "parity", "resume", "fork"}:
+    if raw_argv[0] in {"-h", "--help", "exec", "parity", "resume", "fork", "login"}:
         return False
     return True
+
+
+def _main_login(args: argparse.Namespace) -> int:
+    from .auth import (
+        CLIENT_ID,
+        DEFAULT_OAUTH_ISSUER,
+        auth_status,
+        login_with_api_key,
+        run_browser_login,
+        run_device_code_login,
+    )
+
+    if args.login_command == "status":
+        status = auth_status()
+        if getattr(args, "login_json", False):
+            print(json.dumps(status, ensure_ascii=False, sort_keys=True, indent=2))
+            return 0 if status.get("logged_in") else 1
+        print(f"Auth file: {status.get('auth_file')}")
+        print(f"Mode: {status.get('auth_mode') or 'none'}")
+        if status.get("has_chatgpt_tokens"):
+            account = status.get("account_id") or "unknown"
+            plan = status.get("plan_type") or "unknown"
+            email = status.get("email") or "unknown"
+            print(f"ChatGPT: logged in ({email}, {plan}, {account})")
+        elif status.get("has_api_key"):
+            print("API key: available")
+        else:
+            print("Not logged in. Run `python -m agents.codex login` once, or set OPENAI_API_KEY.")
+            return 1
+        if status.get("last_refresh"):
+            print(f"Last refresh: {status['last_refresh']}")
+        return 0
+
+    issuer = getattr(args, "experimental_issuer", None) or DEFAULT_OAUTH_ISSUER
+    client_id = getattr(args, "experimental_client_id", None) or CLIENT_ID
+    if getattr(args, "login_json", False):
+        print("--json is only supported for `login status`", file=sys.stderr)
+        return 2
+    if getattr(args, "with_api_key", False):
+        if sys.stdin.isatty():
+            print(
+                "--with-api-key expects the API key on stdin. Try piping it, e.g. "
+                "`printenv OPENAI_API_KEY | codex login --with-api-key`.",
+                file=sys.stderr,
+            )
+            return 1
+        print("Reading API key from stdin...", file=sys.stderr)
+        api_key = sys.stdin.read().strip()
+        if not api_key:
+            print("No API key provided via stdin.", file=sys.stderr)
+            return 1
+        login_with_api_key(api_key)
+        print("Successfully logged in", file=sys.stderr)
+        return 0
+    if getattr(args, "device_auth", False):
+        run_device_code_login(issuer=issuer, client_id=client_id)
+        print("Successfully logged in", file=sys.stderr)
+        return 0
+
+    def _print_login_start(port: int, url: str) -> None:
+        print(
+            f"Starting local login server on http://localhost:{port}.\n"
+            "If your browser did not open, navigate to this URL to authenticate:\n\n"
+            f"{url}\n\n"
+            "On a remote or headless machine? Use `codex login --device-auth` instead.",
+            file=sys.stderr,
+        )
+
+    run_browser_login(
+        issuer=issuer,
+        client_id=client_id,
+        open_browser=not getattr(args, "no_open_browser", False),
+        on_start=_print_login_start,
+    )
+    print("Successfully logged in", file=sys.stderr)
+    return 0
 
 
 def _run_parity_trace(args: argparse.Namespace) -> int:
@@ -312,6 +400,7 @@ def _add_exec_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", "-m")
     parser.add_argument("--oss", action="store_true")
     parser.add_argument("--local-provider", dest="local_provider")
+    parser.add_argument("--auth-mode", choices=["auto", "api-key", "api_key", "chatgpt"], default=None)
     parser.add_argument("--profile", "-p")
     parser.add_argument("--config", "-c", action="append", default=[], dest="config_overrides")
     parser.add_argument("--cd", "-C", dest="cwd")
@@ -354,6 +443,9 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
         approval_policy=approval_policy or _approval_config(cli_config) or "never",
         writable_roots=tuple(Path(path) for path in [*_path_list_config(cli_config, "writable_roots"), *args.add_dirs]),
         codex_home=_default_codex_home(),
+        auth_mode=_auth_mode_config(args, cli_config),
+        chatgpt_base_url=_string_config(cli_config, "chatgpt_base_url"),
+        openai_base_url=_string_config(cli_config, "openai_base_url") or _string_config(model_provider_config, "base_url"),
         json_events=args.json_events,
         output_last_message=args.output_last_message,
         skip_git_repo_check=args.skip_git_repo_check,
@@ -509,6 +601,8 @@ def _run_chat(
         source_path=history_source_path,
         color_mode=color_mode,
     ) if replay_history else False
+    if not replay_history and initial_prompt is None:
+        _render_chat_startup_panel(session, color_mode=color_mode)
     exit_status = 0
     queued_prompts: deque[str] = deque()
     while True:
@@ -531,6 +625,15 @@ def _run_chat(
                 session = slash_result.session
             if slash_result.exit:
                 return slash_result.status
+            if slash_result.run_goal_continuation and slash_result.prompt is None:
+                continuation_status = _run_goal_continuations_human(
+                    session,
+                    color_mode=color_mode,
+                    queued_prompts=queued_prompts,
+                )
+                if continuation_status != 0:
+                    exit_status = continuation_status
+                printed_transcript = True
             prompt = slash_result.prompt
             continue
         if prompt.strip():
@@ -562,6 +665,46 @@ def _run_chat(
             if continuation_status != 0:
                 exit_status = continuation_status
         prompt = None
+
+
+def _render_chat_startup_panel(session: CodexSession, *, color_mode: str = "auto") -> None:
+    if not sys.stderr.isatty():
+        return
+    style = _AnsiStyle(_should_use_color(color_mode))
+    rows = _chat_startup_panel_rows(session)
+    if not rows:
+        return
+    label_width = max(_visible_len(label) for label, _value in rows)
+    content_lines = [f" {style.dim(label.ljust(label_width))}  {value}" for label, value in rows]
+    visible_width = max(_visible_len(line) for line in content_lines)
+    title = " Codex "
+    top = f"╭─{style.bold(title)}" + "─" * max(0, visible_width - _visible_len(title) - 1) + "╮"
+    bottom = "╰" + "─" * (max(0, visible_width) + 2) + "╯"
+    print(top, file=sys.stderr)
+    for line in content_lines:
+        print(f"│{_pad_visible(line, visible_width)} │", file=sys.stderr)
+    print(bottom, file=sys.stderr, flush=True)
+
+
+def _chat_startup_panel_rows(session: CodexSession) -> list[tuple[str, str]]:
+    config = session.config
+    reasoning = config.resolved_reasoning() or {}
+    effort = reasoning.get("effort") or "none"
+    summary = reasoning.get("summary")
+    model = f"{config.model} / {effort}"
+    if summary:
+        model = f"{model} / summary {summary}"
+    auth = _session_auth_indicator(session, include_fallback=True) or "unknown"
+    provider = config.model_provider_id
+    if provider == "openai" and config.openai_base_url:
+        provider = f"{provider} ({config.openai_base_url.rstrip('/')})"
+    return [
+        ("Model", model),
+        ("Auth", auth),
+        ("Provider", provider),
+        ("Sandbox", f"{config.sandbox} · approvals {config.approval_policy}"),
+        ("Thread", session.state.thread_id),
+    ]
 
 
 def _render_resumed_transcript(
@@ -702,6 +845,11 @@ def _render_transcript_event_msg(payload: dict[str, Any], renderer: "_HumanEvent
     if event_type == "context_compacted":
         renderer.render_info_message("Context compacted")
         return True
+    if event_type == "warning":
+        message = str(payload.get("message") or "")
+        if message:
+            renderer.render(CodexEvent("warning", {"message": message}))
+            return True
     if event_type in {"warning", "error", "stream_error"}:
         message = str(payload.get("message") or payload.get("error") or "")
         if message:
@@ -826,7 +974,6 @@ def _run_compact_human_interactive(
                 renderer.render(event)
                 if event.type == "context_compaction.completed":
                     completed["value"] = True
-                    renderer.render_info_message("Context compacted")
                 elif event.type == "turn.failed":
                     failed["value"] = True
                     renderer.render_error(str(event.payload.get("error") or "turn failed"))
@@ -864,6 +1011,13 @@ def _run_compact_human_interactive(
 def _submit_turn_input(session: CodexSession, text: str, *, queued_prompts: deque[str] | None = None) -> bool:
     slash = _parse_interactive_slash(text)
     if slash is not None and not slash.command.available_during_task:
+        if queued_prompts is not None:
+            queued_prompts.append(text)
+        else:
+            session.queue_input_for_next_turn(text)
+        return False
+    parsed_name = _parse_slash_name(text.lstrip())
+    if slash is None and parsed_name is not None and "/" not in parsed_name[0]:
         if queued_prompts is not None:
             queued_prompts.append(text)
         else:
@@ -1480,6 +1634,8 @@ class _TurnInputAction:
 class _LiveTurnStatusSnapshot:
     header: str
     elapsed_seconds: int
+    auth_label: str | None
+    goal_status: str | None
     active_context_tokens: int | None
     active_context_estimated: bool
     session_context_tokens: int | None
@@ -1526,6 +1682,8 @@ class _LiveTurnStatus:
         return _LiveTurnStatusSnapshot(
             header=header,
             elapsed_seconds=elapsed,
+            auth_label=_session_auth_indicator(session, include_fallback=False),
+            goal_status=_goal_status_indicator(session),
             active_context_tokens=active_context,
             active_context_estimated=active_context_estimated,
             session_context_tokens=session_context,
@@ -1546,10 +1704,14 @@ class _TurnInputReader:
         self._pending = b""
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._rendered_lines = 0
+        self._rendered_rows_below_cursor = 0
         self._status_lines: list[str] = []
         self._status_key = ""
         self._defer_render = False
         self._dirty = False
+        self._slash_selection = 0
+        self._slash_key = ""
+        self._slash_dismissed_for: str | None = None
 
     def __enter__(self) -> "_TurnInputReader":
         if not self.enabled:
@@ -1606,12 +1768,28 @@ class _TurnInputReader:
         if not self.enabled:
             return
         prompt_lines = _prompt_display_lines(self._buffer, self._style)
-        lines = [*self._status_lines, *prompt_lines]
         cols = _terminal_columns()
+        slash_lines = _slash_palette_display_lines(
+            self._buffer,
+            self._cursor,
+            selected_index=self._synced_slash_selection(),
+            dismissed_for=self._slash_dismissed_for,
+            style=self._style,
+            width=cols,
+        )
+        lines = [*self._status_lines, *prompt_lines, *slash_lines]
         self.clear()
         print("\n".join(lines), end="", file=sys.stderr, flush=True)
         self._rendered_lines = _prompt_screen_rows(lines, cols)
         status_rows = _prompt_screen_rows(self._status_lines, cols)
+        cursor_row = _prompt_cursor_screen_row(
+            self._buffer,
+            self._cursor,
+            self._rendered_lines,
+            cols,
+            prefix_rows=status_rows,
+        )
+        self._rendered_rows_below_cursor = max(0, self._rendered_lines - 1 - cursor_row)
         _move_prompt_cursor(self._buffer, self._cursor, self._rendered_lines, cols, prefix_rows=status_rows)
         self._dirty = False
 
@@ -1629,8 +1807,9 @@ class _TurnInputReader:
     def clear(self) -> None:
         if not self.enabled:
             return
-        _clear_prompt_lines(self._rendered_lines)
+        _clear_prompt_lines(self._rendered_lines, rows_below_cursor=self._rendered_rows_below_cursor)
         self._rendered_lines = 0
+        self._rendered_rows_below_cursor = 0
         self._dirty = False
 
     def suspend(self) -> None:
@@ -1668,15 +1847,30 @@ class _TurnInputReader:
             if self._cursor > 0:
                 self._buffer = self._buffer[: self._cursor - 1] + self._buffer[self._cursor :]
                 self._cursor -= 1
+                self._sync_slash_after_edit()
                 self._request_render()
+            return None
+        if chunk == b"\t":
+            if self._complete_slash_selection(trailing_space=True):
+                return None
             return None
         if chunk == b"\r":
             tail = self._decoder.decode(b"", final=True)
             if tail:
                 self._insert(tail)
-            text = _normalize_optional_prompt(self._buffer) or ""
+            accepted = _slash_selected_completion_text(
+                self._buffer,
+                self._cursor,
+                self._slash_selection,
+                dismissed_for=self._slash_dismissed_for,
+                trailing_space=False,
+            )
+            text = _normalize_optional_prompt(accepted if accepted is not None else self._buffer) or ""
             self._buffer = ""
             self._cursor = 0
+            self._slash_selection = 0
+            self._slash_key = ""
+            self._slash_dismissed_for = None
             self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
             # Force an immediate redraw of the (now empty) prompt so the
             # transcript above remains clean before the caller prints output.
@@ -1699,6 +1893,8 @@ class _TurnInputReader:
             return None
         text = self._decoder.decode(chunk, final=False)
         if text:
+            if text == "/" and self._complete_slash_selection(trailing_space=True):
+                return None
             self._insert(text)
         return None
 
@@ -1708,13 +1904,69 @@ class _TurnInputReader:
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         self._buffer = self._buffer[: self._cursor] + normalized + self._buffer[self._cursor :]
         self._cursor += len(normalized)
+        self._sync_slash_after_edit()
         self._request_render()
 
     def _handle_escape_sequence(self, sequence: bytes) -> bool:
+        rows = self._current_slash_rows()
+        if rows:
+            if sequence in {b"\x1b[A", b"\x1bOA"}:
+                self._slash_selection = (self._slash_selection - 1) % len(rows)
+                self._request_render()
+                return True
+            if sequence in {b"\x1b[B", b"\x1bOB"}:
+                self._slash_selection = (self._slash_selection + 1) % len(rows)
+                self._request_render()
+                return True
+            if sequence == b"\x1b":
+                self._slash_dismissed_for = _slash_first_line(self._buffer)
+                self._request_render()
+                return True
         updated = _apply_prompt_escape_sequence(self._buffer, self._cursor, sequence)
         if updated is None:
             return False
         self._buffer, self._cursor = updated
+        self._sync_slash_after_edit()
+        self._request_render()
+        return True
+
+    def _current_slash_rows(self) -> list["_SlashPaletteRow"]:
+        key = _slash_palette_key(self._buffer, self._cursor, self._slash_dismissed_for)
+        if key != self._slash_key:
+            self._slash_key = key
+            self._slash_selection = 0
+        rows = _slash_palette_rows_for_buffer(
+            self._buffer,
+            self._cursor,
+            dismissed_for=self._slash_dismissed_for,
+        )
+        if rows:
+            self._slash_selection = max(0, min(self._slash_selection, len(rows) - 1))
+        return rows
+
+    def _synced_slash_selection(self) -> int:
+        self._current_slash_rows()
+        return self._slash_selection
+
+    def _sync_slash_after_edit(self) -> None:
+        if self._slash_dismissed_for is not None and _slash_first_line(self._buffer) != self._slash_dismissed_for:
+            self._slash_dismissed_for = None
+        self._current_slash_rows()
+
+    def _complete_slash_selection(self, *, trailing_space: bool) -> bool:
+        completed = _slash_selected_completion_text(
+            self._buffer,
+            self._cursor,
+            self._slash_selection,
+            dismissed_for=self._slash_dismissed_for,
+            trailing_space=trailing_space,
+        )
+        if completed is None:
+            return False
+        self._buffer = completed
+        self._cursor = min(len(self._buffer), _slash_completed_cursor(completed))
+        self._slash_dismissed_for = _slash_first_line(self._buffer)
+        self._sync_slash_after_edit()
         self._request_render()
         return True
 
@@ -1733,8 +1985,7 @@ def _run_compact_human(session: CodexSession, *, color_mode: str = "auto") -> in
                 continue
             if event.type == "context_compaction.completed":
                 completed = True
-                renderer.render_info_message("Context compacted")
-            elif event.type == "turn.failed":
+            if event.type == "turn.failed":
                 failed = True
                 renderer.render_error(str(event.payload.get("error") or "turn failed"))
             else:
@@ -1799,15 +2050,66 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
     buffer = ""
     cursor = 0
     rendered_lines = 0
+    rendered_rows_below_cursor = 0
+    slash_selection = 0
+    slash_key = ""
+    slash_dismissed_for: str | None = None
     state = {"dirty": False, "defer": False}
 
+    def current_slash_rows() -> list["_SlashPaletteRow"]:
+        nonlocal slash_selection, slash_key
+        key = _slash_palette_key(buffer, cursor, slash_dismissed_for)
+        if key != slash_key:
+            slash_key = key
+            slash_selection = 0
+        rows = _slash_palette_rows_for_buffer(buffer, cursor, dismissed_for=slash_dismissed_for)
+        if rows:
+            slash_selection = max(0, min(slash_selection, len(rows) - 1))
+        return rows
+
+    def sync_slash_after_edit() -> None:
+        nonlocal slash_dismissed_for
+        if slash_dismissed_for is not None and _slash_first_line(buffer) != slash_dismissed_for:
+            slash_dismissed_for = None
+        current_slash_rows()
+
+    def complete_slash_selection(*, trailing_space: bool) -> bool:
+        nonlocal buffer, cursor, slash_dismissed_for
+        completed = _slash_selected_completion_text(
+            buffer,
+            cursor,
+            slash_selection,
+            dismissed_for=slash_dismissed_for,
+            trailing_space=trailing_space,
+        )
+        if completed is None:
+            return False
+        buffer = completed
+        cursor = min(len(buffer), _slash_completed_cursor(completed))
+        slash_dismissed_for = _slash_first_line(buffer)
+        sync_slash_after_edit()
+        state["dirty"] = True
+        return True
+
     def render() -> None:
-        nonlocal rendered_lines
+        nonlocal rendered_lines, rendered_rows_below_cursor
         lines = _prompt_display_lines(buffer, style)
         cols = _terminal_columns()
-        _clear_prompt_lines(rendered_lines)
+        lines.extend(
+            _slash_palette_display_lines(
+                buffer,
+                cursor,
+                selected_index=slash_selection,
+                dismissed_for=slash_dismissed_for,
+                style=style,
+                width=cols,
+            )
+        )
+        _clear_prompt_lines(rendered_lines, rows_below_cursor=rendered_rows_below_cursor)
         print("\n".join(lines), end="", file=sys.stderr, flush=True)
         rendered_lines = _prompt_screen_rows(lines, cols)
+        cursor_row = _prompt_cursor_screen_row(buffer, cursor, rendered_lines, cols)
+        rendered_rows_below_cursor = max(0, rendered_lines - 1 - cursor_row)
         _move_prompt_cursor(buffer, cursor, rendered_lines, cols)
         state["dirty"] = False
 
@@ -1833,7 +2135,7 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
                     if chunk == b"":
                         if state["dirty"]:
                             render()
-                        _clear_prompt_lines(rendered_lines)
+                        _clear_prompt_lines(rendered_lines, rows_below_cursor=rendered_rows_below_cursor)
                         print(file=sys.stderr, flush=True)
                         return None
                     if chunk == b"\x03":
@@ -1841,13 +2143,19 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
                     if chunk == b"\x04" and not buffer:
                         if state["dirty"]:
                             render()
-                        _clear_prompt_lines(rendered_lines)
+                        _clear_prompt_lines(rendered_lines, rows_below_cursor=rendered_rows_below_cursor)
                         return None
                     if chunk in {b"\x7f", b"\b"}:
                         if cursor > 0:
                             buffer = buffer[: cursor - 1] + buffer[cursor:]
                             cursor -= 1
+                            sync_slash_after_edit()
                             state["dirty"] = True
+                        if not _has_pending_input(fd, pending):
+                            break
+                        continue
+                    if chunk == b"\t":
+                        complete_slash_selection(trailing_space=True)
                         if not _has_pending_input(fd, pending):
                             break
                         continue
@@ -1857,13 +2165,23 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
                             normalized = tail.replace("\r\n", "\n").replace("\r", "\n")
                             buffer = buffer[:cursor] + normalized + buffer[cursor:]
                             cursor += len(normalized)
-                        result = _normalize_optional_prompt(buffer) or ""
-                        _clear_prompt_lines(rendered_lines)
+                            sync_slash_after_edit()
+                        accepted = _slash_selected_completion_text(
+                            buffer,
+                            cursor,
+                            slash_selection,
+                            dismissed_for=slash_dismissed_for,
+                            trailing_space=False,
+                        )
+                        result = _normalize_optional_prompt(accepted if accepted is not None else buffer) or ""
+                        _clear_prompt_lines(rendered_lines, rows_below_cursor=rendered_rows_below_cursor)
                         rendered_lines = 0
+                        rendered_rows_below_cursor = 0
                         return result
                     if chunk == b"\n":
                         buffer = buffer[:cursor] + "\n" + buffer[cursor:]
                         cursor += 1
+                        sync_slash_after_edit()
                         state["dirty"] = True
                         if not _has_pending_input(fd, pending):
                             break
@@ -1876,12 +2194,25 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
                             normalized = decoded.replace("\r\n", "\n").replace("\r", "\n")
                             buffer = buffer[:cursor] + normalized + buffer[cursor:]
                             cursor += len(normalized)
+                            sync_slash_after_edit()
                             state["dirty"] = True
                         else:
-                            updated = _apply_prompt_escape_sequence(buffer, cursor, sequence)
-                            if updated is not None:
-                                buffer, cursor = updated
+                            rows = current_slash_rows()
+                            if rows and sequence in {b"\x1b[A", b"\x1bOA"}:
+                                slash_selection = (slash_selection - 1) % len(rows)
                                 state["dirty"] = True
+                            elif rows and sequence in {b"\x1b[B", b"\x1bOB"}:
+                                slash_selection = (slash_selection + 1) % len(rows)
+                                state["dirty"] = True
+                            elif rows and sequence == b"\x1b":
+                                slash_dismissed_for = _slash_first_line(buffer)
+                                state["dirty"] = True
+                            else:
+                                updated = _apply_prompt_escape_sequence(buffer, cursor, sequence)
+                                if updated is not None:
+                                    buffer, cursor = updated
+                                    sync_slash_after_edit()
+                                    state["dirty"] = True
                         if sequence.startswith(b"\x1b[200~"):
                             state["dirty"] = True
                         if not _has_pending_input(fd, pending):
@@ -1889,9 +2220,14 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
                         continue
                     decoded = decoder.decode(chunk, final=False)
                     if decoded:
+                        if decoded == "/" and complete_slash_selection(trailing_space=True):
+                            if not _has_pending_input(fd, pending):
+                                break
+                            continue
                         normalized = decoded.replace("\r\n", "\n").replace("\r", "\n")
                         buffer = buffer[:cursor] + normalized + buffer[cursor:]
                         cursor += len(normalized)
+                        sync_slash_after_edit()
                         state["dirty"] = True
                     if not _has_pending_input(fd, pending):
                         break
@@ -1926,6 +2262,8 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
         f"{style.dim(f'({elapsed} • esc to interrupt)')}",
     ]
     metric_parts: list[str] = []
+    if snapshot.goal_status:
+        metric_parts.append(snapshot.goal_status)
     if snapshot.active_context_tokens is not None:
         ctx = _format_tokens_compact(snapshot.active_context_tokens)
         if snapshot.context_window:
@@ -1937,6 +2275,8 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
         )
     if snapshot.session_reasoning_tokens is not None:
         metric_parts.append(f"reasoning {_format_tokens_compact(snapshot.session_reasoning_tokens)}")
+    if snapshot.auth_label:
+        metric_parts.append(f"auth {snapshot.auth_label}")
     if metric_parts:
         parts.append(style.dim(" · " + " · ".join(metric_parts)))
     line = "".join(parts)
@@ -1945,6 +2285,118 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
     if len(wrapped) <= 1:
         return wrapped
     return [wrapped[0], *[f"  {style.dim(line)}" for line in wrapped[1:]]]
+
+
+def _session_auth_indicator(session: CodexSession, *, include_fallback: bool) -> str | None:
+    client = getattr(session, "model_client", None)
+    active = getattr(client, "auth_display_name", None)
+    if not isinstance(active, str) or not active:
+        type_name = type(client).__name__ if client is not None else ""
+        if type_name == "ScriptedResponsesModel":
+            active = "fake model"
+        elif type_name == "ChatGPTCodexModel":
+            active = "ChatGPT"
+        elif type_name == "OpenAIResponsesModel":
+            active = "API key"
+    if not active:
+        return None
+    if include_fallback:
+        active = _with_chatgpt_account_hint(session, active)
+        fallback = getattr(client, "auth_fallback_display_name", None)
+        if isinstance(fallback, str) and fallback:
+            active = f"{active} · fallback {fallback}"
+    return active
+
+
+def _with_chatgpt_account_hint(session: CodexSession, label: str) -> str:
+    if "chatgpt" not in label.lower():
+        return label
+    try:
+        from .auth import auth_status
+
+        status = auth_status(session.config.resolved_auth_codex_home())
+    except Exception:
+        return label
+    pieces: list[str] = []
+    email = _mask_email(str(status.get("email") or ""))
+    if email:
+        pieces.append(email)
+    plan = status.get("plan_type")
+    if isinstance(plan, str) and plan:
+        pieces.append(plan)
+    account = status.get("account_id")
+    if isinstance(account, str) and account:
+        pieces.append(account)
+    if not pieces:
+        return label
+    return f"{label} ({', '.join(pieces)})"
+
+
+def _mask_email(value: str) -> str | None:
+    if "@" not in value:
+        return None
+    local, domain = value.split("@", 1)
+    if not local or not domain:
+        return None
+    if len(local) == 1:
+        masked_local = local + "***"
+    else:
+        masked_local = local[0] + "***" + local[-1]
+    return f"{masked_local}@{domain}"
+
+
+def _goal_status_indicator(session: CodexSession) -> str | None:
+    runtime = getattr(session, "goals", None)
+    get_goal = getattr(runtime, "get_goal", None)
+    if not callable(get_goal):
+        return None
+    try:
+        goal = get_goal()
+    except Exception:
+        return None
+    if goal is None:
+        return None
+    status = GOAL_STATUS_FROM_WIRE.get(getattr(goal, "status", ""), getattr(goal, "status", ""))
+    if status == "active":
+        return f"Pursuing goal ({_active_goal_footer_usage(goal)})"
+    if status == "paused":
+        return "Goal paused (/goal resume)"
+    if status == "blocked":
+        return "Goal blocked (/goal resume)"
+    if status == "usage_limited":
+        return "Goal hit usage limits (/goal resume)"
+    if status == "budget_limited":
+        usage = _budget_limited_goal_footer_usage(goal)
+        return f"Goal unmet ({usage})" if usage else "Goal abandoned"
+    if status == "complete":
+        return f"Goal achieved ({_complete_goal_footer_usage(goal)})"
+    return None
+
+
+def _active_goal_footer_usage(goal: Any) -> str:
+    token_budget = getattr(goal, "token_budget", None)
+    tokens_used = int(getattr(goal, "tokens_used", 0) or 0)
+    if token_budget is not None:
+        return f"{_format_tokens_compact(tokens_used)} / {_format_tokens_compact(int(token_budget))}"
+    elapsed = int(getattr(goal, "time_used_seconds", 0) or 0)
+    return _format_goal_elapsed_seconds(elapsed)
+
+
+def _budget_limited_goal_footer_usage(goal: Any) -> str:
+    token_budget = getattr(goal, "token_budget", None)
+    if token_budget is None:
+        return ""
+    tokens_used = int(getattr(goal, "tokens_used", 0) or 0)
+    return f"{_format_tokens_compact(tokens_used)} / {_format_tokens_compact(int(token_budget))} tokens"
+
+
+def _complete_goal_footer_usage(goal: Any) -> str:
+    token_budget = getattr(goal, "token_budget", None)
+    tokens_used = int(getattr(goal, "tokens_used", 0) or 0)
+    if token_budget is not None:
+        return f"{_format_tokens_compact(tokens_used)} tokens"
+    elapsed = int(getattr(goal, "time_used_seconds", 0) or 0)
+    return _format_goal_elapsed_seconds(elapsed)
 
 
 def _session_context_status(session: CodexSession) -> tuple[int | None, bool, int | None, bool, int | None, int | None]:
@@ -2058,7 +2510,7 @@ def _move_prompt_cursor(text: str, cursor: int, rendered_lines: int, cols: int, 
     if rendered_lines <= 0 or cols <= 0:
         return
     row, col = _prompt_cursor_position(text, cursor, cols)
-    row = min(max(prefix_rows + row, 0), max(0, rendered_lines - 1))
+    row = _prompt_cursor_screen_row(text, cursor, rendered_lines, cols, prefix_rows=prefix_rows)
     rows_up = max(0, rendered_lines - 1 - row)
     sys.stderr.write("\r")
     if rows_up:
@@ -2066,6 +2518,13 @@ def _move_prompt_cursor(text: str, cursor: int, rendered_lines: int, cols: int, 
     if col:
         sys.stderr.write(f"\033[{col}C")
     sys.stderr.flush()
+
+
+def _prompt_cursor_screen_row(text: str, cursor: int, rendered_lines: int, cols: int, *, prefix_rows: int = 0) -> int:
+    if rendered_lines <= 0 or cols <= 0:
+        return 0
+    row, _ = _prompt_cursor_position(text, cursor, cols)
+    return min(max(prefix_rows + row, 0), max(0, rendered_lines - 1))
 
 
 def _prompt_cursor_position(text: str, cursor: int, cols: int) -> tuple[int, int]:
@@ -2131,9 +2590,12 @@ def _move_cursor_vertical(text: str, cursor: int, direction: int) -> int:
     return min(next_start + column, next_end)
 
 
-def _clear_prompt_lines(line_count: int) -> None:
+def _clear_prompt_lines(line_count: int, *, rows_below_cursor: int = 0) -> None:
     if line_count <= 0:
         return
+    if rows_below_cursor > 0:
+        sys.stderr.write("\r")
+        sys.stderr.write(f"\033[{rows_below_cursor}B")
     if line_count > 1:
         sys.stderr.write(f"\r\033[{line_count - 1}A")
     else:
@@ -2272,6 +2734,14 @@ class _InteractiveSlashResult:
     status: int = 0
     prompt: str | None = None
     session: CodexSession | None = None
+    run_goal_continuation: bool = False
+
+
+@dataclass(frozen=True)
+class _SlashPaletteRow:
+    display_name: str
+    command: _SlashCommandDef
+    description: str
 
 
 _SLASH_COMMANDS: tuple[_SlashCommandDef, ...] = (
@@ -2296,20 +2766,21 @@ _SLASH_COMMANDS: tuple[_SlashCommandDef, ...] = (
     _SlashCommandDef("compact", "summarize conversation to prevent hitting the context limit", available_during_task=False),
     _SlashCommandDef("plan", "switch to Plan mode", supports_inline_args=True, available_during_task=False),
     _SlashCommandDef("goal", "set or view the goal for a long-running task", supports_inline_args=True),
-    _SlashCommandDef("collab", "change collaboration mode"),
-    _SlashCommandDef("agent", "switch the active agent thread", aliases=("multi-agents", "subagents")),
+    _SlashCommandDef("agent", "switch the active agent thread"),
     _SlashCommandDef("side", "start a side conversation in an ephemeral fork", supports_inline_args=True),
+    _SlashCommandDef("btw", "start a side conversation in an ephemeral fork", supports_inline_args=True),
+    _SlashCommandDef("multi-agents", "switch the active agent thread", aliases=("subagents",)),
     _SlashCommandDef("copy", "copy last response as markdown"),
-    _SlashCommandDef("raw", "toggle raw scrollback mode", supports_inline_args=True),
-    _SlashCommandDef("diff", "show git diff"),
+    _SlashCommandDef("raw", "toggle raw scrollback mode for copy-friendly terminal selection", supports_inline_args=True),
+    _SlashCommandDef("diff", "show git diff (including untracked files)"),
     _SlashCommandDef("mention", "mention a file"),
     _SlashCommandDef("status", "show current session configuration and token usage"),
     _SlashCommandDef("debug-config", "show config layers and requirement sources for debugging"),
-    _SlashCommandDef("title", "configure terminal title items"),
-    _SlashCommandDef("statusline", "configure status line items"),
+    _SlashCommandDef("title", "configure which items appear in the terminal title"),
+    _SlashCommandDef("statusline", "configure which items appear in the status line"),
     _SlashCommandDef("theme", "choose a syntax highlighting theme", supports_inline_args=True, available_during_task=False),
     _SlashCommandDef("pets", "choose or hide the terminal pet", supports_inline_args=True, available_during_task=False, aliases=("pet",)),
-    _SlashCommandDef("mcp", "list configured MCP tools", supports_inline_args=True),
+    _SlashCommandDef("mcp", "list configured MCP tools; use /mcp verbose for details", supports_inline_args=True),
     _SlashCommandDef("apps", "manage apps"),
     _SlashCommandDef("plugins", "browse plugins"),
     _SlashCommandDef("logout", "log out of Codex", available_during_task=False),
@@ -2320,8 +2791,8 @@ _SLASH_COMMANDS: tuple[_SlashCommandDef, ...] = (
     _SlashCommandDef("ps", "list background terminals"),
     _SlashCommandDef("stop", "stop all background terminals", aliases=("clean",)),
     _SlashCommandDef("clear", "clear the terminal and start a new chat", available_during_task=False),
-    _SlashCommandDef("personality", "choose a communication style", available_during_task=False),
-    _SlashCommandDef("realtime", "toggle realtime voice mode"),
+    _SlashCommandDef("personality", "choose a communication style for Codex", available_during_task=False),
+    _SlashCommandDef("realtime", "toggle realtime voice mode (experimental)"),
     _SlashCommandDef("settings", "configure realtime microphone/speaker"),
     _SlashCommandDef("test-approval", "test approval request"),
     _SlashCommandDef("debug-m-drop", "DO NOT USE", available_during_task=False),
@@ -2333,6 +2804,251 @@ _SLASH_COMMAND_BY_NAME: dict[str, _SlashCommandDef] = {
     for command in _SLASH_COMMANDS
     for alias in (command.name, *command.aliases)
 }
+
+_SLASH_IMPLEMENTED_NAMES = {
+    "model",
+    "new",
+    "resume",
+    "fork",
+    "init",
+    "compact",
+    "plan",
+    "goal",
+    "status",
+    "theme",
+    "quit",
+    "exit",
+    "rollout",
+    "ps",
+    "stop",
+    "clear",
+}
+_SLASH_AVAILABLE_COMMAND_BY_NAME: dict[str, _SlashCommandDef] = {
+    alias: command
+    for command in _SLASH_COMMANDS
+    if command.name in _SLASH_IMPLEMENTED_NAMES
+    for alias in (command.name, *command.aliases)
+}
+
+_SLASH_POPUP_ALIAS_NAMES = {"quit", "btw"}
+_SLASH_POPUP_HIDDEN_NAMES = {"apps"}
+_SLASH_POPUP_MAX_ROWS = 8
+
+
+def _slash_first_line(buffer: str) -> str:
+    return buffer.split("\n", 1)[0]
+
+
+def _slash_command_under_cursor(buffer: str, cursor: int) -> tuple[str, str, str, int] | None:
+    first_line_end = buffer.find("\n")
+    if first_line_end == -1:
+        first_line_end = len(buffer)
+    if cursor > first_line_end:
+        return None
+    first_line = buffer[:first_line_end]
+    if not first_line.startswith("/"):
+        return None
+    name_start = 1
+    rest_of_line = first_line[name_start:]
+    whitespace = next((idx for idx, char in enumerate(rest_of_line) if char.isspace()), None)
+    name_end = len(first_line) if whitespace is None else name_start + whitespace
+    if cursor > name_end:
+        return None
+    name = first_line[name_start:name_end]
+    rest_start = name_end
+    for index in range(name_end, len(first_line)):
+        if not first_line[index].isspace():
+            rest_start = index
+            break
+    else:
+        rest_start = name_end
+    rest = first_line[rest_start:]
+    return name, rest, first_line, name_end
+
+
+def _slash_palette_key(buffer: str, cursor: int, dismissed_for: str | None = None) -> str:
+    parsed = _slash_command_under_cursor(buffer, cursor)
+    if parsed is None:
+        return ""
+    name, rest, first_line, _ = parsed
+    if dismissed_for == first_line:
+        return ""
+    return f"{name}\0{rest}\0{first_line}"
+
+
+def _slash_palette_rows_for_buffer(
+    buffer: str,
+    cursor: int,
+    *,
+    dismissed_for: str | None = None,
+) -> list[_SlashPaletteRow]:
+    parsed = _slash_command_under_cursor(buffer, cursor)
+    if parsed is None:
+        return []
+    name, rest, first_line, _ = parsed
+    if dismissed_for == first_line:
+        return []
+    if not name and rest:
+        return []
+    return _slash_palette_rows_for_name(name)
+
+
+def _slash_palette_rows_for_name(name: str) -> list[_SlashPaletteRow]:
+    query = name.strip().lower()
+    if not query:
+        return [
+            _SlashPaletteRow(command.name, command, command.description)
+            for command in _SLASH_COMMANDS
+            if _slash_command_visible_in_popup(command, default_list=True)
+        ]
+
+    exact: list[_SlashPaletteRow] = []
+    prefix: list[_SlashPaletteRow] = []
+    fuzzy: list[_SlashPaletteRow] = []
+    seen: set[str] = set()
+    for command in _SLASH_COMMANDS:
+        if not _slash_command_visible_in_popup(command, default_list=False):
+            continue
+        candidates = (command.name, *command.aliases)
+        lowered = [candidate.lower() for candidate in candidates]
+        row = _SlashPaletteRow(command.name, command, command.description)
+        if any(candidate == query for candidate in lowered):
+            if command.name not in seen:
+                exact.append(row)
+                seen.add(command.name)
+            continue
+        if any(candidate.startswith(query) for candidate in lowered):
+            if command.name not in seen:
+                prefix.append(row)
+                seen.add(command.name)
+            continue
+        if any(_is_subsequence(query, candidate) for candidate in lowered):
+            if command.name not in seen:
+                fuzzy.append(row)
+                seen.add(command.name)
+    if exact or prefix:
+        return [*exact, *prefix]
+    return fuzzy
+
+
+def _slash_command_visible_in_popup(command: _SlashCommandDef, *, default_list: bool) -> bool:
+    if command.name not in _SLASH_IMPLEMENTED_NAMES:
+        return False
+    if command.name in _SLASH_POPUP_HIDDEN_NAMES or command.name.startswith("debug"):
+        return False
+    if default_list and command.name in _SLASH_POPUP_ALIAS_NAMES:
+        return False
+    return True
+
+
+def _is_subsequence(needle: str, haystack: str) -> bool:
+    if not needle:
+        return True
+    iterator = iter(haystack)
+    return all(char in iterator for char in needle)
+
+
+def _slash_palette_display_lines(
+    buffer: str,
+    cursor: int,
+    *,
+    selected_index: int,
+    dismissed_for: str | None,
+    style: "_AnsiStyle",
+    width: int,
+) -> list[str]:
+    rows = _slash_palette_rows_for_buffer(buffer, cursor, dismissed_for=dismissed_for)
+    if not rows:
+        return []
+    selected_index = max(0, min(selected_index, len(rows) - 1))
+    start = _slash_visible_start(selected_index, len(rows), _SLASH_POPUP_MAX_ROWS)
+    visible_rows = rows[start : start + _SLASH_POPUP_MAX_ROWS]
+    name_width = max(_visible_len(f"/{row.display_name}") for row in visible_rows)
+    lines = [""]
+    for offset, row in enumerate(visible_rows):
+        index = start + offset
+        lines.extend(
+            _slash_palette_row_lines(
+                row,
+                name_width=name_width,
+                selected=index == selected_index,
+                style=style,
+                width=width,
+            )
+        )
+    return lines
+
+
+def _slash_visible_start(selected_index: int, total: int, max_rows: int) -> int:
+    if total <= max_rows:
+        return 0
+    half = max_rows // 2
+    return max(0, min(selected_index - half, total - max_rows))
+
+
+def _slash_palette_row_lines(
+    row: _SlashPaletteRow,
+    *,
+    name_width: int,
+    selected: bool,
+    style: "_AnsiStyle",
+    width: int,
+) -> list[str]:
+    plain_name = f"/{row.display_name}"
+    padded_name = _pad_visible(plain_name, name_width)
+    prefix = f"  {padded_name}  "
+    desc_width = max(12, width - _visible_len(prefix))
+    desc_lines = _wrap_ansi_line(row.description, desc_width)
+    rendered: list[str] = []
+    for index, desc in enumerate(desc_lines):
+        line_prefix = prefix if index == 0 else f"  {' ' * name_width}  "
+        desc_text = style.dim(desc) if desc else ""
+        line = f"{line_prefix}{desc_text}".rstrip()
+        if selected:
+            line = style.inverse(_pad_visible(line, min(width, max(_visible_len(line), 1))))
+        rendered.append(line)
+    return rendered
+
+
+def _pad_visible(text: str, width: int) -> str:
+    padding = max(0, width - _visible_len(text))
+    return text + (" " * padding)
+
+
+def _slash_selected_completion_text(
+    buffer: str,
+    cursor: int,
+    selected_index: int,
+    *,
+    dismissed_for: str | None = None,
+    trailing_space: bool,
+) -> str | None:
+    parsed = _slash_command_under_cursor(buffer, cursor)
+    if parsed is None:
+        return None
+    _, _, first_line, name_end = parsed
+    rows = _slash_palette_rows_for_buffer(buffer, cursor, dismissed_for=dismissed_for)
+    if not rows:
+        return None
+    row = rows[max(0, min(selected_index, len(rows) - 1))]
+    replacement = f"/{row.display_name}"
+    first_line_end = buffer.find("\n")
+    if first_line_end == -1:
+        first_line_end = len(buffer)
+    completed_first_line = replacement + first_line[name_end:]
+    if trailing_space and (
+        len(completed_first_line) == len(replacement)
+        or not completed_first_line[len(replacement)].isspace()
+    ):
+        completed_first_line = f"{replacement} " + completed_first_line[len(replacement):]
+    return completed_first_line + buffer[first_line_end:]
+
+
+def _slash_completed_cursor(buffer: str) -> int:
+    first_line_end = buffer.find("\n")
+    if first_line_end == -1:
+        return len(buffer)
+    return first_line_end
 
 
 def _parse_slash_name(line: str) -> tuple[str, str] | None:
@@ -2359,7 +3075,7 @@ def _parse_interactive_slash(prompt: str) -> _ParsedSlashCommand | None:
     name, rest = parsed
     if "/" in name:
         return None
-    command = _SLASH_COMMAND_BY_NAME.get(name.lower())
+    command = _SLASH_AVAILABLE_COMMAND_BY_NAME.get(name.lower())
     if command is None:
         return None
     if rest and not command.supports_inline_args:
@@ -2391,8 +3107,13 @@ def _handle_interactive_slash_command(
         if parsed_name is not None and "/" not in parsed_name[0]:
             name, _ = parsed_name
             command = _SLASH_COMMAND_BY_NAME.get(name.lower())
-            if command is not None:
-                return _InteractiveSlashResult(False)
+            if command is not None and command.name not in _SLASH_IMPLEMENTED_NAMES:
+                print(
+                    f"Command '/{name}' is not available in this Python CLI.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return _InteractiveSlashResult(True)
             print(
                 f"Unrecognized command '/{name}'. Type \"/\" for a list of supported commands.",
                 file=sys.stderr,
@@ -2428,10 +3149,10 @@ def _handle_interactive_slash_command(
         forked = _interactive_fork_session(session, slash.rest.strip(), color_mode=color_mode)
         return _InteractiveSlashResult(True, session=forked)
     if command == "goal":
-        _handle_goal_slash(session, slash.rest.strip(), color_mode=color_mode)
-        return _InteractiveSlashResult(True)
+        should_continue = _handle_goal_slash(session, slash.rest.strip(), color_mode=color_mode)
+        return _InteractiveSlashResult(True, run_goal_continuation=should_continue)
     if command == "status":
-        _print_chat_status(session)
+        _print_chat_status(session, color_mode=color_mode)
         return _InteractiveSlashResult(True)
     if command == "rollout":
         print(f"Current rollout path: {session.state.rollout_path()}", file=sys.stderr, flush=True)
@@ -2459,74 +3180,72 @@ def _handle_interactive_slash_command(
         if arg and arg not in {"on", "off"}:
             print("Usage: /raw [on|off]", file=sys.stderr, flush=True)
         else:
-            print("'/raw' is recognized but raw scrollback mode is not implemented in this Python CLI yet.", file=sys.stderr, flush=True)
+            print("Command '/raw' is not available in this Python CLI.", file=sys.stderr, flush=True)
         return _InteractiveSlashResult(True)
 
     print(
-        f"'/{slash.name}' is recognized as a Codex command but is not implemented in this Python CLI yet.",
+        f"Command '/{slash.name}' is not available in this Python CLI.",
         file=sys.stderr,
         flush=True,
     )
     return _InteractiveSlashResult(True)
 
 
-def _handle_goal_slash(session: CodexSession, rest: str, *, color_mode: str = "auto") -> None:
+def _handle_goal_slash(session: CodexSession, rest: str, *, color_mode: str = "auto") -> bool:
     style = _AnsiStyle(_should_use_color(color_mode))
+    renderer = _HumanEventRenderer(color_mode=color_mode)
     runtime = getattr(session, "goals", None)
     available = getattr(runtime, "tools_available", None)
     if not callable(available) or not available():
-        print(
-            "Goals need a saved session. This session is temporary.",
-            file=sys.stderr,
-            flush=True,
-        )
-        return
+        renderer.render_info_message("Usage: /goal <objective>", "Goals need a saved session. This session is temporary.")
+        return False
     rest = rest.strip()
     if not rest:
         goal = runtime.get_goal()
         if goal is None:
-            print("Usage: /goal <objective>", file=sys.stderr)
-            print("No goal is currently set.", file=sys.stderr, flush=True)
-            return
+            renderer.render_info_message("Usage: /goal <objective>", "No goal is currently set.")
+            return False
         _print_goal_summary(goal, style)
-        return
+        return False
     try:
         command, remainder = _parse_goal_command(rest)
         if command == "clear":
             cleared, events = runtime.clear_goal_external()
             _emit_goal_runtime_events(session, events)
-            print("Goal cleared" if cleared else "No goal to clear", file=sys.stderr, flush=True)
-            return
+            if cleared:
+                renderer.render_info_message("Goal cleared")
+            else:
+                renderer.render_info_message("No goal to clear", "This thread does not currently have a goal.")
+            return False
         if command in {"pause", "resume"}:
             status: GoalStatus = "paused" if command == "pause" else "active"
             goal, events = runtime.set_goal_external(status=status)
             _emit_goal_runtime_events(session, events)
-            print(f"Goal {_goal_status_label(goal.status)}", file=sys.stderr)
-            print(goal_summary(goal), file=sys.stderr, flush=True)
-            return
+            renderer.render_info_message(f"Goal {_goal_status_label(goal.status)}", goal_summary(goal))
+            return goal.status == "active"
         if command == "edit":
             if not remainder.strip():
-                print("Usage: /goal edit <objective>", file=sys.stderr, flush=True)
-                return
+                renderer.render_info_message("Usage: /goal edit <objective>")
+                return False
             goal, events = runtime.set_goal_external(objective=remainder.strip())
             _emit_goal_runtime_events(session, events)
-            print(f"Goal {_goal_status_label(goal.status)}", file=sys.stderr)
-            print(goal_summary(goal), file=sys.stderr, flush=True)
-            return
+            renderer.render_info_message(f"Goal {_goal_status_label(goal.status)}", goal_summary(goal))
+            return goal.status == "active"
         objective = rest
         existing = runtime.get_goal()
         replace = existing is not None and existing.status == "complete"
         if existing is not None and existing.status != "complete":
             if not _confirm_replace_goal(existing.objective, objective, color_mode=color_mode):
-                print("Cancelled.", file=sys.stderr, flush=True)
-                return
+                renderer.render_info_message("Cancelled.")
+                return False
             replace = True
         goal, events = runtime.set_goal_external(objective=objective, status="active", token_budget=None, replace_existing=replace)
         _emit_goal_runtime_events(session, events)
-        print(f"Goal {_goal_status_label(goal.status)}", file=sys.stderr)
-        print(goal_summary(goal), file=sys.stderr, flush=True)
+        renderer.render_info_message(f"Goal {_goal_status_label(goal.status)}", goal_summary(goal))
+        return goal.status == "active"
     except Exception as exc:
-        print(f"Failed to update thread goal: {_exception_display_message(exc)}", file=sys.stderr, flush=True)
+        renderer.render_error(f"Failed to update thread goal: {_exception_display_message(exc)}")
+        return False
 
 
 def _parse_goal_command(rest: str) -> tuple[str | None, str]:
@@ -3325,36 +4044,384 @@ def _read_init_command_prompt() -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _print_chat_status(session: CodexSession) -> None:
+def _print_chat_status(session: CodexSession, *, color_mode: str = "auto") -> None:
+    style = _AnsiStyle(_should_use_color(color_mode))
+    rate_limits, rate_limit_error = _status_rate_limits(session)
+    print(
+        "\n".join(
+            _chat_status_panel_lines(
+                session,
+                style=style,
+                rate_limits=rate_limits,
+                rate_limit_error=rate_limit_error,
+            )
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _chat_status_panel_lines(
+    session: CodexSession,
+    *,
+    style: "_AnsiStyle" | None = None,
+    rate_limits: list[Any] | None = None,
+    rate_limit_error: str | None = None,
+    terminal_width: int | None = None,
+) -> list[str]:
+    style = style or _AnsiStyle(False)
     config = session.config
     reasoning = config.resolved_reasoning() or {}
-    active_context, _active_context_estimated = session.state.active_context_token_status()
-    context_tokens = "unknown" if active_context is None else str(active_context)
-    session_context, _session_context_estimated = session.state.session_context_token_status()
-    session_context_text = (
-        "unknown"
-        if session_context is None
-        else str(session_context)
-    )
-    api_usage_tokens = session.state.session_usage_tokens()
-    api_usage_text = "none" if api_usage_tokens is None else str(api_usage_tokens)
-    reasoning_tokens = session.state.session_reasoning_usage_tokens()
-    reasoning_text = "none" if reasoning_tokens is None else str(reasoning_tokens)
-    lines = [
-        "Session status",
-        f"  model: {config.model}",
-        f"  reasoning: {reasoning.get('effort') or 'none'}",
-        f"  cwd: {config.resolved_cwd()}",
-        f"  sandbox: {config.sandbox}",
-        f"  approval: {config.approval_policy}",
-        f"  mode: {config.collaboration_mode}",
-        f"  rollout: {session.state.rollout_path()}",
-        f"  context tokens: {context_tokens}",
-        f"  session context tokens: {session_context_text}",
-        f"  session reasoning tokens: {reasoning_text}",
-        f"  API usage tokens: {api_usage_text}",
+    effort = str(reasoning.get("effort") or "none").lower()
+    summary = str(reasoning.get("summary") or "auto").lower()
+    model_details = f"reasoning {effort}, summaries {summary}"
+    provider = _status_provider_display(config)
+    directory = _status_directory_display(config.resolved_cwd())
+    permissions = _status_permissions_display(config)
+    account = _session_auth_indicator(session, include_fallback=True)
+    thread_name = getattr(session.state, "thread_name", None)
+    active_context, active_estimated = session.state.active_context_token_status()
+    session_context, session_estimated = session.state.session_context_token_status()
+    context_window = config.resolved_model_context_window()
+    token_usage = _status_token_usage_display(session)
+    labels = [
+        "Model",
+        "Model provider",
+        "Directory",
+        "Permissions",
+        "Agents.md",
+        "Account",
+        "Thread name",
+        "Collaboration mode",
+        "Session",
+        "Forked from",
+        "Token usage",
+        "Context window",
+        "Session context",
+        "Reasoning tokens",
+        "Rollout",
+        *[label for label, _value in _status_rate_limit_rows(rate_limits, rate_limit_error)],
     ]
-    print("\n".join(lines), file=sys.stderr, flush=True)
+    label_width = max(_visible_len(label) for label in labels)
+    terminal_width = terminal_width or _terminal_columns()
+    available_inner_width = max(24, min(96, terminal_width - 4))
+    field_lines: list[str] = [
+        f"  >_ {style.bold('OpenAI Codex')}",
+        "",
+        style.cyan("Visit https://chatgpt.com/codex/settings/usage for up-to-date"),
+        style.cyan("information on rate limits and credits"),
+        "",
+    ]
+    field_lines.extend(_status_field_lines("Model", f"{config.model} ({model_details})", label_width, available_inner_width))
+    if provider:
+        field_lines.extend(_status_field_lines("Model provider", provider, label_width, available_inner_width))
+    field_lines.extend(_status_field_lines("Directory", directory, label_width, available_inner_width))
+    field_lines.extend(_status_field_lines("Permissions", permissions, label_width, available_inner_width))
+    field_lines.extend(_status_field_lines("Agents.md", _status_agents_summary(config.resolved_cwd()), label_width, available_inner_width))
+    if account:
+        field_lines.extend(_status_field_lines("Account", account, label_width, available_inner_width))
+    if isinstance(thread_name, str) and thread_name.strip():
+        field_lines.extend(_status_field_lines("Thread name", thread_name.strip(), label_width, available_inner_width))
+    field_lines.extend(_status_field_lines("Collaboration mode", config.collaboration_mode, label_width, available_inner_width))
+    field_lines.extend(_status_field_lines("Session", session.state.thread_id, label_width, available_inner_width))
+    if session.state.forked_from_id:
+        field_lines.extend(_status_field_lines("Forked from", session.state.forked_from_id, label_width, available_inner_width))
+    field_lines.append("")
+    if not _session_uses_chatgpt_auth(session) and token_usage:
+        field_lines.extend(_status_field_lines("Token usage", token_usage, label_width, available_inner_width))
+    if active_context is not None:
+        field_lines.extend(
+            _status_field_lines(
+                "Context window",
+                _status_context_display(active_context, active_estimated, context_window),
+                label_width,
+                available_inner_width,
+            )
+        )
+    if session_context is not None:
+        field_lines.extend(
+            _status_field_lines(
+                "Session context",
+                _status_context_display(session_context, session_estimated, context_window),
+                label_width,
+                available_inner_width,
+            )
+        )
+    reasoning_tokens = session.state.session_reasoning_usage_tokens()
+    if reasoning_tokens is not None:
+        field_lines.extend(_status_field_lines("Reasoning tokens", _format_tokens_compact(reasoning_tokens), label_width, available_inner_width))
+    for label, value in _status_rate_limit_rows(rate_limits, rate_limit_error):
+        field_lines.extend(_status_field_lines(label, value, label_width, available_inner_width))
+    field_lines.extend(_status_field_lines("Rollout", str(session.state.rollout_path()), label_width, available_inner_width))
+    return ["/status", "", *_box_lines(field_lines, terminal_width=terminal_width)]
+
+
+def _status_rate_limits(session: CodexSession) -> tuple[list[Any] | None, str | None]:
+    if not _session_uses_chatgpt_auth(session):
+        return None, None
+    try:
+        from .auth import fetch_chatgpt_rate_limits
+
+        return (
+            fetch_chatgpt_rate_limits(
+                session.config.resolved_auth_codex_home(),
+                base_url=session.config.chatgpt_base_url,
+                timeout=3,
+            ),
+            None,
+        )
+    except Exception as exc:
+        return None, _sanitize_status_limit_error(exc)
+
+
+def _status_rate_limit_rows(rate_limits: list[Any] | None, error: str | None = None) -> list[tuple[str, str]]:
+    if rate_limits:
+        rows: list[tuple[str, str]] = []
+        for snapshot in rate_limits:
+            limit_id = str(getattr(snapshot, "limit_id", "") or "codex")
+            prefix = "" if limit_id.lower() == "codex" else f"{limit_id} "
+            primary = getattr(snapshot, "primary", None)
+            secondary = getattr(snapshot, "secondary", None)
+            if primary is not None:
+                rows.append((_status_limit_label(primary, secondary=False, prefix=prefix), _status_limit_value(primary)))
+            if secondary is not None:
+                rows.append((_status_limit_label(secondary, secondary=True, prefix=prefix), _status_limit_value(secondary)))
+            credits = getattr(snapshot, "credits", None)
+            credit_row = _status_credit_row(credits)
+            if credit_row:
+                rows.append(credit_row)
+        if rows:
+            return rows
+        return [("Limits", "not available for this account")]
+    if error:
+        return [("Limits", f"data not available yet ({error})")]
+    return [("Limits", "data not available yet")]
+
+
+def _status_limit_label(window: Any, *, secondary: bool, prefix: str) -> str:
+    window_minutes = getattr(window, "window_minutes", None)
+    label = _limit_label_for_window(window_minutes, secondary=secondary)
+    if label == "5h":
+        label = "5h"
+    else:
+        label = label[:1].upper() + label[1:]
+    return f"{prefix}{label} limit"
+
+
+def _limit_label_for_window(window_minutes: Any, *, secondary: bool) -> str:
+    try:
+        minutes = int(window_minutes)
+    except (TypeError, ValueError):
+        return "secondary usage" if secondary else "usage"
+    expected = [
+        (5 * 60, "5h"),
+        (24 * 60, "daily"),
+        (7 * 24 * 60, "weekly"),
+        (30 * 24 * 60, "monthly"),
+        (365 * 24 * 60, "annual"),
+    ]
+    for target, label in expected:
+        if target * 0.95 <= max(0, minutes) <= target * 1.05:
+            return label
+    return "secondary usage" if secondary else "usage"
+
+
+def _status_limit_value(window: Any) -> str:
+    used = getattr(window, "used_percent", 0.0)
+    try:
+        remaining = (100.0 - float(used))
+    except (TypeError, ValueError):
+        remaining = 0.0
+    remaining = max(0.0, min(100.0, remaining))
+    value = f"{_status_limit_bar(remaining)} {remaining:.0f}% left"
+    reset = _status_reset_display(getattr(window, "resets_at", None))
+    return f"{value} (resets {reset})" if reset else value
+
+
+def _status_limit_bar(percent_remaining: float) -> str:
+    segments = 20
+    filled = min(segments, max(0, round((percent_remaining / 100.0) * segments)))
+    return "[" + ("█" * filled) + ("░" * (segments - filled)) + "]"
+
+
+def _status_reset_display(resets_at: Any) -> str | None:
+    try:
+        timestamp = int(resets_at)
+    except (TypeError, ValueError):
+        return None
+    dt = _dt.datetime.fromtimestamp(timestamp).astimezone()
+    now = _dt.datetime.now().astimezone()
+    if dt.date() == now.date():
+        return dt.strftime("%H:%M")
+    return f"{dt.strftime('%H:%M')} on {dt.strftime('%-d %b')}"
+
+
+def _status_credit_row(credits: Any) -> tuple[str, str] | None:
+    if credits is None or not bool(getattr(credits, "has_credits", False)):
+        return None
+    if bool(getattr(credits, "unlimited", False)):
+        return ("Credits", "Unlimited")
+    balance = str(getattr(credits, "balance", "") or "").strip()
+    if not balance:
+        return None
+    try:
+        value = float(balance)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return ("Credits", f"{int(round(value))} credits")
+
+
+def _status_field_lines(label: str, value: str, label_width: int, inner_width: int) -> list[str]:
+    prefix = "  " + _pad_visible(f"{label}:", label_width + 1) + " "
+    value_width = max(8, inner_width - _visible_len(prefix))
+    wrapped = _wrap_ansi_line(value, value_width)
+    if not wrapped:
+        return [prefix.rstrip()]
+    continuation_prefix = " " * _visible_len(prefix)
+    return [
+        f"{prefix}{wrapped[0]}",
+        *[f"{continuation_prefix}{line}" for line in wrapped[1:]],
+    ]
+
+
+def _box_lines(lines: list[str], *, terminal_width: int | None = None) -> list[str]:
+    terminal_width = terminal_width or _terminal_columns()
+    max_inner = max(24, min(96, terminal_width - 4))
+    wrapped: list[str] = []
+    for line in lines:
+        if not line:
+            wrapped.append("")
+            continue
+        wrapped.extend(_wrap_ansi_line(line, max_inner))
+    inner_width = min(max_inner, max((_visible_len(line) for line in wrapped), default=0))
+    boxed = ["╭" + ("─" * (inner_width + 2)) + "╮"]
+    boxed.extend(f"│ {_pad_visible(line, inner_width)} │" for line in wrapped)
+    boxed.append("╰" + ("─" * (inner_width + 2)) + "╯")
+    return boxed
+
+
+def _status_provider_display(config: CodexConfig) -> str | None:
+    provider = config.model_provider_id
+    if provider == "openai" and not config.openai_base_url:
+        return None
+    if provider == "openai" and config.openai_base_url:
+        return f"OpenAI - {config.openai_base_url.rstrip('/')}"
+    return provider
+
+
+def _status_directory_display(path: Path) -> str:
+    try:
+        home = Path.home().resolve()
+        if path == home:
+            return "~"
+        try:
+            rel = path.relative_to(home)
+            return f"~/{rel}"
+        except ValueError:
+            return str(path)
+    except Exception:
+        return str(path)
+
+
+def _status_permissions_display(config: CodexConfig) -> str:
+    approval = config.approval_policy
+    if config.sandbox == "read-only":
+        return f"Read Only ({approval})"
+    if config.sandbox == "workspace-write":
+        suffix = " with network access" if config.network_access == "enabled" else ""
+        return f"Workspace{suffix} ({approval})"
+    if config.sandbox == "danger-full-access":
+        return "Full Access" if approval == "never" else f"No Sandbox ({approval})"
+    return f"Custom ({config.sandbox}, {approval})"
+
+
+def _status_agents_summary(cwd: Path) -> str:
+    try:
+        project_root = next((ancestor for ancestor in (cwd, *cwd.parents) if (ancestor / ".git").exists()), cwd)
+        dirs = [cwd]
+        while dirs[-1] != project_root and dirs[-1].parent != dirs[-1]:
+            dirs.append(dirs[-1].parent)
+        dirs.reverse()
+        paths: list[Path] = []
+        for directory in dirs:
+            for filename in ("AGENTS.override.md", "AGENTS.md"):
+                candidate = directory / filename
+                if candidate.exists() and candidate.is_file() and candidate.read_text(encoding="utf-8").strip():
+                    paths.append(candidate)
+                    break
+        if not paths:
+            return "<none>"
+        return ", ".join(_relative_status_path(path, cwd) for path in paths)
+    except Exception:
+        return "<none>"
+
+
+def _relative_status_path(path: Path, cwd: Path) -> str:
+    try:
+        if path.parent == cwd:
+            return path.name
+        return str(path.relative_to(cwd))
+    except ValueError:
+        try:
+            return os.path.relpath(path, cwd)
+        except ValueError:
+            return str(path)
+
+
+def _status_token_usage_display(session: CodexSession) -> str | None:
+    usage = session.state.last_token_usage or {}
+    total = session.state.session_usage_tokens()
+    if total is None:
+        return None
+    input_tokens = _usage_int(usage, "input_tokens")
+    cached = _usage_int(usage, "cached_input_tokens")
+    if cached is None:
+        details = usage.get("input_tokens_details")
+        if isinstance(details, dict):
+            cached = _usage_int(details, "cached_tokens")
+    output_tokens = _usage_int(usage, "output_tokens") or 0
+    non_cached_input = max(0, (input_tokens or 0) - (cached or 0))
+    return (
+        f"{_format_tokens_compact(total)} total  "
+        f"({_format_tokens_compact(non_cached_input)} input + {_format_tokens_compact(output_tokens)} output)"
+    )
+
+
+def _status_context_display(tokens: int, estimated: bool, context_window: int | None) -> str:
+    marker = " approx" if estimated else ""
+    if context_window:
+        remaining = max(0, min(100, round(100 - (tokens / context_window) * 100)))
+        return f"{remaining}% left ({_format_tokens_compact(tokens)} used / {_format_tokens_compact(context_window)}){marker}"
+    return f"{_format_tokens_compact(tokens)}{marker}"
+
+
+def _usage_int(usage: dict[str, Any], key: str) -> int | None:
+    value = usage.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _session_uses_chatgpt_auth(session: CodexSession) -> bool:
+    label = _session_auth_indicator(session, include_fallback=False)
+    if not isinstance(label, str):
+        return False
+    return "chatgpt" in label.lower()
+
+
+def _sanitize_status_limit_error(exc: Exception) -> str:
+    message = str(exc).strip().replace("\n", " ")
+    message = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", message)
+    message = re.sub(r"(sk-[A-Za-z0-9_-]{8,})", "[redacted-api-key]", message)
+    if len(message) > 120:
+        message = message[:117] + "..."
+    return message or type(exc).__name__
 
 
 def _interactive_command(prompt: str) -> str | None:
@@ -3385,13 +4452,16 @@ def _interactive_mode_command(prompt: str) -> tuple[str, str | None] | None:
 
 
 def _print_chat_help() -> None:
-    local = "/resume, /fork, /compact, /plan, /status, /rollout, /init, /clear, /exit"
-    recognized = ", ".join(f"/{command.name}" for command in _SLASH_COMMANDS[:18])
+    local_commands = [
+        command
+        for command in _SLASH_COMMANDS
+        if command.name in _SLASH_IMPLEMENTED_NAMES and command.name not in _SLASH_POPUP_ALIAS_NAMES
+    ]
+    local = ", ".join(f"/{command.name}" for command in local_commands[:18])
     print(
         "Commands implemented locally: "
         f"{local}\n"
-        "Known Codex commands are recognized and consumed locally; unsupported ones report a local message instead of being sent to the model.\n"
-        f"Examples: {recognized}, ...",
+        "Unsupported upstream commands are hidden from the chat menu until their Python CLI behavior is implemented.",
         file=sys.stderr,
         flush=True,
     )
@@ -3452,9 +4522,10 @@ class _HumanEventRenderer:
             self._render_tool_started(event.payload)
         elif event.type == "tool.completed":
             self._render_tool_completed(event.payload)
+        elif event.type == "context_compaction.completed":
+            self.render_info_message("Context compacted")
         elif event.type == "warning":
-            self._begin_cell()
-            self._line(f"warning: {event.payload.get('message') or ''}")
+            self.render_warning(str(event.payload.get("message") or ""))
         elif event.type == "stream_error":
             self._begin_cell()
             self._line(str(event.payload.get("message") or "Reconnecting..."))
@@ -3471,9 +4542,27 @@ class _HumanEventRenderer:
         self._begin_cell()
         self._line(f"ERROR: {message}")
 
-    def render_info_message(self, message: str) -> None:
+    def render_info_message(self, message: str, hint: str | None = None) -> None:
         self._begin_cell()
-        self._line(f"{self._style.dim('•')} {message}")
+        text = message
+        if hint:
+            text = f"{message} {self._style.dim(hint)}"
+        self._emit_prefixed_lines(
+            [text],
+            first_prefix=f"{self._style.dim('•')} ",
+            rest_prefix="  ",
+        )
+
+    def render_warning(self, message: str) -> None:
+        if not message:
+            return
+        self._begin_cell()
+        self._emit_prefixed_lines(
+            [message],
+            first_prefix=self._style.yellow("⚠ "),
+            rest_prefix="  ",
+            transform=self._style.yellow,
+        )
 
     def render_interrupted(self) -> None:
         self._begin_cell()
@@ -4408,6 +5497,9 @@ class _AnsiStyle:
 
     def magenta(self, text: str) -> str:
         return self._wrap("35", text)
+
+    def inverse(self, text: str) -> str:
+        return self._wrap("7", text)
 
     def _wrap(self, code: str, text: str) -> str:
         if not self.enabled or not text:
@@ -5429,6 +6521,23 @@ def _remote_compaction_config(config: dict) -> str:
     if value not in {"auto", "off", "required"}:
         raise ValueError("remote_compaction must be one of: auto, off, required")
     return value
+
+
+def _auth_mode_config(args: argparse.Namespace, config: dict) -> str:
+    from .auth import normalize_auth_mode
+
+    cli_value = getattr(args, "auth_mode", None)
+    if cli_value:
+        return normalize_auth_mode(cli_value)
+    forced = _string_config(config, "forced_login_method")
+    if forced:
+        key = forced.replace("-", "_").lower()
+        if key in {"chatgpt", "chat"}:
+            return "chatgpt"
+        if key in {"api", "api_key", "apikey"}:
+            return "api_key"
+    configured = _string_config(config, "auth_mode")
+    return normalize_auth_mode(configured)
 
 
 def _bool_nested_config(config: dict, path: tuple[str, ...], default: bool) -> bool:

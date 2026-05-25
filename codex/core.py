@@ -64,6 +64,10 @@ INTERRUPTED_TURN_GUIDANCE = (
     "processes may still be running in the background. If any tools/commands were "
     "aborted, they may have partially executed."
 )
+LOCAL_COMPACTION_WARNING_MESSAGE = (
+    "Heads up: Long threads and multiple compactions can cause the model to be less accurate. "
+    "Start a new thread when possible to keep threads small and targeted."
+)
 _MIN_AGENT_WAIT_TIMEOUT_MS = 10_000
 _DEFAULT_AGENT_WAIT_TIMEOUT_MS = 30_000
 _MAX_AGENT_WAIT_TIMEOUT_MS = 3_600_000
@@ -75,7 +79,7 @@ class CodexSession:
     def __init__(self, config: CodexConfig | None = None, model_client: ModelClient | None = None):
         self.config = _config_with_memory_state_store(config or CodexConfig())
         self.state = CodexState(self.config)
-        self.model_client = model_client or default_model_client()
+        self.model_client = model_client or default_model_client(self.config)
         self.goals = GoalRuntime(self.config, self.state)
         self.tools = ToolRuntime(
             self.config,
@@ -361,6 +365,8 @@ class CodexSession:
         if compacted_message is not None:
             completed_payload["compacted_message"] = compacted_message
         yield self.state.emit("context_compaction.completed", **completed_payload)
+        if implementation == "responses":
+            yield self.state.emit("warning", message=LOCAL_COMPACTION_WARNING_MESSAGE)
         post_hook = yield from self._run_hook(
             "post_compact",
             trigger=trigger,
@@ -385,13 +391,6 @@ class CodexSession:
             if trigger == "manual":
                 self._end_active_turn()
             return True
-        yield self.state.emit(
-            "warning",
-            message=(
-                "Heads up: Long threads and multiple compactions can cause the model to be less accurate. "
-                "Start a new thread when possible to keep threads small and targeted."
-            ),
-        )
         if trigger == "manual":
             self._end_active_turn()
         return False
@@ -425,6 +424,8 @@ class CodexSession:
             store=compact_config.provider_is_azure_responses_endpoint,
             service_tier=compact_config.service_tier,
             client_metadata=self._client_metadata(),
+            session_id=self.state.thread_id,
+            thread_id=self.state.thread_id,
             verbosity=compact_config.resolved_verbosity(),
         )
 
@@ -456,6 +457,8 @@ class CodexSession:
             store=compact_config.provider_is_azure_responses_endpoint,
             service_tier=compact_config.service_tier,
             client_metadata=self._client_metadata(),
+            session_id=self.state.thread_id,
+            thread_id=self.state.thread_id,
             verbosity=compact_config.resolved_verbosity(),
         )
 
@@ -620,6 +623,8 @@ class CodexSession:
                     store=self.config.provider_is_azure_responses_endpoint,
                     service_tier=self.config.service_tier,
                     client_metadata=self._client_metadata(),
+                    session_id=self.state.thread_id,
+                    thread_id=self.state.thread_id,
                     verbosity=self.config.resolved_verbosity(),
                     output_schema=self.config.output_schema,
                     output_schema_strict=self.config.output_schema_strict,
@@ -816,6 +821,11 @@ class CodexSession:
                     retryable=_is_retryable_model_stream_error(error),
                     error=error,
                 )
+            if stream_event.type == "warning":
+                message = str(stream_event.payload.get("message") or "")
+                if message:
+                    yield self.state.emit("warning", message=message)
+                continue
             self._check_interrupted()
         return _ModelOutput(response_id=response_id, items=items)
 

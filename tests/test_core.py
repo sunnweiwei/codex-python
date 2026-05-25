@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import unittest
 
 from contextlib import redirect_stderr
@@ -79,9 +80,18 @@ import subprocess as _codex_subprocess
 _codex_subprocess_run_orig = _codex_subprocess.run
 def _codex_subprocess_run(*args, **kwargs):
     kwargs.setdefault("timeout", 30)
+
     return _codex_subprocess_run_orig(*args, **kwargs)
 _codex_subprocess.run = _codex_subprocess_run
 # --- end subprocess.run guard ---------------------------------------------
+
+
+def _fake_jwt(payload: dict[str, Any]) -> str:
+    def encode(part: dict[str, Any]) -> str:
+        raw = json.dumps(part, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode(payload)}.sig"
 
 _codex_safe_import("codex.types", "codex_types")
 _codex_safe_from("codex", "CodexConfig", "CodexSession")
@@ -125,9 +135,20 @@ _codex_safe_from("codex.memory", "write_memory_workspace_diff")
 _codex_safe_from("codex.model", "ScriptedResponsesModel")
 _codex_safe_from("codex.model", "ModelStreamEvent")
 _codex_safe_from("codex.model", "OpenAIResponsesModel")
+_codex_safe_from("codex.model", "ChatGPTCodexModel")
+_codex_safe_from("codex.model", "FallbackModelClient")
 _codex_safe_from("codex.model", "default_model_client")
 _codex_safe_from("codex.model", "collect_stream_response")
 _codex_safe_from("codex.model", "load_env_file")
+_codex_safe_from("codex.auth", "auth_status")
+_codex_safe_from("codex.auth", "build_authorize_url")
+_codex_safe_from("codex.auth", "chatgpt_codex_base_url")
+_codex_safe_from("codex.auth", "chatgpt_backend_base_url")
+_codex_safe_from("codex.auth", "fetch_chatgpt_rate_limits")
+_codex_safe_from("codex.auth", "parse_chatgpt_rate_limit_payload")
+_codex_safe_from("codex.auth", "login_with_api_key")
+_codex_safe_from("codex.auth", "load_auth_snapshot")
+_codex_safe_from("codex.auth", "save_chatgpt_tokens")
 _codex_safe_from("codex.prompts", "build_base_instructions", "build_environment_context", "build_initial_context_items")
 _codex_safe_from("codex.prompts", "build_permissions_instructions", "collect_agents_md")
 _codex_safe_from("codex.prompts", "verify_asset_hashes", "read_model_catalog_instructions")
@@ -237,6 +258,7 @@ _codex_safe_from("codex.tools", "ToolResult")
 _codex_safe_from("codex.types", "KNOWN_EVENT_TYPES")
 _codex_safe_from("codex.types", "PromptRequest")
 _codex_safe_from("codex.types", "TERMINAL_TURN_EVENT_TYPES")
+_codex_safe_from("codex.core", "LOCAL_COMPACTION_WARNING_MESSAGE")
 
 
 def message(text: str) -> dict:
@@ -815,6 +837,415 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(headers["x-codex-installation-id"], "install-1")
         self.assertEqual(headers["session-id"], "session-1")
         self.assertEqual(headers["thread-id"], "thread-1")
+
+    def test_chatgpt_auth_snapshot_reads_official_auth_json_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            id_token = _fake_jwt(
+                {
+                    "email": "user@example.test",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_plan_type": "plus",
+                        "chatgpt_account_id": "account-from-jwt",
+                    },
+                }
+            )
+            access_token = _fake_jwt({"exp": int(time.time()) + 3600})
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": id_token,
+                            "access_token": access_token,
+                            "refresh_token": "refresh-token",
+                            "account_id": "account-from-file",
+                        },
+                        "last_refresh": "2026-05-01T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot = load_auth_snapshot(home, mode="chatgpt")
+
+        self.assertIsNotNone(snapshot)
+        self.assertTrue(snapshot.is_chatgpt)
+        self.assertEqual(snapshot.access_token, access_token)
+        self.assertEqual(snapshot.account_id, "account-from-file")
+        self.assertEqual(snapshot.email, "user@example.test")
+        self.assertEqual(snapshot.plan_type, "plus")
+        self.assertFalse(snapshot.needs_proactive_refresh())
+
+    def test_default_model_client_uses_chatgpt_auth_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            access_token = _fake_jwt({"exp": int(time.time()) + 3600})
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": _fake_jwt({}),
+                            "access_token": access_token,
+                            "refresh_token": "refresh-token",
+                            "account_id": "account-1",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = CodexConfig(
+                auth_mode="chatgpt",
+                auth_codex_home=home,
+                chatgpt_base_url="https://chatgpt.example/backend-api",
+                skip_git_repo_check=True,
+                ephemeral=True,
+            )
+
+            client = default_model_client(config)
+
+        self.assertIsInstance(client, ChatGPTCodexModel)
+        self.assertEqual(client.base_url, "https://chatgpt.example/backend-api/codex")
+
+    def test_default_model_client_auto_uses_api_key_fallback_for_chatgpt_auth(self) -> None:
+        old_api_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "sk-fallback"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                access_token = _fake_jwt({"exp": int(time.time()) + 3600})
+                (home / "auth.json").write_text(
+                    json.dumps(
+                        {
+                            "auth_mode": "chatgpt",
+                            "tokens": {
+                                "id_token": _fake_jwt({}),
+                                "access_token": access_token,
+                                "refresh_token": "refresh-token",
+                                "account_id": "account-1",
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                config = CodexConfig(
+                    auth_mode="auto",
+                    auth_codex_home=home,
+                    skip_git_repo_check=True,
+                    ephemeral=True,
+                )
+
+                client = default_model_client(config)
+        finally:
+            if old_api_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = old_api_key
+
+        self.assertIsInstance(client, FallbackModelClient)
+        self.assertEqual(client.auth_display_name, "ChatGPT")
+        self.assertEqual(client.auth_fallback_display_name, "API key")
+
+    def test_model_client_falls_back_to_api_key_on_chatgpt_budget_limit(self) -> None:
+        class _BudgetLimitedChatGPT:
+            auth_display_name = "ChatGPT"
+
+            def stream(self, request: PromptRequest):
+                raise RuntimeError("budget limit reached for this ChatGPT account")
+                yield  # pragma: no cover
+
+            def create(self, request: PromptRequest):
+                raise RuntimeError("budget limit reached for this ChatGPT account")
+
+        client = FallbackModelClient(
+            primary=_BudgetLimitedChatGPT(),
+            fallback=ScriptedResponsesModel([message("api fallback ok")]),
+        )
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=client,
+        )
+
+        result = session.run("hello")
+
+        self.assertEqual(result.final_message, "api fallback ok")
+        self.assertTrue(client.using_fallback)
+        self.assertEqual(client.auth_display_name, "API key")
+        self.assertTrue(any(event.type == "warning" and "switched to API key" in event.payload.get("message", "") for event in result.events))
+
+    def test_chatgpt_model_adds_official_auth_and_session_headers(self) -> None:
+        access_token = _fake_jwt({"exp": int(time.time()) + 3600})
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": _fake_jwt({}),
+                            "access_token": access_token,
+                            "refresh_token": "refresh-token",
+                            "account_id": "account-1",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = ChatGPTCodexModel(auth_snapshot=load_auth_snapshot(home, mode="chatgpt"))
+        request = PromptRequest(
+            model="gpt-test",
+            instructions="base",
+            input=[],
+            tools=[],
+            prompt_cache_key="thread-1",
+            session_id="session-1",
+            client_metadata={"x-codex-installation-id": "install-1"},
+        )
+
+        headers = client._headers(request, accept="application/json")
+
+        self.assertEqual(headers["Authorization"], f"Bearer {access_token}")
+        self.assertEqual(headers["ChatGPT-Account-ID"], "account-1")
+        self.assertEqual(headers["originator"], "codex_cli_rs")
+        self.assertEqual(headers["session-id"], "session-1")
+        self.assertEqual(headers["thread-id"], "thread-1")
+        self.assertEqual(headers["x-codex-installation-id"], "install-1")
+
+    def test_auth_status_never_returns_token_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": _fake_jwt({}),
+                            "access_token": "secret-access-token",
+                            "refresh_token": "secret-refresh-token",
+                            "account_id": "account-123456",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            status = auth_status(home)
+        encoded = json.dumps(status, sort_keys=True)
+        self.assertNotIn("secret-access-token", encoded)
+        self.assertNotIn("secret-refresh-token", encoded)
+        self.assertEqual(status["account_id"], "acco...3456")
+
+    def test_chatgpt_backend_base_url_matches_official_usage_path_root(self) -> None:
+        self.assertEqual(
+            chatgpt_backend_base_url("https://chatgpt.com/backend-api/codex"),
+            "https://chatgpt.com/backend-api",
+        )
+        self.assertEqual(
+            chatgpt_backend_base_url("https://example.test"),
+            "https://example.test",
+        )
+
+    def test_parse_chatgpt_rate_limit_payload_maps_official_usage_shape(self) -> None:
+        snapshots = parse_chatgpt_rate_limit_payload(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": True,
+                    "limit_reached": False,
+                    "primary_window": {
+                        "used_percent": 42,
+                        "limit_window_seconds": 18000,
+                        "reset_after_seconds": 120,
+                        "reset_at": 1735689720,
+                    },
+                    "secondary_window": {
+                        "used_percent": 5,
+                        "limit_window_seconds": 604800,
+                        "reset_after_seconds": 43200,
+                        "reset_at": 1735693200,
+                    },
+                },
+                "credits": {
+                    "has_credits": True,
+                    "unlimited": False,
+                    "balance": "37.6",
+                },
+                "additional_rate_limits": [
+                    {
+                        "limit_name": "codex_other",
+                        "metered_feature": "codex_other",
+                        "rate_limit": {
+                            "primary_window": {
+                                "used_percent": 88,
+                                "limit_window_seconds": 1800,
+                                "reset_at": 1735693200,
+                            }
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(len(snapshots), 2)
+        primary = snapshots[0]
+        self.assertEqual(primary.limit_id, "codex")
+        self.assertEqual(primary.plan_type, "pro")
+        self.assertEqual(primary.primary.window_minutes, 300)
+        self.assertEqual(primary.primary.used_percent, 42.0)
+        self.assertEqual(primary.secondary.window_minutes, 10080)
+        self.assertEqual(primary.credits.balance, "37.6")
+        self.assertEqual(snapshots[1].limit_id, "codex_other")
+
+    def test_fetch_chatgpt_rate_limits_uses_official_backend_endpoint_and_headers(self) -> None:
+        from codex import auth as auth_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": _fake_jwt({}),
+                            "access_token": _fake_jwt({"exp": int(time.time()) + 3600}),
+                            "refresh_token": "refresh-token",
+                            "account_id": "account-123",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls = []
+
+            class _Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self):
+                    return json.dumps(
+                        {
+                            "plan_type": "plus",
+                            "rate_limit": {
+                                "primary_window": {
+                                    "used_percent": 25,
+                                    "limit_window_seconds": 18000,
+                                    "reset_at": 1735689720,
+                                }
+                            },
+                        }
+                    ).encode("utf-8")
+
+            old_urlopen = auth_mod.urllib.request.urlopen
+            try:
+                def fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+                    calls.append((request, timeout))
+                    return _Response()
+
+                auth_mod.urllib.request.urlopen = fake_urlopen
+                snapshots = fetch_chatgpt_rate_limits(
+                    home,
+                    base_url="https://chatgpt.example/backend-api",
+                    timeout=7,
+                )
+            finally:
+                auth_mod.urllib.request.urlopen = old_urlopen
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].primary.used_percent, 25.0)
+        request, timeout = calls[0]
+        self.assertEqual(timeout, 7)
+        self.assertEqual(request.full_url, "https://chatgpt.example/backend-api/wham/usage")
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(headers["chatgpt-account-id"], "account-123")
+        self.assertIn("authorization", headers)
+
+    def test_save_chatgpt_tokens_writes_official_login_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            id_token = _fake_jwt(
+                {
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "account-from-jwt",
+                    },
+                }
+            )
+            path = save_chatgpt_tokens(
+                codex_home=home,
+                id_token=id_token,
+                access_token=_fake_jwt({"exp": int(time.time()) + 3600}),
+                refresh_token="refresh-token",
+            )
+
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            snapshot = load_auth_snapshot(home, mode="chatgpt")
+
+        self.assertEqual(raw["auth_mode"], "chatgpt")
+        self.assertEqual(raw["tokens"]["id_token"], id_token)
+        self.assertEqual(raw["tokens"]["refresh_token"], "refresh-token")
+        self.assertEqual(raw["tokens"]["account_id"], "account-from-jwt")
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.account_id, "account-from-jwt")
+
+    def test_login_with_api_key_writes_official_auth_json_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = login_with_api_key("  sk-test-login\n", codex_home=home)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(raw, {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test-login"})
+
+    def test_build_authorize_url_matches_official_login_params(self) -> None:
+        url = build_authorize_url(
+            issuer="https://auth.example.test",
+            client_id="client-1",
+            redirect_uri="http://localhost:1455/auth/callback",
+            code_challenge="challenge-1",
+            state="state-1",
+            forced_workspace_ids=["workspace-1"],
+        )
+
+        parsed = urllib.parse.urlparse(url)
+        params = {key: value[0] for key, value in urllib.parse.parse_qs(parsed.query).items()}
+
+        self.assertEqual(parsed.scheme, "https")
+        self.assertEqual(parsed.netloc, "auth.example.test")
+        self.assertEqual(parsed.path, "/oauth/authorize")
+        self.assertEqual(params["response_type"], "code")
+        self.assertEqual(params["client_id"], "client-1")
+        self.assertEqual(params["redirect_uri"], "http://localhost:1455/auth/callback")
+        self.assertEqual(
+            params["scope"],
+            "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        )
+        self.assertEqual(params["code_challenge"], "challenge-1")
+        self.assertEqual(params["code_challenge_method"], "S256")
+        self.assertEqual(params["id_token_add_organizations"], "true")
+        self.assertEqual(params["codex_cli_simplified_flow"], "true")
+        self.assertEqual(params["state"], "state-1")
+        self.assertEqual(params["originator"], "codex_cli_rs")
+        self.assertEqual(params["allowed_workspace_id"], "workspace-1")
+
+    def test_cli_login_with_api_key_reads_stdin_without_echoing_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env["CODEX_AUTH_HOME"] = tmp
+            proc = subprocess.run(
+                [sys.executable, "-m", "codex", "login", "--with-api-key"],
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                input="sk-secret-login\n",
+                text=True,
+                capture_output=True,
+            )
+            raw = json.loads((Path(tmp) / "auth.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(raw, {"auth_mode": "apikey", "OPENAI_API_KEY": "sk-secret-login"})
+        self.assertNotIn("sk-secret-login", proc.stdout)
+        self.assertNotIn("sk-secret-login", proc.stderr)
 
     def test_prompt_request_matches_upstream_empty_tools_shape(self) -> None:
         request = PromptRequest(
@@ -1533,6 +1964,8 @@ class CodexCoreTests(unittest.TestCase):
         self.assertTrue(compacted_texts[-1].startswith("Another language model started"))
         self.assertIn("handoff summary", compacted_texts[-1])
         self.assertTrue(any(event.type == "context_compaction.completed" for event in result.events))
+        warning = next(event for event in result.events if event.type == "warning")
+        self.assertEqual(warning.payload["message"], LOCAL_COMPACTION_WARNING_MESSAGE)
 
     def test_remote_compaction_uses_compact_endpoint_payload_and_replacement_history(self) -> None:
         real_user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "kept user"}]}
@@ -1576,6 +2009,7 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(completed.payload["implementation"], "responses_compact")
         self.assertTrue(completed.payload["remote_compaction"])
         self.assertEqual(completed.payload["compacted_message"], "")
+        self.assertFalse(any(event.type == "warning" for event in result.events))
 
     def test_remote_compaction_falls_back_to_local_prompt_when_auto_mode_fails(self) -> None:
         model = RemoteCompactModel(compact_output=[], local_responses=[message("local summary")], fail_remote=True)
@@ -4473,6 +4907,40 @@ PATCH
             self.assertTrue(result.ok, result.output)
             self.assertEqual((root / "file.txt").read_text(encoding="utf-8"), "after\n")
 
+    def test_unified_exec_output_truncation_matches_upstream_head_tail_shape(self) -> None:
+        text = "this is an example of a long output that should be truncated"
+        output, original_tokens = codex_tools._truncate_output(text, 5)
+
+        self.assertEqual(original_tokens, 15)
+        self.assertEqual(
+            output,
+            "Total output lines: 1\n\nthis is an…10 tokens truncated… truncated",
+        )
+
+        multiline = "this is an example of a long output that should be truncated\nalso some other line"
+        output, original_tokens = codex_tools._truncate_output(multiline, 10)
+
+        self.assertEqual(original_tokens, 21)
+        self.assertEqual(
+            output,
+            "Total output lines: 2\n\nthis is an example o…11 tokens truncated…also some other line",
+        )
+
+    def test_unified_exec_head_tail_buffer_matches_upstream_cap_shape(self) -> None:
+        buffer = codex_tools._HeadTailTextBuffer(max_bytes=10)
+        buffer.append("0123456789")
+        buffer.append("abcdefghij")
+
+        self.assertEqual(buffer.to_text(), "01234fghij")
+
+        buffer.clear()
+        self.assertEqual(buffer.to_text(), "")
+
+    def test_write_stdin_empty_poll_uses_upstream_background_timeout_cap(self) -> None:
+        self.assertEqual(codex_tools._write_stdin_yield_time(250, ""), 5000)
+        self.assertEqual(codex_tools._write_stdin_yield_time(600000, ""), 300000)
+        self.assertEqual(codex_tools._write_stdin_yield_time(600000, "input\n"), 30000)
+
     def test_apply_patch_tool_supports_codex_freeform_patch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6151,6 +6619,101 @@ new file mode 100644
         self.assertEqual(_apply_prompt_escape_sequence("abc\ndefgh", 6, b"\x1b[A"), ("abc\ndefgh", 2))
         self.assertEqual(_apply_prompt_escape_sequence("abc\ndefgh", 2, b"\x1b[B"), ("abc\ndefgh", 6))
 
+    def test_slash_palette_filters_and_completes_like_upstream_composer(self) -> None:
+        from codex.cli import _AnsiStyle
+        from codex.cli import _slash_palette_display_lines
+        from codex.cli import _slash_palette_rows_for_buffer
+        from codex.cli import _slash_selected_completion_text
+
+        rows = _slash_palette_rows_for_buffer("/co", 3)
+        self.assertEqual(rows[0].display_name, "compact")
+        self.assertIn("summarize conversation", rows[0].description)
+        self.assertEqual(
+            _slash_selected_completion_text("/ro", 3, 0, trailing_space=False),
+            "/rollout",
+        )
+        self.assertEqual(
+            _slash_selected_completion_text("/ro", 3, 0, trailing_space=True),
+            "/rollout ",
+        )
+
+        rendered = "\n".join(
+            _slash_palette_display_lines(
+                "/mo",
+                3,
+                selected_index=0,
+                dismissed_for=None,
+                style=_AnsiStyle(False),
+                width=100,
+            )
+        )
+        self.assertIn("/model", rendered)
+        self.assertIn("choose what model and reasoning effort to use", rendered)
+
+        self.assertEqual(_slash_palette_rows_for_buffer("/ test", 2), [])
+        self.assertEqual(_slash_palette_rows_for_buffer("/zzz", 4), [])
+        self.assertEqual(_slash_palette_rows_for_buffer("/bt", 3), [])
+        self.assertEqual(_slash_palette_rows_for_buffer("/pet", 4), [])
+        self.assertEqual(_slash_palette_rows_for_buffer("/ren", 4), [])
+        self.assertEqual(_slash_palette_rows_for_buffer("/app", 4), [])
+
+    def test_slash_palette_redraw_clears_menu_rows_below_prompt_cursor(self) -> None:
+        from codex.cli import _TurnInputReader
+
+        reader = _TurnInputReader(enabled=True, color_mode="never")
+        reader._buffer = "/"
+        reader._cursor = 1
+
+        captured = io.StringIO()
+        with redirect_stderr(captured):
+            reader.render()
+        rows_below = reader._rendered_rows_below_cursor
+        self.assertGreater(rows_below, 0)
+
+        captured = io.StringIO()
+        reader._slash_selection = 1
+        with redirect_stderr(captured):
+            reader.render()
+
+        self.assertIn(f"\x1b[{rows_below}B", captured.getvalue())
+
+    def test_cli_tty_slash_palette_previews_and_enter_selects_command(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        env = {
+            **os.environ,
+            "TERM": "xterm-256color",
+            "PY_CODEX_FAKE_RESPONSES": json.dumps([message("model should not be called")]),
+            "PYTHONPATH": os.getcwd(),
+        }
+        output = self._run_cli_pty(
+            [
+                sys.executable,
+                "-m",
+                "codex",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+            ],
+            env=env,
+            interactions=[
+                ("/", "/model"),
+                ("\x1b[B\r", "Started new chat"),
+                ("/exit\r", None),
+            ],
+            timeout=10.0,
+        )
+        plain = _plain_terminal_output(output)
+
+        self.assertIn("/model", plain)
+        self.assertIn("choose what model and reasoning effort to use", plain)
+        self.assertIn("/new", plain)
+        self.assertNotIn("/ide", plain)
+        self.assertNotIn("/approve", plain)
+        self.assertNotIn("/rename", plain)
+        self.assertNotIn("model should not be called", plain)
+
     def test_live_status_format_matches_upstream_elapsed_and_adds_context_metrics(self) -> None:
         from codex.cli import _AnsiStyle
         from codex.cli import _LiveTurnStatusSnapshot
@@ -6168,6 +6731,8 @@ new file mode 100644
             _LiveTurnStatusSnapshot(
                 header="Working",
                 elapsed_seconds=2,
+                auth_label="ChatGPT",
+                goal_status=None,
                 active_context_tokens=12_700,
                 active_context_estimated=True,
                 session_context_tokens=18_200,
@@ -6180,11 +6745,160 @@ new file mode 100644
 
         rendered = "\n".join(lines)
         self.assertIn("• Working (2s • esc to interrupt)", rendered)
+        self.assertIn("auth ChatGPT", rendered)
         self.assertIn("ctx 12.7K/400K", rendered)
         self.assertIn("session 18.2K", rendered)
         self.assertIn("reasoning", rendered)
         self.assertIn("1.5K", rendered)
         self.assertNotIn("~", rendered)
+
+    def test_chat_startup_panel_summarizes_model_auth_and_fallback_without_secret_leaks(self) -> None:
+        from codex import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            id_token = _fake_jwt(
+                {
+                    "email": "user@example.test",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_plan_type": "plus",
+                        "chatgpt_account_id": "account-from-jwt",
+                    },
+                }
+            )
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": id_token,
+                            "access_token": _fake_jwt({"exp": int(time.time()) + 3600}),
+                            "refresh_token": "secret-refresh-token",
+                            "account_id": "account-from-file",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            session = CodexSession(
+                CodexConfig(
+                    auth_codex_home=home,
+                    model="gpt-5.5",
+                    model_reasoning_effort="xhigh",
+                    skip_git_repo_check=True,
+                    ephemeral=True,
+                ),
+                model_client=FallbackModelClient(
+                    primary=ScriptedResponsesModel([]),
+                    fallback=ScriptedResponsesModel([]),
+                ),
+            )
+
+            rows = dict(cli._chat_startup_panel_rows(session))
+
+        self.assertIn("gpt-5.5 / xhigh", rows["Model"])
+        self.assertIn("ChatGPT", rows["Auth"])
+        self.assertIn("u***r@example.test", rows["Auth"])
+        self.assertIn("plus", rows["Auth"])
+        self.assertIn("fallback API key", rows["Auth"])
+        self.assertNotIn("user@example.test", rows["Auth"])
+        self.assertNotIn("secret-refresh-token", json.dumps(rows))
+
+    def test_chat_status_panel_matches_upstream_boxed_shape_and_limits(self) -> None:
+        from codex import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            id_token = _fake_jwt(
+                {
+                    "email": "user@example.test",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_plan_type": "pro",
+                        "chatgpt_account_id": "account-from-jwt",
+                    },
+                }
+            )
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": id_token,
+                            "access_token": _fake_jwt({"exp": int(time.time()) + 3600}),
+                            "refresh_token": "secret-refresh-token",
+                            "account_id": "account-from-file",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            session = CodexSession(
+                CodexConfig(
+                    auth_codex_home=home,
+                    model="gpt-5.5",
+                    model_reasoning_effort="xhigh",
+                    skip_git_repo_check=True,
+                    ephemeral=True,
+                ),
+                model_client=FallbackModelClient(
+                    primary=ScriptedResponsesModel([]),
+                    fallback=ScriptedResponsesModel([]),
+                ),
+            )
+            session.state.record_token_usage(
+                {
+                    "input_tokens": 1200,
+                    "cached_input_tokens": 200,
+                    "output_tokens": 900,
+                    "total_tokens": 2100,
+                    "output_tokens_details": {"reasoning_tokens": 150},
+                }
+            )
+            rate_limits = parse_chatgpt_rate_limit_payload(
+                {
+                    "plan_type": "pro",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 72,
+                            "limit_window_seconds": 18000,
+                            "reset_at": int(time.time()) + 600,
+                        },
+                        "secondary_window": {
+                            "used_percent": 45,
+                            "limit_window_seconds": 604800,
+                            "reset_at": int(time.time()) + 1200,
+                        },
+                    },
+                    "credits": {"has_credits": True, "unlimited": False, "balance": "37.6"},
+                }
+            )
+
+            rendered = "\n".join(
+                cli._chat_status_panel_lines(
+                    session,
+                    style=cli._AnsiStyle(False),
+                    rate_limits=rate_limits,
+                    terminal_width=100,
+                )
+            )
+
+        self.assertIn("/status", rendered)
+        self.assertIn("╭", rendered)
+        self.assertIn("OpenAI Codex", rendered)
+        self.assertIn("Model:", rendered)
+        self.assertIn("gpt-5.5 (reasoning xhigh, summaries auto)", rendered)
+        self.assertIn("Account:", rendered)
+        self.assertIn("u***r@example.test", rendered)
+        self.assertNotIn("user@example.test", rendered)
+        self.assertIn("Context window:", rendered)
+        self.assertIn("Session context:", rendered)
+        self.assertIn("5h limit:", rendered)
+        self.assertIn("28% left", rendered)
+        self.assertIn("Weekly limit:", rendered)
+        self.assertIn("55% left", rendered)
+        self.assertIn("Credits:", rendered)
+        self.assertIn("38 credits", rendered)
+        self.assertIn("Rollout:", rendered)
 
     def test_cli_tty_chat_esc_interrupts_long_running_tool(self) -> None:
         if sys.platform == "win32":
@@ -6599,14 +7313,14 @@ new file mode 100644
             ],
             env=env,
             interactions=[
-                ("/permissions\r", "recognized as a Codex command"),
+                ("/permissions\r", "not available in this Python CLI"),
                 ("/exit\r", None),
             ],
             timeout=10.0,
         )
         plain = _plain_terminal_output(output)
 
-        self.assertIn("'/permissions' is recognized as a Codex command", plain)
+        self.assertIn("Command '/permissions' is not available in this Python CLI.", plain)
         self.assertNotIn("model should not be called", plain)
 
     def test_cli_tty_unknown_slash_command_is_not_sent_to_model(self) -> None:
@@ -6847,6 +7561,8 @@ new file mode 100644
         env = {
             **os.environ,
             "TERM": "xterm-256color",
+            "PY_CODEX_AUTH_MODE": "api_key",
+            "OPENAI_API_KEY": "sk-test",
             "PYTHONPATH": os.getcwd(),
         }
         output = self._run_cli_pty(
@@ -6861,16 +7577,16 @@ new file mode 100644
             ],
             env=env,
             interactions=[
-                ("/status\r", "Session status"),
+                ("/status\r", "OpenAI Codex"),
                 ("/exit\r", None),
             ],
             timeout=10.0,
         )
         plain = _plain_terminal_output(output)
 
-        self.assertIn("model:", plain)
-        self.assertIn("mode:", plain)
-        self.assertIn("rollout:", plain)
+        self.assertIn("Model:", plain)
+        self.assertIn("Collaboration mode:", plain)
+        self.assertIn("Rollout:", plain)
 
     def test_cli_tty_compact_slash_command_renders_context_compacted_not_summary(self) -> None:
         if sys.platform == "win32":
@@ -6953,6 +7669,19 @@ new file mode 100644
         self.assertIn("↳ /compact", plain)
         self.assertIn("Context compacted", plain)
         self.assertNotIn("hidden compact summary", plain)
+
+    def test_cli_human_renderer_matches_upstream_compaction_and_warning_cells(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(codex_types.CodexEvent("context_compaction.completed", {}))
+        renderer.render(codex_types.CodexEvent("warning", {"message": LOCAL_COMPACTION_WARNING_MESSAGE}))
+
+        rendered = "\n".join(lines)
+        self.assertIn("• Context compacted", rendered)
+        self.assertIn("⚠ Heads up: Long threads and multiple compactions", rendered)
+        self.assertNotIn("warning:", rendered)
 
     def test_chat_user_history_lines_use_upstream_gutter_and_wrapping(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -7806,6 +8535,7 @@ model_reasoning_effort = "low"
         starting at all."""
         env = dict(os.environ)
         env.pop("PY_CODEX_FAKE_RESPONSES", None)
+        env["PY_CODEX_AUTH_MODE"] = "api_key"
         env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
         completed = subprocess.run(
             [
@@ -7856,6 +8586,7 @@ model_reasoning_effort = "low"
                 "-c",
                 "import os\n"
                 "os.environ.pop('PY_CODEX_FAKE_RESPONSES', None)\n"
+                "os.environ['PY_CODEX_AUTH_MODE'] = 'api_key'\n"
                 "from codex.model import default_model_client, OpenAIResponsesModel\n"
                 "client = default_model_client()\n"
                 "assert isinstance(client, OpenAIResponsesModel), "
@@ -7874,6 +8605,7 @@ model_reasoning_effort = "low"
         silently picks a stub."""
         env = dict(os.environ)
         env.pop("PY_CODEX_FAKE_RESPONSES", None)
+        env["PY_CODEX_AUTH_MODE"] = "api_key"
         env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
         completed = subprocess.run(
             [
@@ -7883,7 +8615,7 @@ model_reasoning_effort = "low"
                 "os.environ.pop('PY_CODEX_FAKE_RESPONSES', None)\n"
                 "from codex import CodexConfig, CodexSession\n"
                 "from codex.model import OpenAIResponsesModel\n"
-                "session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True))\n"
+                "session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True, auth_mode='api_key'))\n"
                 "assert isinstance(session.model_client, OpenAIResponsesModel), "
                 "'CodexSession.model_client must default to OpenAIResponsesModel; "
                 "got %s' % type(session.model_client).__name__\n",

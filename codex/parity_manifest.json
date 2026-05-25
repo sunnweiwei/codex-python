@@ -182,6 +182,9 @@
           "exec_command_yield_bounds": "passed_static",
           "exec_command_tty_stdin": "passed_static",
           "exec_command_byte_output_capture": "passed_static",
+          "exec_command_middle_truncation": "passed_static",
+          "exec_command_head_tail_output_cap": "passed_static",
+          "exec_command_session_pruning": "passed_static",
           "exec_command_escalation_rejection": "passed_static",
           "exec_command_approval_provider": "passed_static",
           "exec_command_sandbox_approval": "passed_static",
@@ -198,6 +201,7 @@
           "macos_seatbelt_argv_transform": "passed_static",
           "exec_command_real_pty": "passed_static",
           "write_stdin_response_text": "passed_static",
+          "write_stdin_empty_poll_timeout_cap": "passed_static",
           "write_stdin_terminal_interaction": "passed_static",
           "apply_patch_freeform_runtime": "passed_static",
           "apply_patch_overwrite_move_verification": "passed_static",
@@ -726,12 +730,12 @@
       "exec_command": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Uses upstream-style response text, yield bounds, byte-level output capture, real PTY for tty=true on Unix, tty-gated stdin, approval/retry paths, canonical hook-facing Bash contracts with updated-command rewrites, macOS seatbelt argv transformation when available, and structured rollout metadata; full cross-platform sandbox orchestration remains partial."
+        "notes": "Uses upstream-style response text, yield bounds, byte-level output capture, middle head/tail truncation, 1MiB retained-output caps, background session pruning, real PTY for tty=true on Unix, tty-gated stdin, approval/retry paths, canonical hook-facing Bash contracts with updated-command rewrites, macOS seatbelt argv transformation when available, and structured rollout metadata; full cross-platform sandbox orchestration remains partial."
       },
       "write_stdin": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Uses upstream-style response text, tty gating, terminal_interaction rollout events, and final exec_command_end when a local session exits; still local-subprocess only."
+        "notes": "Uses upstream-style response text, tty gating, upstream empty-poll background timeout bounds, terminal_interaction rollout events, and final exec_command_end when a local session exits; still local-subprocess only."
       },
       "search_files": {
         "status": "removed_invalid",

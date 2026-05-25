@@ -15,6 +15,7 @@ ApprovalPolicy = Literal["untrusted", "on-failure", "on-request", "never"]
 NetworkAccess = Literal["restricted", "enabled"]
 CollaborationMode = Literal["Default", "Plan", "Execute", "Pair Programming"]
 RemoteCompactionMode = Literal["auto", "off", "required"]
+AuthModeSelection = Literal["auto", "api_key", "chatgpt"]
 LifecyclePhase = Literal["thread", "turn", "model", "item", "tool", "compaction", "diagnostic"]
 
 
@@ -91,6 +92,10 @@ class CodexConfig:
     network_access: NetworkAccess = "restricted"
     writable_roots: tuple[Path | str, ...] = ()
     codex_home: Path | str | None = None
+    auth_mode: AuthModeSelection = field(default_factory=lambda: _default_auth_mode())
+    auth_codex_home: Path | str | None = None
+    chatgpt_base_url: str | None = None
+    openai_base_url: str | None = None
     json_events: bool = False
     output_last_message: Path | str | None = None
     skip_git_repo_check: bool = False
@@ -165,6 +170,11 @@ class CodexConfig:
         if self.codex_home is not None:
             return Path(self.codex_home).expanduser().resolve()
         return Path(os.environ.get("CODEX_PY_HOME", "~/.codex-python")).expanduser().resolve()
+
+    def resolved_auth_codex_home(self) -> Path | None:
+        if self.auth_codex_home is not None:
+            return Path(self.auth_codex_home).expanduser().resolve()
+        return None
 
     def resolved_output_last_message(self) -> Path | None:
         if self.output_last_message is None:
@@ -289,6 +299,8 @@ class PromptRequest:
     verbosity: str | None = None
     service_tier: str | None = None
     client_metadata: dict[str, str] | None = None
+    session_id: str | None = None
+    thread_id: str | None = None
 
     def to_responses_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -353,6 +365,15 @@ def new_turn_id() -> str:
 def _model_supports_reasoning(model: str) -> bool:
     lowered = model.lower()
     return lowered.startswith("gpt-5") or lowered.startswith("o")
+
+
+def _default_auth_mode() -> AuthModeSelection:
+    value = os.environ.get("PY_CODEX_AUTH_MODE", "auto").replace("-", "_").lower()
+    if value in {"auto", "api_key", "chatgpt"}:
+        return value  # type: ignore[return-value]
+    if value in {"api", "apikey"}:
+        return "api_key"
+    return "auto"
 
 
 def _default_remote_compaction_mode() -> RemoteCompactionMode:
