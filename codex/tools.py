@@ -2036,7 +2036,13 @@ def _macos_seatbelt_policy(config: CodexConfig, *, cwd: Path, workdir: Path) -> 
         base_policy = "(version 1)\n(deny default)\n(allow process-exec)\n(allow process-fork)\n"
     sections = [base_policy, "; allow read-only file operations\n(allow file-read*)"]
     if config.sandbox == "workspace-write":
-        writable_roots = _workspace_write_roots(cwd, config.writable_roots)
+        writable_roots = _workspace_write_roots(
+            cwd,
+            config.writable_roots,
+            include_tmp_roots=True,
+            exclude_tmpdir_env_var=config.exclude_tmpdir_env_var,
+            exclude_slash_tmp=config.exclude_slash_tmp,
+        )
         if not any(_path_is_within(workdir.resolve(), root) for root in writable_roots):
             writable_roots.append(workdir.resolve())
         sections.append(_macos_file_write_policy(writable_roots))
@@ -2867,13 +2873,33 @@ def _strip_git_diff_prefix(path: str) -> str:
     return path
 
 
-def _workspace_write_roots(cwd: Path, writable_roots: tuple[Path | str, ...]) -> list[Path]:
+def _workspace_write_roots(
+    cwd: Path,
+    writable_roots: tuple[Path | str, ...],
+    *,
+    include_tmp_roots: bool = False,
+    exclude_tmpdir_env_var: bool = False,
+    exclude_slash_tmp: bool = False,
+) -> list[Path]:
     roots = [cwd.resolve()]
     for root in writable_roots:
         path = Path(root).expanduser()
         if not path.is_absolute():
             path = cwd / path
         roots.append(path.resolve())
+    if include_tmp_roots and not exclude_slash_tmp:
+        slash_tmp = Path("/tmp")
+        if slash_tmp.is_absolute() and slash_tmp.is_dir():
+            roots.append(slash_tmp.resolve())
+    if include_tmp_roots and not exclude_tmpdir_env_var:
+        tmpdir = os.environ.get("TMPDIR")
+        if tmpdir:
+            tmpdir_path = Path(tmpdir).expanduser()
+            if tmpdir_path.is_absolute():
+                try:
+                    roots.append(tmpdir_path.resolve())
+                except OSError:
+                    pass
     return list(dict.fromkeys(roots))
 
 

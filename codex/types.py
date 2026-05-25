@@ -91,6 +91,8 @@ class CodexConfig:
     approval_policy: ApprovalPolicy = "never"
     network_access: NetworkAccess = "restricted"
     writable_roots: tuple[Path | str, ...] = ()
+    exclude_tmpdir_env_var: bool = False
+    exclude_slash_tmp: bool = False
     codex_home: Path | str | None = None
     auth_mode: AuthModeSelection = field(default_factory=lambda: _default_auth_mode())
     auth_codex_home: Path | str | None = None

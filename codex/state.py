@@ -1234,8 +1234,8 @@ def _sandbox_policy(config: CodexConfig) -> dict[str, Any]:
         "type": "workspace-write",
         "writable_roots": [str(Path(root).expanduser().resolve()) for root in config.writable_roots],
         "network_access": network_access,
-        "exclude_tmpdir_env_var": False,
-        "exclude_slash_tmp": False,
+        "exclude_tmpdir_env_var": config.exclude_tmpdir_env_var,
+        "exclude_slash_tmp": config.exclude_slash_tmp,
     }
 
 
@@ -1244,18 +1244,23 @@ def _file_system_sandbox_policy(config: CodexConfig) -> dict[str, Any]:
         return {"kind": "unrestricted", "entries": []}
     if config.sandbox == "read-only":
         return {"kind": "restricted", "entries": [_fs_entry(_special_path("root"), "read")]}
-    return {
-        "kind": "restricted",
-        "entries": [
-            _fs_entry(_special_path("root"), "read"),
-            _fs_entry(_special_path("project_roots"), "write"),
-            _fs_entry(_special_path("slash_tmp"), "write"),
-            _fs_entry(_special_path("tmpdir"), "write"),
-            _fs_entry(_special_path("project_roots", ".git"), "read"),
-            _fs_entry(_special_path("project_roots", ".agents"), "read"),
-            _fs_entry(_special_path("project_roots", ".codex"), "read"),
-        ],
-    }
+    return {"kind": "restricted", "entries": _workspace_write_file_system_entries(config)}
+
+
+def _workspace_write_file_system_entries(config: CodexConfig) -> list[dict[str, Any]]:
+    entries = [
+        _fs_entry(_special_path("root"), "read"),
+        _fs_entry(_special_path("project_roots"), "write"),
+        _fs_entry(_special_path("project_roots", ".git"), "read"),
+        _fs_entry(_special_path("project_roots", ".agents"), "read"),
+        _fs_entry(_special_path("project_roots", ".codex"), "read"),
+    ]
+    if not config.exclude_slash_tmp:
+        entries.append(_fs_entry(_special_path("slash_tmp"), "write"))
+    if not config.exclude_tmpdir_env_var:
+        entries.append(_fs_entry(_special_path("tmpdir"), "write"))
+    entries.extend(_fs_entry({"path": str(Path(root).expanduser().resolve())}, "write") for root in config.writable_roots)
+    return entries
 
 
 def _permission_profile(config: CodexConfig) -> dict[str, Any]:

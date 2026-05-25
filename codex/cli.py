@@ -436,6 +436,13 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
     approval_policy = "never" if args.dangerously_bypass_approvals_and_sandbox else args.ask_for_approval
     web_search = _web_search_settings(cli_config)
     auth_codex_home = _string_config(cli_config, "auth_codex_home")
+    sandbox_workspace_write = cli_config.get("sandbox_workspace_write")
+    sandbox_workspace_write_config = sandbox_workspace_write if isinstance(sandbox_workspace_write, dict) else {}
+    writable_roots = [
+        *_path_list_config(cli_config, "writable_roots"),
+        *_path_list_config(sandbox_workspace_write_config, "writable_roots"),
+        *args.add_dirs,
+    ]
     config = CodexConfig(
         model=model,
         model_provider_id=model_provider_id,
@@ -443,7 +450,12 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
         cwd=Path(args.cwd or _string_config(cli_config, "cwd") or "."),
         sandbox=sandbox or _sandbox_config(cli_config) or "workspace-write",
         approval_policy=approval_policy or _approval_config(cli_config) or "never",
-        writable_roots=tuple(Path(path) for path in [*_path_list_config(cli_config, "writable_roots"), *args.add_dirs]),
+        network_access="enabled"
+        if _bool_config(sandbox_workspace_write_config, "network_access", False)
+        else "restricted",
+        writable_roots=tuple(Path(path) for path in writable_roots),
+        exclude_tmpdir_env_var=_bool_config(sandbox_workspace_write_config, "exclude_tmpdir_env_var", False),
+        exclude_slash_tmp=_bool_config(sandbox_workspace_write_config, "exclude_slash_tmp", False),
         codex_home=_default_codex_home(),
         auth_codex_home=auth_codex_home,
         auth_mode=_auth_mode_config(args, cli_config),
@@ -5103,7 +5115,7 @@ class _HumanEventRenderer:
 
     def _render_exec_call(self, call: "_ExecDisplayCall", *, running: bool, ok: bool) -> None:
         self._begin_work_cell()
-        command = _command_display(call.command)
+        command_lines = _command_display_lines(call.command, self._style)
         if running:
             title = "Running"
             bullet = self._style.cyan("•")
@@ -5115,10 +5127,10 @@ class _HumanEventRenderer:
             bullet = self._style.red("•")
         header_prefix = f"{bullet} {self._style.bold(title)} "
         self._emit_limited_prefixed_lines(
-            [command],
+            command_lines,
             first_prefix=header_prefix,
             rest_prefix=self._style.dim("  │ "),
-            max_lines=3,
+            max_lines=5,
             ellipsis_prefix=self._style.dim("  │ "),
         )
         if call.output.strip():
@@ -5447,10 +5459,20 @@ def _file_change_path_label(change: _FileChangeDisplay) -> str:
 
 def _file_change_display_from_metadata(meta: dict[str, Any]) -> list[_FileChangeDisplay]:
     changes = meta.get("changes")
-    if not isinstance(changes, list):
+    if isinstance(changes, dict):
+        raw_changes = []
+        for path, raw_change in changes.items():
+            if not isinstance(raw_change, dict):
+                continue
+            normalized = dict(raw_change)
+            normalized.setdefault("path", path)
+            raw_changes.append(normalized)
+    elif isinstance(changes, list):
+        raw_changes = changes
+    else:
         return []
     rendered: list[_FileChangeDisplay] = []
-    for raw_change in changes:
+    for raw_change in raw_changes:
         if not isinstance(raw_change, dict):
             continue
         path = str(raw_change.get("path") or "")
@@ -5981,7 +6003,7 @@ def _render_code_block_for_terminal(code: str, info: str, style: _AnsiStyle) -> 
     plain = code.splitlines()
     if not plain:
         return [""]
-    return [style.dim(line) for line in plain]
+    return plain
 
 
 def _code_fence_language(info: str) -> str | None:
@@ -6511,6 +6533,14 @@ def _command_display(command: str) -> str:
     if len(tokens) >= 3 and Path(tokens[0]).name in {"bash", "zsh", "sh"} and tokens[1] in {"-lc", "-c"}:
         return tokens[2]
     return command
+
+
+def _command_display_lines(command: str, style: _AnsiStyle) -> list[str]:
+    display = _command_display(command)
+    highlighted = _highlight_code_for_terminal(display, "bash", style)
+    if highlighted is not None:
+        return highlighted
+    return display.splitlines() or [display]
 
 
 def _duration_ms(raw: Any) -> int | None:

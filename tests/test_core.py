@@ -5501,6 +5501,10 @@ new file mode 100644
             root = Path(tmp)
             writable = root / "writable-extra"
             writable.mkdir()
+            tmpdir = root / "tmpdir"
+            tmpdir.mkdir()
+            previous_tmpdir = os.environ.get("TMPDIR")
+            os.environ["TMPDIR"] = str(tmpdir)
             previous = codex_tools._PLATFORM_SANDBOX_AVAILABLE_CACHE
             codex_tools._PLATFORM_SANDBOX_AVAILABLE_CACHE = True
             try:
@@ -5519,6 +5523,10 @@ new file mode 100644
                 )
             finally:
                 codex_tools._PLATFORM_SANDBOX_AVAILABLE_CACHE = previous
+                if previous_tmpdir is None:
+                    os.environ.pop("TMPDIR", None)
+                else:
+                    os.environ["TMPDIR"] = previous_tmpdir
 
             self.assertEqual(sandboxed.argv[:2], [codex_tools.MACOS_SANDBOX_EXEC, "-p"])
             self.assertEqual(sandboxed.argv[-2:], ["/bin/echo", "ok"])
@@ -5527,7 +5535,40 @@ new file mode 100644
             self.assertIn("(allow file-read*)", policy)
             self.assertIn(str(root), policy)
             self.assertIn(str(writable), policy)
+            self.assertIn(str(Path("/tmp").resolve()), policy)
+            self.assertIn(str(tmpdir.resolve()), policy)
             self.assertTrue(sandboxed.metadata["sandbox_enforced"])
+
+    def test_workspace_write_roots_match_upstream_tmp_defaults_and_exclusions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tmpdir = root / "tmpdir"
+            tmpdir.mkdir()
+            previous_tmpdir = os.environ.get("TMPDIR")
+            os.environ["TMPDIR"] = str(tmpdir)
+            try:
+                roots = codex_tools._workspace_write_roots(root, (), include_tmp_roots=True)
+                excluded = codex_tools._workspace_write_roots(
+                    root,
+                    (),
+                    include_tmp_roots=True,
+                    exclude_tmpdir_env_var=True,
+                    exclude_slash_tmp=True,
+                )
+                apply_patch_roots = codex_tools._workspace_write_roots(root, ())
+            finally:
+                if previous_tmpdir is None:
+                    os.environ.pop("TMPDIR", None)
+                else:
+                    os.environ["TMPDIR"] = previous_tmpdir
+
+            self.assertIn(root.resolve(), roots)
+            self.assertIn(tmpdir.resolve(), roots)
+            self.assertIn(Path("/tmp").resolve(), roots)
+            self.assertNotIn(tmpdir.resolve(), excluded)
+            self.assertNotIn(Path("/tmp").resolve(), excluded)
+            self.assertNotIn(tmpdir.resolve(), apply_patch_roots)
+            self.assertNotIn(Path("/tmp").resolve(), apply_patch_roots)
 
     def test_escalated_exec_bypasses_platform_sandbox_after_approval(self) -> None:
         approvals: list[dict] = []
@@ -5930,7 +5971,8 @@ new file mode 100644
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("\033[32m•\033[0m \033[1mRan\033[0m printf hello", completed.stderr)
+        self.assertIn("\033[32m•\033[0m \033[1mRan\033[0m", completed.stderr)
+        self.assertIn("• Ran printf hello", _plain_terminal_output(completed.stderr))
         self.assertEqual(completed.stdout.strip(), "color done")
 
     def test_cli_human_output_wraps_long_command_with_official_gutter(self) -> None:
@@ -6092,6 +6134,21 @@ new file mode 100644
         self.assertIn("def hello", plain)
         self.assertIn("return 'ok'", plain)
         self.assertRegex(joined, r"\x1b\[[0-9;]*m")
+
+    def test_cli_markdown_plain_code_fences_are_not_dimmed(self) -> None:
+        from codex.cli import _ANSI_RE
+        from codex.cli import _AnsiStyle
+        from codex.cli import _render_markdown_for_terminal
+
+        rendered = _render_markdown_for_terminal(
+            "```\nplain_code()\n```",
+            _AnsiStyle(True),
+            terminal_width=80,
+        )
+        joined = "\n".join(rendered)
+
+        self.assertEqual(_ANSI_RE.sub("", joined), "plain_code()")
+        self.assertNotIn("\033[2m", joined)
 
     def test_cli_ansi_wrapping_preserves_color_boundaries(self) -> None:
         from codex.cli import _ANSI_RE, _visible_len, _wrap_ansi_line
@@ -7022,6 +7079,75 @@ new file mode 100644
         }
         self.assertEqual(_visible_command_output(meta, {"output": response_text}), "")
         self.assertEqual(_strip_unified_exec_response_metadata(response_text + "hello\n"), "hello\n")
+
+    def test_cli_human_renderer_indents_multiline_shell_commands_like_upstream(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        command = "python3 <<'PY'\nprint('hello from heredoc')\nPY"
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "arguments": {"cmd": command},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "ok": True,
+                    "metadata": {
+                        "command": command,
+                        "exit_code": 0,
+                        "output": "hello from heredoc\n",
+                    },
+                },
+            )
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn("• Ran python3 <<'PY'", rendered)
+        self.assertIn("  │ print('hello from heredoc')", rendered)
+        self.assertIn("  │ PY", rendered)
+        self.assertIn("  └ hello from heredoc", rendered)
+
+    def test_resume_transcript_replays_apply_patch_changes_as_file_change(self) -> None:
+        from codex.cli import _HumanEventRenderer
+        from codex.cli import _render_transcript_event_msg
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        rendered_any = _render_transcript_event_msg(
+            {
+                "type": "patch_apply_end",
+                "call_id": "patch-1",
+                "success": True,
+                "status": "completed",
+                "stdout": "patch: completed\nSuccess. Updated the following files:\nM temp_print_test.py\n",
+                "changes": {
+                    "temp_print_test.py": {
+                        "type": "update",
+                        "unified_diff": '@@\n-print("hello")\n+print("bonjour")\n',
+                    }
+                },
+            },
+            renderer,
+        )
+
+        rendered = "\n".join(lines)
+        self.assertTrue(rendered_any)
+        self.assertIn("• Edited temp_print_test.py (+1 -1)", rendered)
+        self.assertIn('    1 -print("hello")', rendered)
+        self.assertIn('    1 +print("bonjour")', rendered)
+        self.assertNotIn("patch: completed", rendered)
+        self.assertNotIn("Success. Updated the following files", rendered)
 
     def test_chat_startup_panel_summarizes_model_auth_and_fallback_without_secret_leaks(self) -> None:
         from codex import cli
