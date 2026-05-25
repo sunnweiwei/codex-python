@@ -980,7 +980,8 @@ def _run_session_human_interactive(
         reader.set_status(status_tracker.snapshot(session))
         while thread.is_alive():
             _drain_output_queue(output, input_reader=reader)
-            reader.set_status(status_tracker.snapshot(session))
+            if not reader.output_partial_line_open:
+                reader.set_status(status_tracker.snapshot(session))
             request = request_user_input_bridge.take_pending()
             if request is not None:
                 reader.suspend()
@@ -1053,7 +1054,8 @@ def _run_compact_human_interactive(
         reader.set_status(status_tracker.snapshot(session))
         while thread.is_alive():
             _drain_output_queue(output, input_reader=reader)
-            reader.set_status(status_tracker.snapshot(session))
+            if not reader.output_partial_line_open:
+                reader.set_status(status_tracker.snapshot(session))
             for action in reader.poll():
                 if action.kind == "interrupt" and not interrupted:
                     interrupted = True
@@ -1690,18 +1692,32 @@ def _split_request_user_input_answer_values(values: list[str]) -> tuple[list[str
     return options, note
 
 
-def _drain_output_queue(output: "queue.Queue[str]", *, input_reader: "_TurnInputReader | None" = None) -> None:
+@dataclass(frozen=True)
+class _ConsoleWrite:
+    text: str
+    partial_line_open: bool = False
+
+
+def _drain_output_queue(output: "queue.Queue[Any]", *, input_reader: "_TurnInputReader | None" = None) -> None:
     printed = False
     while True:
         try:
-            line = output.get_nowait()
+            item = output.get_nowait()
         except queue.Empty:
-            if printed and input_reader is not None:
+            if printed and input_reader is not None and not input_reader.output_partial_line_open:
                 input_reader.render()
             return
         if input_reader is not None:
             input_reader.clear()
-        print(line, file=sys.stderr, flush=True)
+        if isinstance(item, _ConsoleWrite):
+            sys.stderr.write(item.text)
+            sys.stderr.flush()
+            if input_reader is not None:
+                input_reader.output_partial_line_open = item.partial_line_open
+        else:
+            print(item, file=sys.stderr, flush=True)
+            if input_reader is not None:
+                input_reader.output_partial_line_open = False
         printed = True
 
 
@@ -1803,6 +1819,7 @@ class _TurnInputReader:
         self._kill_buffer = ""
         self._rendered_lines = 0
         self._rendered_rows_below_cursor = 0
+        self.output_partial_line_open = False
         self._status_lines: list[str] = []
         self._status_key = ""
         self._defer_render = False
@@ -2371,7 +2388,7 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
         return []
     elapsed = _format_elapsed_compact(snapshot.elapsed_seconds)
     if snapshot.finished:
-        parts = [style.dim(f"✻ {_finished_status_label(snapshot)} {elapsed}")]
+        parts = [style.dim(f"  {_finished_status_label(snapshot)} {elapsed}")]
     else:
         parts = [
             f"{style.dim('•')} {style.bold(snapshot.header)} "
@@ -4356,6 +4373,15 @@ def _truncate_display_text(text: str, width: int) -> str:
     return out.rstrip() + ellipsis
 
 
+def _terminal_interaction_command_snapshot(command: str, width: int) -> str:
+    if width < 8:
+        return ""
+    single_line = " ".join(str(command or "").split())
+    if not single_line:
+        return ""
+    return _truncate_display_text(single_line, width)
+
+
 def _read_init_command_prompt() -> str:
     path = Path(__file__).resolve().parent / "assets" / "prompts" / "init_command.md"
     return path.read_text(encoding="utf-8")
@@ -4820,7 +4846,7 @@ class _HumanEventRenderer:
         self,
         *,
         color_mode: str = "auto",
-        line_sink: Callable[[str], None] | None = None,
+        line_sink: Callable[[Any], None] | None = None,
         status_tracker: _LiveTurnStatus | None = None,
     ) -> None:
         self._tool_arguments: dict[str, Any] = {}
@@ -4833,6 +4859,7 @@ class _HumanEventRenderer:
         self._live_exec_rendered: set[str] = set()
         self._live_exec_output_seen: set[str] = set()
         self._live_exec_output_text: dict[str, str] = {}
+        self._live_exec_output_line_state: dict[str, _LiveOutputLineState] = {}
         self._exploration_calls: list[_ExecDisplayCall] = []
         self._final_message: str = ""
         self._final_message_rendered = False
@@ -5184,7 +5211,9 @@ class _HumanEventRenderer:
             return
         if live_output_seen and exit_value is None:
             if call.output.strip():
-                self._render_output_delta_block(call.output, first=False)
+                combined_output = self._live_exec_output_text.get(call_id, "") + call.output
+                self._live_exec_output_text[call_id] = combined_output
+                self._render_output_delta_block(call_id, combined_output, first=False)
             self._clear_live_exec(call_id)
             return
         if exit_value is not None and call.is_exploration and not live_output_seen:
@@ -5234,20 +5263,19 @@ class _HumanEventRenderer:
                     call = _ExecDisplayCall(call_id=call_id, command=command, parsed=parse_command_actions(command))
                 self._flush_exploration()
                 self._render_exec_call(call, running=True, ok=True, suppress_empty_output=True)
-            self._live_exec_rendered.add(call_id)
+        self._live_exec_rendered.add(call_id)
         self._live_exec_output_seen.add(call_id)
         self._live_exec_output_text[call_id] = self._live_exec_output_text.get(call_id, "") + delta
-        self._render_output_delta_block(delta, first=first_output)
+        self._render_output_delta_block(call_id, self._live_exec_output_text[call_id], first=first_output)
 
     def render_terminal_interaction(self, session_id: str, stdin: str, *, command: str | None = None) -> None:
         self._flush_exploration()
         self._begin_work_cell()
         command_display = command or self._background_terminal_commands.get(str(session_id), "")
-        suffix = f" {self._style.dim('·')} {self._style.dim(command_display)}" if command_display else ""
         if not stdin:
-            self._line(f"{self._style.dim('•')} {self._style.bold('Waited for background terminal')}{suffix}")
+            self._render_terminal_interaction_header("•", "Waited for background terminal", command_display)
             return
-        self._line(f"{self._style.dim('↳')} {self._style.bold('Interacted with background terminal')}{suffix}")
+        self._render_terminal_interaction_header("↳", "Interacted with background terminal", command_display)
         input_lines = stdin.rstrip("\n").splitlines()
         if input_lines:
             self._emit_prefixed_lines(
@@ -5255,6 +5283,17 @@ class _HumanEventRenderer:
                 first_prefix=self._style.dim("  └ "),
                 rest_prefix=self._style.dim("    "),
             )
+
+    def _render_terminal_interaction_header(self, marker: str, label: str, command_display: str) -> None:
+        prefix = f"{self._style.dim(marker)} "
+        line = self._style.bold(label)
+        command_snapshot = _terminal_interaction_command_snapshot(
+            command_display,
+            shutil.get_terminal_size((100, 24)).columns - _visible_len(prefix) - _visible_len(label) - 3,
+        )
+        if command_snapshot:
+            line += f" {self._style.dim('·')} {self._style.dim(command_snapshot)}"
+        self._emit_prefixed_lines([line], first_prefix=prefix, rest_prefix="  ")
 
     def _render_write_stdin_exec_completion(
         self,
@@ -5464,16 +5503,18 @@ class _HumanEventRenderer:
                 transform=self._style.dim,
             )
 
-    def _render_output_delta_block(self, output: str, *, first: bool) -> None:
-        lines = output.rstrip("\n").splitlines()
-        if not lines:
+    def _render_output_delta_block(self, call_id: str, output: str, *, first: bool) -> None:
+        if not output:
             return
-        self._emit_prefixed_lines(
-            lines,
-            first_prefix=self._style.dim("  └ " if first else "    "),
-            rest_prefix=self._style.dim("    "),
-            transform=self._style.dim,
-        )
+        state = self._live_exec_output_line_state.setdefault(call_id, _LiveOutputLineState(started=not first))
+        rows = _live_output_display_rows(output, self._style, shutil.get_terminal_size((100, 24)).columns)
+        if not rows:
+            return
+        clear = _clear_rendered_block_sequence(state.rendered_rows)
+        rendered = "\n".join(rows)
+        self._write(f"{clear}{rendered}\n", partial_line_open=False)
+        state.started = True
+        state.rendered_rows = len(rows)
 
     def _remaining_live_exec_output(self, call_id: str, output: str) -> str:
         if not output:
@@ -5488,9 +5529,19 @@ class _HumanEventRenderer:
         return output
 
     def _clear_live_exec(self, call_id: str) -> None:
+        self._finish_live_output_line(call_id)
         self._live_exec_rendered.discard(call_id)
         self._live_exec_output_seen.discard(call_id)
         self._live_exec_output_text.pop(call_id, None)
+
+    def _finish_live_output_line(self, call_id: str) -> None:
+        state = self._live_exec_output_line_state.pop(call_id, None)
+        if state is not None:
+            self._live_exec_rendered.discard(call_id)
+
+    def _finish_all_live_output_lines(self) -> None:
+        for call_id in list(self._live_exec_output_line_state):
+            self._finish_live_output_line(call_id)
 
     def _render_plan(self, meta: dict[str, Any]) -> None:
         self._line(f"{self._style.dim('•')} {self._style.bold('Updated Plan')}")
@@ -5692,10 +5743,24 @@ class _HumanEventRenderer:
         self._line(f"{ellipsis_prefix}{self._style.dim(_ellipsis_text(len(rendered) - keep))}")
 
     def _line(self, text: str) -> None:
+        self._finish_all_live_output_lines()
         if self._line_sink is not None:
             self._line_sink(text)
             return
         print(text, file=sys.stderr, flush=True)
+
+    def _write(self, text: str, *, partial_line_open: bool) -> None:
+        if self._line_sink is not None:
+            self._line_sink(_ConsoleWrite(text, partial_line_open=partial_line_open))
+            return
+        sys.stderr.write(text)
+        sys.stderr.flush()
+
+
+@dataclass
+class _LiveOutputLineState:
+    started: bool = False
+    rendered_rows: int = 0
 
 
 @dataclass
@@ -6204,6 +6269,49 @@ def _truncate_middle_parts(lines: list[str], max_lines: int) -> tuple[list[str],
     omitted = max(0, len(lines) - head_count - tail_count)
     tail = lines[len(lines) - tail_count :] if tail_count else []
     return lines[:head_count], tail, omitted
+
+
+def _clear_rendered_block_sequence(line_count: int) -> str:
+    if line_count <= 0:
+        return ""
+    parts: list[str] = ["\r"]
+    parts.append(f"\033[{line_count}A")
+    for index in range(line_count):
+        parts.append("\r\033[2K")
+        if index < line_count - 1:
+            parts.append("\033[1B")
+    if line_count > 1:
+        parts.append(f"\r\033[{line_count - 1}A")
+    else:
+        parts.append("\r")
+    return "".join(parts)
+
+
+def _live_output_display_rows(output: str, style: "_AnsiStyle", terminal_width: int) -> list[str]:
+    first_prefix = style.dim("  └ ")
+    rest_prefix = style.dim("    ")
+    rows: list[str] = []
+    first = True
+    cleaned = output.replace("\r", "")
+    logical_lines = cleaned.split("\n")
+    if logical_lines and logical_lines[-1] == "":
+        logical_lines.pop()
+    for logical_line in logical_lines or [cleaned]:
+        prefix = first_prefix if first else rest_prefix
+        available = max(10, terminal_width - _visible_len(prefix))
+        wrapped = _wrap_ansi_line(logical_line, available)
+        for index, segment in enumerate(wrapped):
+            current_prefix = prefix if index == 0 else rest_prefix
+            rows.append(f"{current_prefix}{style.dim(segment)}")
+            first = False
+    max_rows = 5
+    if len(rows) <= max_rows:
+        return rows
+    head_count = 2
+    tail_count = max(1, max_rows - head_count - 1)
+    omitted = max(1, len(rows) - head_count - tail_count)
+    marker = f"{rest_prefix}{style.dim(_ellipsis_text(omitted, transcript_hint=True))}"
+    return [*rows[:head_count], marker, *rows[-tail_count:]]
 
 
 def _render_markdown_for_terminal(

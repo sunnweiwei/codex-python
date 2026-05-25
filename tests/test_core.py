@@ -7243,7 +7243,7 @@ new file mode 100644
                 _AnsiStyle(False),
             )
         )
-        self.assertIn("✻ Worked for 2m 05s", finished)
+        self.assertIn("  Worked for 2m 05s", finished)
         self.assertIn("ctx 12.7K/400K", finished)
         self.assertIn("auth", finished)
         self.assertIn("ChatGPT", finished)
@@ -7268,7 +7268,7 @@ new file mode 100644
                 _AnsiStyle(True),
             )
         )
-        self.assertRegex(colored_finished, r"\x1b\[[0-9;]*2m✻ Worked for 1s")
+        self.assertRegex(colored_finished, r"\x1b\[[0-9;]*2m  Worked for 1s")
 
     def test_live_status_tracks_background_terminal_waits_like_upstream(self) -> None:
         from codex.cli import _LiveTurnStatus
@@ -7420,41 +7420,213 @@ new file mode 100644
     def test_cli_human_renderer_streams_exec_output_delta_without_duplicate_completion_output(self) -> None:
         from codex.cli import _HumanEventRenderer
 
-        lines: list[str] = []
-        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
-        renderer.render(
-            codex_types.CodexEvent(
-                "tool.started",
-                {
-                    "name": "exec_command",
-                    "call_id": "cmd-1",
-                    "arguments": {"cmd": "printf x"},
-                },
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "arguments": {"cmd": "printf x"},
+                    },
+                )
             )
-        )
-        renderer.render(
-            codex_types.CodexEvent(
-                "exec_command.output_delta",
-                {"call_id": "cmd-1", "delta": "streamed-output\n", "stream": "stdout"},
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "cmd-1", "delta": "streamed-output\n", "stream": "stdout"},
+                )
             )
-        )
-        renderer.render(
-            codex_types.CodexEvent(
-                "tool.completed",
-                {
-                    "name": "exec_command",
-                    "call_id": "cmd-1",
-                    "ok": True,
-                    "metadata": {"command": "printf x", "exit_code": 0, "output": "streamed-output\n"},
-                },
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "ok": True,
+                        "metadata": {"command": "printf x", "exit_code": 0, "output": "streamed-output\n"},
+                    },
+                )
             )
-        )
 
-        rendered = "\n".join(lines)
+        rendered = rendered_io.getvalue()
         self.assertIn("• Running printf x", rendered)
         self.assertIn("  └ streamed-output", rendered)
         self.assertIn("• Ran printf x", rendered)
         self.assertEqual(rendered.count("streamed-output"), 1)
+
+    def test_cli_human_renderer_streams_partial_output_on_same_line(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "arguments": {"cmd": "python -m unittest"},
+                    },
+                )
+            )
+            for dot in [".", ".", "."]:
+                renderer.render(
+                    codex_types.CodexEvent(
+                        "exec_command.output_delta",
+                        {"call_id": "cmd-1", "delta": dot, "stream": "stdout"},
+                    )
+                )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "ok": True,
+                        "metadata": {"command": "python -m unittest", "exit_code": 0, "output": "..."},
+                    },
+                )
+            )
+
+        rendered = rendered_io.getvalue()
+        self.assertIn("  └ ...\n", rendered)
+        self.assertNotIn("  └ .\n    .", rendered)
+
+    def test_cli_human_renderer_marks_long_live_output_but_keeps_tail_streaming(self) -> None:
+        from unittest.mock import patch
+
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io), patch("shutil.get_terminal_size", return_value=os.terminal_size((24, 24))):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "arguments": {"cmd": "python noisy.py"},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "cmd-1", "delta": "\n".join(f"line-{i}" for i in range(1, 8)) + "\n", "stream": "stdout"},
+                )
+            )
+
+        rendered = rendered_io.getvalue()
+        self.assertIn("… +3 lines (ctrl + t to view transcript)", rendered)
+        self.assertIn("line-1", rendered)
+        self.assertIn("line-7", rendered)
+
+    def test_cli_output_drain_does_not_redraw_prompt_over_partial_line(self) -> None:
+        import queue
+
+        from codex.cli import _ConsoleWrite
+        from codex.cli import _drain_output_queue
+
+        class FakeReader:
+            def __init__(self) -> None:
+                self.output_partial_line_open = False
+                self.clears = 0
+                self.renders = 0
+
+            def clear(self) -> None:
+                self.clears += 1
+
+            def render(self) -> None:
+                self.renders += 1
+
+        output: "queue.Queue[Any]" = queue.Queue()
+        reader = FakeReader()
+        output.put(_ConsoleWrite("  └ ***", partial_line_open=True))
+        with redirect_stderr(io.StringIO()):
+            _drain_output_queue(output, input_reader=reader)
+
+        self.assertTrue(reader.output_partial_line_open)
+        self.assertEqual(reader.renders, 0)
+
+        output.put(_ConsoleWrite("\n", partial_line_open=False))
+        with redirect_stderr(io.StringIO()):
+            _drain_output_queue(output, input_reader=reader)
+        self.assertFalse(reader.output_partial_line_open)
+        self.assertEqual(reader.renders, 1)
+
+    def test_cli_human_renderer_restarts_terminal_header_after_agent_message(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "arguments": {"cmd": "python slow.py", "yield_time_ms": 1000},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "cmd-1", "delta": "booting", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "ok": True,
+                        "metadata": {"session_id": 7, "command": "python slow.py", "output": "booting"},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "item.completed",
+                    {
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Still running; I will check again."}],
+                        }
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "write_stdin",
+                        "call_id": "poll-1",
+                        "arguments": {"session_id": 7, "chars": ""},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "cmd-1", "delta": "done\n", "stream": "stdout"},
+                )
+            )
+
+        rendered = rendered_io.getvalue()
+        self.assertIn("• Running python slow.py", rendered)
+        self.assertIn("  └ booting\n", rendered)
+        self.assertIn("• Still running; I will check again.", rendered)
+        self.assertIn("• Waited for background terminal", rendered)
+        self.assertIn("  └ done\n", rendered)
 
     def test_cli_human_renderer_hides_running_cells_for_silent_background_command(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -7519,66 +7691,84 @@ new file mode 100644
     def test_cli_human_renderer_streams_background_terminal_wait_output(self) -> None:
         from codex.cli import _HumanEventRenderer
 
-        lines: list[str] = []
-        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
-        renderer.render(
-            codex_types.CodexEvent(
-                "tool.started",
-                {
-                    "name": "exec_command",
-                    "call_id": "cmd-1",
-                    "arguments": {"cmd": "python3 -i", "tty": True},
-                },
-            )
-        )
-        renderer.render(
-            codex_types.CodexEvent(
-                "tool.completed",
-                {
-                    "name": "exec_command",
-                    "call_id": "cmd-1",
-                    "ok": True,
-                    "metadata": {"session_id": 7, "output": ""},
-                },
-            )
-        )
-        renderer.render(
-            codex_types.CodexEvent(
-                "tool.started",
-                {
-                    "name": "write_stdin",
-                    "call_id": "poll-1",
-                    "arguments": {"session_id": 7, "chars": ""},
-                },
-            )
-        )
-        renderer.render(
-            codex_types.CodexEvent(
-                "exec_command.output_delta",
-                {"call_id": "cmd-1", "delta": "prompt ready\n", "stream": "stdout"},
-            )
-        )
-        renderer.render(
-            codex_types.CodexEvent(
-                "tool.completed",
-                {
-                    "name": "write_stdin",
-                    "call_id": "poll-1",
-                    "ok": True,
-                    "metadata": {
-                        "session_id": 7,
-                        "event_call_id": "cmd-1",
-                        "command": "python3 -i",
-                        "output": "prompt ready\n",
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "arguments": {"cmd": "python3 -i", "tty": True},
                     },
-                },
+                )
             )
-        )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "ok": True,
+                        "metadata": {"session_id": 7, "output": ""},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "write_stdin",
+                        "call_id": "poll-1",
+                        "arguments": {"session_id": 7, "chars": ""},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "cmd-1", "delta": "prompt ready\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "write_stdin",
+                        "call_id": "poll-1",
+                        "ok": True,
+                        "metadata": {
+                            "session_id": 7,
+                            "event_call_id": "cmd-1",
+                            "command": "python3 -i",
+                            "output": "prompt ready\n",
+                        },
+                    },
+                )
+            )
 
-        rendered = "\n".join(lines)
+        rendered = rendered_io.getvalue()
         self.assertIn("• Waited for background terminal · python3 -i", rendered)
         self.assertIn("  └ prompt ready", rendered)
         self.assertEqual(rendered.count("prompt ready"), 1)
+
+    def test_cli_human_renderer_terminal_interaction_uses_command_snapshot(self) -> None:
+        from unittest.mock import patch
+
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        command = "python3 <<'PY'\nprint('this is a very long heredoc command body')\nPY"
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((64, 24))):
+            renderer.render_terminal_interaction("7", "", command=command)
+
+        rendered = "\n".join(lines)
+        self.assertIn("• Waited for background terminal ·", rendered)
+        self.assertIn("…", rendered)
+        self.assertNotIn("\nprint(", rendered)
+        self.assertNotIn("very long heredoc command body", rendered)
 
     def test_resume_transcript_replays_apply_patch_changes_as_file_change(self) -> None:
         from codex.cli import _HumanEventRenderer
