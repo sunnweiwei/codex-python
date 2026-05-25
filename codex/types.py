@@ -149,6 +149,9 @@ class CodexConfig:
     model_reasoning_summary: str | None = None
     model_verbosity: str | None = None
     service_tier: str | None = None
+    fast_mode_enabled: bool = True
+    fast_default_opt_out: bool = False
+    account_plan_type: str | None = None
     model_stream_max_retries: int | None = None
     model_stream_retry_base_delay_ms: int = 200
     show_raw_agent_reasoning: bool = False
@@ -210,6 +213,26 @@ class CodexConfig:
         model_info = _model_catalog_info(self.model)
         value = model_info.get("supports_parallel_tool_calls")
         return bool(value) if isinstance(value, bool) else True
+
+    def resolved_service_tier(self) -> str | None:
+        configured = normalize_service_tier(self.service_tier)
+        if configured is not None:
+            return configured
+        if self.fast_default_opt_out or not self.fast_mode_enabled:
+            return None
+        if not _catalog_model_supports_fast_mode(self.model):
+            return None
+        if _is_enterprise_default_service_tier_plan(self.account_plan_type):
+            return "priority"
+        return None
+
+    def resolved_model_service_tiers(self) -> list[dict[str, str]]:
+        return _catalog_model_service_tiers(self.model)
+
+    def resolved_model_supports_fast_mode(self) -> bool:
+        if not self.fast_mode_enabled:
+            return False
+        return _catalog_model_supports_fast_mode(self.model)
 
     def resolved_model_stream_max_retries(self) -> int:
         if self.model_stream_max_retries is None:
@@ -410,6 +433,62 @@ def _catalog_model_context_window(model: str) -> int | None:
         if isinstance(value, int) and value > 0:
             return value
     return None
+
+
+def normalize_service_tier(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized.lower() == "fast":
+        return "priority"
+    if normalized.lower() == "priority":
+        return "priority"
+    if normalized.lower() == "flex":
+        return "flex"
+    return normalized
+
+
+def _catalog_model_service_tiers(model: str) -> list[dict[str, str]]:
+    info = _model_catalog_info(model)
+    tiers = info.get("service_tiers")
+    if not isinstance(tiers, list):
+        return []
+    out: list[dict[str, str]] = []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        tier_id = tier.get("id")
+        name = tier.get("name")
+        description = tier.get("description")
+        if isinstance(tier_id, str) and isinstance(name, str) and isinstance(description, str):
+            out.append({"id": tier_id, "name": name.lower(), "description": description})
+    return out
+
+
+def _catalog_model_supports_fast_mode(model: str) -> bool:
+    info = _model_catalog_info(model)
+    tiers = info.get("service_tiers")
+    if isinstance(tiers, list):
+        for tier in tiers:
+            if isinstance(tier, dict) and tier.get("id") == "priority":
+                return True
+    speed_tiers = info.get("additional_speed_tiers")
+    return isinstance(speed_tiers, list) and any(str(tier).lower() == "fast" for tier in speed_tiers)
+
+
+def _is_enterprise_default_service_tier_plan(plan_type: str | None) -> bool:
+    if not plan_type:
+        return False
+    normalized = plan_type.strip().lower()
+    return normalized in {
+        "enterprise",
+        "business",
+        "enterprise_cbp_usage_based",
+        "team",
+        "self_serve_business_usage_based",
+    }
 
 
 def _create_text_param(

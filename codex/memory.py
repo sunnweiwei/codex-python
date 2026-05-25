@@ -1971,7 +1971,7 @@ def build_memory_consolidation_config(
         model_reasoning_effort=MEMORY_STAGE_TWO_REASONING_EFFORT,
         model_reasoning_summary=config.model_reasoning_summary,
         model_verbosity=config.model_verbosity,
-        service_tier=config.service_tier,
+        service_tier=config.resolved_service_tier(),
         client_metadata=config.client_metadata,
         output_schema=None,
         output_schema_strict=config.output_schema_strict,

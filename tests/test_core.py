@@ -795,6 +795,33 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(kwargs["service_tier"], "flex")
         self.assertEqual(kwargs["client_metadata"], {"x-codex-installation-id": "install-1"})
 
+    def test_fast_service_tier_alias_resolves_to_priority_request_value(self) -> None:
+        config = CodexConfig(skip_git_repo_check=True, ephemeral=True, service_tier="fast")
+        self.assertEqual(config.resolved_service_tier(), "priority")
+
+        model = ScriptedResponsesModel([message("ok")])
+        session = CodexSession(config, model_client=model)
+        session.run("hello")
+
+        self.assertEqual(model.requests[0].service_tier, "priority")
+
+    def test_enterprise_like_chatgpt_plan_defaults_to_fast_service_tier(self) -> None:
+        config = CodexConfig(
+            skip_git_repo_check=True,
+            ephemeral=True,
+            service_tier=None,
+            account_plan_type="team",
+        )
+        self.assertEqual(config.resolved_service_tier(), "priority")
+        opted_out = CodexConfig(
+            skip_git_repo_check=True,
+            ephemeral=True,
+            service_tier=None,
+            account_plan_type="team",
+            fast_default_opt_out=True,
+        )
+        self.assertIsNone(opted_out.resolved_service_tier())
+
     def test_prompt_request_compact_payload_matches_upstream_endpoint_shape(self) -> None:
         request = PromptRequest(
             model="gpt-test",
@@ -6824,6 +6851,9 @@ new file mode 100644
         )
         self.assertIn("/model", rendered)
         self.assertIn("choose what model and reasoning effort to use", rendered)
+        fast_rows = _slash_palette_rows_for_buffer("/fa", 3)
+        self.assertEqual(fast_rows[0].display_name, "fast")
+        self.assertIn("Fastest inference", fast_rows[0].description)
 
         self.assertEqual(_slash_palette_rows_for_buffer("/ test", 2), [])
         self.assertEqual(_slash_palette_rows_for_buffer("/zzz", 4), [])
@@ -6874,7 +6904,7 @@ new file mode 100644
             env=env,
             interactions=[
                 ("/", "/model"),
-                ("\x1b[B\r", "Started new chat"),
+                ("\x1b[B\x1b[B\r", "Started new chat"),
                 ("/exit\r", None),
             ],
             timeout=10.0,
@@ -6951,6 +6981,47 @@ new file mode 100644
         self.assertIn("auth", finished)
         self.assertIn("ChatGPT", finished)
         self.assertNotIn("esc to interrupt", finished)
+
+        colored_finished = "".join(
+            _live_status_display_lines(
+                _LiveTurnStatusSnapshot(
+                    header="Working",
+                    elapsed_seconds=1,
+                    auth_label=None,
+                    goal_status=None,
+                    active_context_tokens=None,
+                    active_context_estimated=False,
+                    session_context_tokens=None,
+                    session_context_estimated=False,
+                    session_reasoning_tokens=None,
+                    context_window=None,
+                    finished=True,
+                    outcome="completed",
+                ),
+                _AnsiStyle(True),
+            )
+        )
+        self.assertRegex(colored_finished, r"\x1b\[[0-9;]*2m• Worked for 1s")
+
+    def test_command_renderer_hides_unified_exec_metadata_when_no_output(self) -> None:
+        from codex.cli import _strip_unified_exec_response_metadata
+        from codex.cli import _visible_command_output
+
+        response_text = (
+            "Chunk ID: abc123\n"
+            "Wall time: 0.0100 seconds\n"
+            "Process running with session ID 1\n"
+            "Original token count: 0\n"
+            "Output:\n"
+        )
+        meta = {
+            "chunk_id": "abc123",
+            "wall_time_seconds": 0.01,
+            "session_id": 1,
+            "output": "",
+        }
+        self.assertEqual(_visible_command_output(meta, {"output": response_text}), "")
+        self.assertEqual(_strip_unified_exec_response_metadata(response_text + "hello\n"), "hello\n")
 
     def test_chat_startup_panel_summarizes_model_auth_and_fallback_without_secret_leaks(self) -> None:
         from codex import cli
@@ -7148,7 +7219,55 @@ new file mode 100644
         self.assertIn("session ", plain)
         self.assertNotIn("Ask Codex to do anything", plain)
         self.assertIn("Conversation interrupted", plain)
-        self.assertIn("Process running with session ID", plain)
+        self.assertIn("Running sleep 10", plain)
+        self.assertNotIn("Chunk ID:", plain)
+        self.assertNotIn("Process running with session ID", plain)
+
+    def test_cli_tty_completed_command_without_output_renders_no_output_like_upstream(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        responses = [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "true-1",
+                        "arguments": json.dumps({"cmd": "true", "yield_time_ms": 30000}),
+                    }
+                ]
+            },
+            message("done"),
+        ]
+        env = {
+            **os.environ,
+            "TERM": "xterm-256color",
+            "PY_CODEX_FAKE_RESPONSES": json.dumps(responses),
+            "PYTHONPATH": os.getcwd(),
+        }
+        output = self._run_cli_pty(
+            [
+                sys.executable,
+                "-m",
+                "codex",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+                "run true",
+            ],
+            env=env,
+            interactions=[
+                ("", "done"),
+                ("/exit\r", None),
+            ],
+            timeout=12.0,
+        )
+        plain = _plain_terminal_output(output)
+
+        self.assertIn("Ran true", plain)
+        self.assertIn("(no output)", plain)
+        self.assertNotIn("Chunk ID:", plain)
 
     def test_cli_tty_chat_pending_input_submits_during_running_turn(self) -> None:
         if sys.platform == "win32":
@@ -8484,6 +8603,50 @@ model_reasoning_effort = "low"
             assert clear_result.session is not None
             self.assertNotEqual(clear_result.session.state.thread_id, current.state.thread_id)
             self.assertEqual(clear_result.session.state.history, [])
+
+    def test_interactive_fast_slash_toggles_service_tier_and_status(self) -> None:
+        from codex import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_codex_home = os.environ.get("CODEX_HOME")
+            os.environ["CODEX_HOME"] = str(root / "codex-home")
+            try:
+                session = CodexSession(
+                    CodexConfig(model="gpt-5.5", cwd=root, skip_git_repo_check=True, ephemeral=True),
+                    model_client=ScriptedResponsesModel([]),
+                )
+
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    enabled = cli._handle_interactive_slash_command(session, "/fast", color_mode="never")
+
+                self.assertTrue(enabled.handled)
+                self.assertEqual(session.config.service_tier, "priority")
+                self.assertEqual(session.config.resolved_service_tier(), "priority")
+                self.assertIn("Service tier set to priority", stderr.getvalue())
+                self.assertIn("Fast on", "\n".join(cli._chat_status_panel_lines(session, terminal_width=100)))
+
+                config_text = (Path(os.environ["CODEX_HOME"]) / "config.toml").read_text(encoding="utf-8")
+                self.assertIn('service_tier = "fast"', config_text)
+                self.assertIn("fast_default_opt_out = false", config_text)
+
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    disabled = cli._handle_interactive_slash_command(session, "/fast", color_mode="never")
+
+                self.assertTrue(disabled.handled)
+                self.assertIn("Service tier set to default", stderr.getvalue())
+                self.assertIsNone(session.config.service_tier)
+                self.assertTrue(session.config.fast_default_opt_out)
+                config_text = (Path(os.environ["CODEX_HOME"]) / "config.toml").read_text(encoding="utf-8")
+                self.assertNotIn("service_tier", config_text)
+                self.assertIn("fast_default_opt_out = true", config_text)
+            finally:
+                if old_codex_home is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = old_codex_home
 
     def test_interactive_ps_and_stop_manage_background_terminals(self) -> None:
         from codex import cli

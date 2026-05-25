@@ -30,7 +30,7 @@ from typing import Any, Callable
 from .core import CodexSession, SteerInputError, TurnInterrupted
 from .goal import GOAL_STATUS_FROM_WIRE, GoalStatus, goal_summary
 from .state import load_rollout_records, parse_command_actions, reconstruct_history_from_rollout
-from .types import CodexConfig, CodexEvent, _model_catalog_info
+from .types import CodexConfig, CodexEvent, _model_catalog_info, normalize_service_tier
 from . import types as _types
 
 
@@ -398,6 +398,7 @@ def _main_chat(argv: list[str], *, prog: str = "python -m agents.codex") -> int:
 def _add_exec_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", "--experimental-json", action="store_true", dest="json_events")
     parser.add_argument("--model", "-m")
+    parser.add_argument("--service-tier", choices=["fast", "priority", "flex"], default=None)
     parser.add_argument("--oss", action="store_true")
     parser.add_argument("--local-provider", dest="local_provider")
     parser.add_argument("--auth-mode", choices=["auto", "api-key", "api_key", "chatgpt"], default=None)
@@ -434,6 +435,7 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
     sandbox = "danger-full-access" if args.dangerously_bypass_approvals_and_sandbox else args.sandbox
     approval_policy = "never" if args.dangerously_bypass_approvals_and_sandbox else args.ask_for_approval
     web_search = _web_search_settings(cli_config)
+    auth_codex_home = _string_config(cli_config, "auth_codex_home")
     config = CodexConfig(
         model=model,
         model_provider_id=model_provider_id,
@@ -443,6 +445,7 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
         approval_policy=approval_policy or _approval_config(cli_config) or "never",
         writable_roots=tuple(Path(path) for path in [*_path_list_config(cli_config, "writable_roots"), *args.add_dirs]),
         codex_home=_default_codex_home(),
+        auth_codex_home=auth_codex_home,
         auth_mode=_auth_mode_config(args, cli_config),
         chatgpt_base_url=_string_config(cli_config, "chatgpt_base_url"),
         openai_base_url=_string_config(cli_config, "openai_base_url") or _string_config(model_provider_config, "base_url"),
@@ -471,7 +474,14 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
         model_reasoning_effort=_string_config(cli_config, "model_reasoning_effort"),
         model_reasoning_summary=_string_config(cli_config, "model_reasoning_summary"),
         model_verbosity=_string_config(cli_config, "model_verbosity"),
-        service_tier=_string_config(cli_config, "service_tier"),
+        service_tier=args.service_tier or _string_config(cli_config, "service_tier"),
+        fast_mode_enabled=_bool_nested_config(cli_config, ("features", "fast_mode"), True),
+        fast_default_opt_out=_bool_nested_config(
+            cli_config,
+            ("notices", "fast_default_opt_out"),
+            _bool_config(cli_config, "fast_default_opt_out", False),
+        ),
+        account_plan_type=_local_account_plan_type(auth_codex_home),
         model_stream_max_retries=_int_config(model_provider_config, "stream_max_retries"),
         show_raw_agent_reasoning=bool(oss_provider) or _bool_config(cli_config, "show_raw_agent_reasoning", False),
         bypass_hook_trust=args.bypass_hook_trust or _bool_config(cli_config, "bypass_hook_trust", False),
@@ -1095,6 +1105,17 @@ def _set_session_model(session: CodexSession, model: str, effort: str | None) ->
     session.tools.config = config
 
 
+def _set_session_service_tier(session: CodexSession, service_tier: str | None) -> None:
+    config = replace(
+        session.config,
+        service_tier=normalize_service_tier(service_tier),
+        fast_default_opt_out=service_tier is None,
+    )
+    session.config = config
+    session.state.config = config
+    session.tools.config = config
+
+
 def _interactive_model_picker(
     models: list[dict[str, Any]],
     current_model: str,
@@ -1664,6 +1685,7 @@ class _LiveTurnStatusSnapshot:
     context_window: int | None
     finished: bool = False
     outcome: str | None = None
+    fast_status: str | None = None
 
 
 class _LiveTurnStatus:
@@ -1711,6 +1733,7 @@ class _LiveTurnStatus:
             header=header,
             elapsed_seconds=elapsed,
             auth_label=_session_auth_indicator(session, include_fallback=False),
+            fast_status=_fast_status_indicator(session.config, include_off=False),
             goal_status=_goal_status_indicator(session),
             active_context_tokens=active_context,
             active_context_estimated=active_context_estimated,
@@ -2288,7 +2311,7 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
         return []
     elapsed = _format_elapsed_compact(snapshot.elapsed_seconds)
     if snapshot.finished:
-        parts = [f"{style.dim('•')} {_finished_status_label(snapshot)} {elapsed}"]
+        parts = [style.dim(f"• {_finished_status_label(snapshot)} {elapsed}")]
     else:
         parts = [
             f"{style.dim('•')} {style.bold(snapshot.header)} "
@@ -2297,6 +2320,8 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
     metric_parts: list[str] = []
     if snapshot.goal_status:
         metric_parts.append(snapshot.goal_status)
+    if snapshot.fast_status:
+        metric_parts.append(snapshot.fast_status)
     if snapshot.active_context_tokens is not None:
         ctx = _format_tokens_compact(snapshot.active_context_tokens)
         if snapshot.context_window:
@@ -2434,6 +2459,17 @@ def _goal_status_indicator(session: CodexSession) -> str | None:
         return f"Goal unmet ({usage})" if usage else "Goal abandoned"
     if status == "complete":
         return f"Goal achieved ({_complete_goal_footer_usage(goal)})"
+    return None
+
+
+def _fast_status_indicator(config: CodexConfig, *, include_off: bool) -> str | None:
+    service_tier = config.resolved_service_tier()
+    if service_tier == "priority" and config.resolved_model_supports_fast_mode():
+        return "Fast on"
+    if include_off and config.fast_mode_enabled and config.resolved_model_supports_fast_mode():
+        return "Fast off"
+    if include_off and service_tier:
+        return service_tier
     return None
 
 
@@ -2810,6 +2846,7 @@ class _SlashPaletteRow:
 
 _SLASH_COMMANDS: tuple[_SlashCommandDef, ...] = (
     _SlashCommandDef("model", "choose what model and reasoning effort to use", available_during_task=False),
+    _SlashCommandDef("fast", "Fastest inference with increased plan usage", available_during_task=False),
     _SlashCommandDef("ide", "include current selection, open files, and other context from your IDE", supports_inline_args=True),
     _SlashCommandDef("permissions", "choose what Codex is allowed to do", available_during_task=False),
     _SlashCommandDef("keymap", "remap TUI shortcuts", supports_inline_args=True, available_during_task=False),
@@ -2871,6 +2908,7 @@ _SLASH_COMMAND_BY_NAME: dict[str, _SlashCommandDef] = {
 
 _SLASH_IMPLEMENTED_NAMES = {
     "model",
+    "fast",
     "new",
     "resume",
     "fork",
@@ -3233,6 +3271,9 @@ def _handle_interactive_slash_command(
             print("AGENTS.md already exists here. Skipping /init to avoid overwriting it.", file=sys.stderr, flush=True)
             return _InteractiveSlashResult(True)
         return _InteractiveSlashResult(True, prompt=_read_init_command_prompt())
+    if command == "fast":
+        _handle_fast_slash(session, slash.rest, color_mode=color_mode)
+        return _InteractiveSlashResult(True)
     if command == "model":
         _handle_model_slash(session, slash.rest, color_mode=color_mode)
         return _InteractiveSlashResult(True)
@@ -3253,6 +3294,114 @@ def _handle_interactive_slash_command(
         flush=True,
     )
     return _InteractiveSlashResult(True)
+
+
+def _handle_fast_slash(session: CodexSession, rest: str, *, color_mode: str = "auto") -> None:
+    style = _AnsiStyle(_should_use_color(color_mode))
+    if rest.strip():
+        print("Usage: /fast", file=sys.stderr, flush=True)
+        return
+    command = _fast_service_tier_command(session.config)
+    if command is None:
+        print("Fast mode is not available for the current model.", file=sys.stderr, flush=True)
+        return
+    current = session.config.resolved_service_tier()
+    next_tier = None if current == command["id"] else command["id"]
+    _set_session_service_tier(session, next_tier)
+    _persist_service_tier_selection(next_tier)
+    label = next_tier or "default"
+    print(f"Service tier set to {style.bold(label)}", file=sys.stderr, flush=True)
+
+
+def _fast_service_tier_command(config: CodexConfig) -> dict[str, str] | None:
+    if not config.resolved_model_supports_fast_mode():
+        return None
+    for tier in config.resolved_model_service_tiers():
+        if tier.get("id") == "priority" or tier.get("name", "").lower() == "fast":
+            return {
+                "id": normalize_service_tier(tier["id"]) or tier["id"],
+                "name": tier.get("name", "fast").lower(),
+                "description": tier.get("description") or "Fastest inference with increased plan usage",
+            }
+    return {
+        "id": "priority",
+        "name": "fast",
+        "description": "Fastest inference with increased plan usage",
+    }
+
+
+def _persist_service_tier_selection(service_tier: str | None) -> None:
+    path = _default_config_path()
+    try:
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return
+    persisted_value = "fast" if service_tier == "priority" else service_tier
+    next_text = _update_service_tier_toml(text, persisted_value)
+    next_text = _update_notices_fast_default_opt_out_toml(next_text, service_tier is None)
+    if next_text == text:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(next_text, encoding="utf-8")
+    except OSError:
+        return
+
+
+def _update_service_tier_toml(text: str, service_tier: str | None) -> str:
+    lines = text.splitlines(keepends=True)
+    in_root = True
+    key_pattern = re.compile(r"^(\s*)service_tier\s*=")
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_root = False
+        if in_root and key_pattern.match(line):
+            if service_tier is None:
+                del lines[index]
+            else:
+                newline = "\n" if line.endswith("\n") else ""
+                lines[index] = f'service_tier = "{service_tier}"{newline}'
+            return "".join(lines)
+    if service_tier is None:
+        return text
+    insert_at = next(
+        (index for index, line in enumerate(lines) if line.strip().startswith("[") and line.strip().endswith("]")),
+        len(lines),
+    )
+    prefix = "" if insert_at == 0 or (insert_at > 0 and lines[insert_at - 1].endswith("\n")) else "\n"
+    lines.insert(insert_at, f'{prefix}service_tier = "{service_tier}"\n')
+    return "".join(lines)
+
+
+def _update_notices_fast_default_opt_out_toml(text: str, opt_out: bool) -> str:
+    lines = text.splitlines(keepends=True)
+    section_start: int | None = None
+    section_end = len(lines)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "[notices]":
+            section_start = index
+            section_end = len(lines)
+            continue
+        if section_start is not None and index > section_start and stripped.startswith("[") and stripped.endswith("]"):
+            section_end = index
+            break
+    value = "true" if opt_out else "false"
+    key_pattern = re.compile(r"^(\s*)fast_default_opt_out\s*=")
+    if section_start is not None:
+        for index in range(section_start + 1, section_end):
+            if key_pattern.match(lines[index]):
+                newline = "\n" if lines[index].endswith("\n") else ""
+                lines[index] = f"fast_default_opt_out = {value}{newline}"
+                return "".join(lines)
+        insert_line = section_end
+        prefix = "" if insert_line == 0 or lines[insert_line - 1].endswith("\n") else "\n"
+        lines.insert(insert_line, f"{prefix}fast_default_opt_out = {value}\n")
+        return "".join(lines)
+    suffix = "" if not text or text.endswith("\n") else "\n"
+    spacer = "" if not text else "\n"
+    return f"{text}{suffix}{spacer}[notices]\nfast_default_opt_out = {value}\n"
 
 
 def _handle_goal_slash(session: CodexSession, rest: str, *, color_mode: str = "auto") -> bool:
@@ -4151,6 +4300,7 @@ def _chat_status_panel_lines(
     labels = [
         "Model",
         "Model provider",
+        "Fast mode",
         "Directory",
         "Permissions",
         "Agents.md",
@@ -4179,6 +4329,9 @@ def _chat_status_panel_lines(
     field_lines.extend(_status_field_lines("Model", f"{config.model} ({model_details})", label_width, available_inner_width))
     if provider:
         field_lines.extend(_status_field_lines("Model provider", provider, label_width, available_inner_width))
+    fast_status = _fast_status_indicator(config, include_off=True)
+    if fast_status:
+        field_lines.extend(_status_field_lines("Fast mode", fast_status, label_width, available_inner_width))
     field_lines.extend(_status_field_lines("Directory", directory, label_width, available_inner_width))
     field_lines.extend(_status_field_lines("Permissions", permissions, label_width, available_inner_width))
     field_lines.extend(_status_field_lines("Agents.md", _status_agents_summary(config.resolved_cwd()), label_width, available_inner_width))
@@ -4862,7 +5015,7 @@ class _HumanEventRenderer:
         meta: dict[str, Any],
     ) -> None:
         if str(payload.get("name") or "") == "write_stdin":
-            output = str(meta.get("aggregated_output") or meta.get("output") or payload.get("output") or "")
+            output = _visible_command_output(meta, payload)
             if output.strip():
                 self._render_output_block(output)
             return
@@ -4872,7 +5025,7 @@ class _HumanEventRenderer:
             call = _ExecDisplayCall(call_id=call_id, command=command, parsed=parse_command_actions(command))
         exit_code = meta.get("exit_code")
         exit_value = _int_value(exit_code)
-        call.output = str(meta.get("aggregated_output") or meta.get("output") or payload.get("output") or "")
+        call.output = _visible_command_output(meta, payload)
         call.exit_code = exit_value
         call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
         if exit_value is not None and call.is_exploration:
@@ -4970,6 +5123,12 @@ class _HumanEventRenderer:
         )
         if call.output.strip():
             self._render_output_block(call.output)
+        elif not running:
+            self._emit_prefixed_lines(
+                [self._style.dim("(no output)")],
+                first_prefix=self._style.dim("  └ "),
+                rest_prefix="    ",
+            )
 
     def _flush_exploration(self) -> None:
         if not self._exploration_calls:
@@ -5319,6 +5478,50 @@ def _file_change_display_from_metadata(meta: dict[str, Any]) -> list[_FileChange
             )
         )
     return rendered
+
+
+def _visible_command_output(meta: dict[str, Any], payload: dict[str, Any]) -> str:
+    if meta:
+        for key in ("aggregated_output", "output"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        if any(
+            key in meta
+            for key in (
+                "chunk_id",
+                "wall_time_seconds",
+                "session_id",
+                "exit_code",
+                "stdout",
+                "stderr",
+                "aggregated_output",
+            )
+        ):
+            return ""
+    output = payload.get("output")
+    if not isinstance(output, str) or not output.strip():
+        return ""
+    return _strip_unified_exec_response_metadata(output)
+
+
+def _strip_unified_exec_response_metadata(text: str) -> str:
+    if "\nOutput:\n" not in text:
+        return text
+    head, output = text.split("\nOutput:\n", 1)
+    metadata_lines = head.splitlines()
+    if not metadata_lines:
+        return text
+    known_prefixes = (
+        "Chunk ID:",
+        "Wall time:",
+        "Process exited with code ",
+        "Process running with session ID ",
+        "Original token count:",
+    )
+    if all(line.startswith(known_prefixes) for line in metadata_lines):
+        return output
+    return text
 
 
 def _file_change_display_from_patch(arguments: Any) -> list[_FileChangeDisplay]:
@@ -6525,6 +6728,17 @@ def _default_config_path() -> Path:
     if official.exists():
         return official
     return _default_codex_home() / "config.toml"
+
+
+def _local_account_plan_type(auth_codex_home: str | Path | None = None) -> str | None:
+    try:
+        from .auth import auth_status
+
+        status = auth_status(auth_codex_home)
+    except Exception:
+        return None
+    plan = status.get("plan_type") if isinstance(status, dict) else None
+    return plan if isinstance(plan, str) and plan else None
 
 
 def _configure_cli_syntax_theme(config: dict) -> None:
