@@ -247,6 +247,7 @@ _codex_safe_from("codex.state", "build_compaction_summary_text")
 _codex_safe_from("codex.state", "parse_command_actions")
 _codex_safe_from("codex.state", "prepare_prompt_history")
 _codex_safe_from("codex.state", "reconstruct_history_from_rollout")
+_codex_safe_from("codex.state", "trim_remote_compaction_history_to_fit_context_window")
 _codex_safe_from("codex.state", "parse_memory_citation")
 _codex_safe_from("codex.state", "extract_proposed_plan_text")
 _codex_safe_from("codex.state", "strip_memory_citations")
@@ -877,6 +878,51 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(headers["x-codex-installation-id"], "install-1")
         self.assertEqual(headers["session-id"], "session-1")
         self.assertEqual(headers["thread-id"], "thread-1")
+
+    def test_api_key_remote_compact_omits_service_tier_like_upstream(self) -> None:
+        model = OpenAIResponsesModel(api_key="sk-test", base_url="https://example.test/v1")
+        request = PromptRequest(
+            model="gpt-test",
+            instructions="base",
+            input=[],
+            tools=[],
+            service_tier="priority",
+        )
+
+        payload = model._compact_payload(request)
+
+        self.assertNotIn("service_tier", payload)
+
+    def test_chatgpt_remote_compact_preserves_service_tier_like_upstream(self) -> None:
+        access_token = _fake_jwt({"exp": int(time.time()) + 3600})
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": _fake_jwt({}),
+                            "access_token": access_token,
+                            "refresh_token": "refresh-token",
+                            "account_id": "account-1",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            model = ChatGPTCodexModel(auth_snapshot=load_auth_snapshot(home, mode="chatgpt"))
+        request = PromptRequest(
+            model="gpt-test",
+            instructions="base",
+            input=[],
+            tools=[],
+            service_tier="priority",
+        )
+
+        payload = model._compact_payload(request)
+
+        self.assertEqual(payload["service_tier"], "priority")
 
     def test_chatgpt_auth_snapshot_reads_official_auth_json_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2037,6 +2083,33 @@ class CodexCoreTests(unittest.TestCase):
         warning = next(event for event in result.events if event.type == "warning")
         self.assertEqual(warning.payload["message"], LOCAL_COMPACTION_WARNING_MESSAGE)
 
+    def test_manual_compaction_reinjects_initial_context_on_next_turn(self) -> None:
+        model = ScriptedResponsesModel([message("handoff summary"), message("next final")])
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=model,
+        )
+        session._initial_context_recorded = True
+        session.state.append_history(
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first task"}]}
+        )
+
+        session.compact()
+
+        self.assertFalse(session._initial_context_recorded)
+        result = session.run("next task")
+
+        self.assertEqual(result.final_message, "next final")
+        self.assertEqual(result.history[0]["role"], "user")
+        self.assertTrue(result.history[0]["content"][0]["text"].startswith("first task"))
+        roles = [item.get("role") for item in result.history]
+        self.assertIn("developer", roles)
+        self.assertTrue(any(
+            item.get("role") == "user"
+            and item["content"][-1]["text"].startswith("<environment_context>")
+            for item in result.history
+        ))
+
     def test_remote_compaction_uses_compact_endpoint_payload_and_replacement_history(self) -> None:
         real_user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "kept user"}]}
         remote_summary = {
@@ -2080,6 +2153,72 @@ class CodexCoreTests(unittest.TestCase):
         self.assertTrue(completed.payload["remote_compaction"])
         self.assertEqual(completed.payload["compacted_message"], "")
         self.assertFalse(any(event.type == "warning" for event in result.events))
+
+    def test_remote_compaction_trims_trailing_codex_generated_outputs_to_fit_context_window(self) -> None:
+        huge_output = "x" * 20_000
+        history = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "real user"}]},
+            {"type": "function_call", "name": "exec_command", "call_id": "call-1", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call-1", "output": huge_output},
+        ]
+        config = CodexConfig(
+            skip_git_repo_check=True,
+            ephemeral=True,
+            model_context_window=1,
+        )
+
+        trimmed, deleted = trim_remote_compaction_history_to_fit_context_window(history, config)
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual([item["type"] for item in trimmed], ["message", "function_call"])
+        self.assertNotIn(huge_output, json.dumps(trimmed))
+
+    def test_remote_compaction_does_not_trim_real_user_tail_when_request_still_too_large(self) -> None:
+        history = [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "x" * 20_000}]},
+        ]
+        config = CodexConfig(
+            skip_git_repo_check=True,
+            ephemeral=True,
+            model_context_window=1,
+        )
+
+        trimmed, deleted = trim_remote_compaction_history_to_fit_context_window(history, config)
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(trimmed, history)
+
+    def test_remote_compaction_request_trims_large_trailing_tool_output_before_endpoint(self) -> None:
+        huge_output = "x" * 20_000
+        remote_summary = {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": build_compaction_summary_text("remote summary")}],
+        }
+        model = RemoteCompactModel(compact_output=[remote_summary])
+        session = CodexSession(
+            CodexConfig(
+                skip_git_repo_check=True,
+                ephemeral=True,
+                model_context_window=1,
+            ),
+            model_client=model,
+        )
+        session.state.append_history(
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "real user"}]}
+        )
+        session.state.append_history(
+            {"type": "function_call", "name": "exec_command", "call_id": "call-1", "arguments": "{}"}
+        )
+        session.state.append_history(
+            {"type": "function_call_output", "call_id": "call-1", "output": huge_output}
+        )
+
+        session.compact()
+
+        request_body = json.dumps(model.compact_requests[0].input, ensure_ascii=False)
+        self.assertNotIn(huge_output, request_body)
+        self.assertIn('"output": "aborted"', request_body)
 
     def test_remote_compaction_falls_back_to_local_prompt_when_auto_mode_fails(self) -> None:
         model = RemoteCompactModel(compact_output=[], local_responses=[message("local summary")], fail_remote=True)
@@ -2306,14 +2445,16 @@ class CodexCoreTests(unittest.TestCase):
         completed = [event for event in result.events if event.type == "context_compaction.completed"]
         self.assertEqual(completed[0].payload["trigger"], "auto")
         self.assertEqual(completed[0].payload["phase"], "pre_sampling")
-        self.assertTrue(completed[0].payload["initial_context_injected"])
-        self.assertEqual([item["role"] for item in result.history[:3]], ["developer", "user", "user"])
-        self.assertTrue(result.history[1]["content"][-1]["text"].startswith("<environment_context>"))
+        self.assertFalse(completed[0].payload["initial_context_injected"])
+        self.assertEqual(result.history[0]["role"], "user")
+        self.assertTrue(result.history[0]["content"][0]["text"].startswith("Another language model started"))
+        self.assertEqual([item["role"] for item in result.history[1:4]], ["developer", "user", "user"])
+        self.assertTrue(result.history[2]["content"][-1]["text"].startswith("<environment_context>"))
         self.assertTrue(any(
             item.get("role") == "user"
             and item["content"][0]["text"].startswith("Another language model started")
             for item in result.history
-            ))
+        ))
 
     def test_current_first_prompt_does_not_trigger_pre_sampling_compaction_by_itself(self) -> None:
         model = ScriptedResponsesModel([message("final without compact")])
@@ -2376,6 +2517,7 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0].payload["trigger"], "auto")
         self.assertEqual(completed[0].payload["phase"], "mid_turn")
+        self.assertTrue(completed[0].payload["initial_context_injected"])
         started_turn_id = next(event.payload["turn_id"] for event in result.events if event.type == "turn.started")
         self.assertEqual(completed[0].payload["turn_id"], started_turn_id)
 
@@ -2461,7 +2603,7 @@ class CodexCoreTests(unittest.TestCase):
         finally:
             codex_types._MODEL_CATALOG_CACHE = previous_catalog
 
-    def test_persistent_auto_compaction_reconstructs_reference_turn_context(self) -> None:
+    def test_persistent_pre_turn_auto_compaction_clears_reference_turn_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             codex_home = root / "codex-home"
@@ -2485,12 +2627,11 @@ class CodexCoreTests(unittest.TestCase):
             rollout_path = next((codex_home / "sessions").glob(f"????/??/??/rollout-*-{result.thread_id}.jsonl"))
             records = [json.loads(line) for line in rollout_path.read_text(encoding="utf-8").splitlines()]
             compacted_index = next(index for index, record in enumerate(records) if record["type"] == "compacted")
-            reference_turn_context = records[compacted_index + 1]
-            self.assertEqual(reference_turn_context["type"], "turn_context")
+            self.assertNotEqual(records[compacted_index + 1]["type"], "turn_context")
 
             reconstructed = reconstruct_history_from_rollout(rollout_path)
 
-            self.assertEqual(reconstructed.reference_context_item, reference_turn_context["payload"])
+            self.assertIsNotNone(reconstructed.reference_context_item)
             self.assertEqual(reconstructed.previous_turn_settings["model"], CodexConfig().model)
             self.assertTrue(any(
                 item.get("role") == "user"
@@ -4233,6 +4374,54 @@ class CodexCoreTests(unittest.TestCase):
         result = session.run("run a command")
         self.assertEqual(result.final_message, "saw tool output")
         self.assertTrue(any(item.get("type") == "function_call_output" for item in result.history))
+
+    def test_long_running_exec_emits_output_delta_before_completion(self) -> None:
+        command = (
+            f"{shlex.quote(sys.executable)} -u -c "
+            "\"import time; print('stream-start', flush=True); time.sleep(0.2); print('stream-end', flush=True)\""
+        )
+        model = ScriptedResponsesModel(
+            [
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": "call-1",
+                            "arguments": json.dumps({"cmd": command, "yield_time_ms": 1000}),
+                        }
+                    ]
+                },
+                message("done"),
+            ]
+        )
+
+        events = list(
+            CodexSession(
+                CodexConfig(skip_git_repo_check=True, ephemeral=True),
+                model_client=model,
+            ).stream("run a streaming command")
+        )
+
+        delta_indices = [
+            index
+            for index, event in enumerate(events)
+            if event.type == "exec_command.output_delta"
+            and "stream-start" in str(event.payload.get("delta") or "")
+        ]
+        self.assertTrue(delta_indices, [event.type for event in events])
+        started_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.type == "tool.started" and event.payload.get("call_id") == "call-1"
+        )
+        completed_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.type == "tool.completed" and event.payload.get("call_id") == "call-1"
+        )
+        self.assertLess(started_index, delta_indices[0])
+        self.assertLess(delta_indices[0], completed_index)
 
     def test_parallel_tool_calls_dispatch_concurrently_and_drain_in_order(self) -> None:
         class SleepingToolRuntime:
@@ -6878,6 +7067,27 @@ new file mode 100644
         self.assertEqual(_apply_prompt_escape_sequence("abc\ndefgh", 6, b"\x1b[A"), ("abc\ndefgh", 2))
         self.assertEqual(_apply_prompt_escape_sequence("abc\ndefgh", 2, b"\x1b[B"), ("abc\ndefgh", 6))
 
+    def test_prompt_control_keys_support_readline_style_kill_and_yank(self) -> None:
+        from codex.cli import _apply_prompt_control_key
+
+        self.assertEqual(_apply_prompt_control_key("abc", 2, b"\x01", ""), ("abc", 0, ""))
+        self.assertEqual(_apply_prompt_control_key("one\ntwo", 5, b"\x01", ""), ("one\ntwo", 4, ""))
+        self.assertEqual(_apply_prompt_control_key("one\ntwo", 4, b"\x01", ""), ("one\ntwo", 0, ""))
+        self.assertEqual(_apply_prompt_control_key("abc", 2, b"\x05", ""), ("abc", 3, ""))
+        self.assertEqual(_apply_prompt_control_key("one\ntwo", 1, b"\x05", ""), ("one\ntwo", 3, ""))
+        self.assertEqual(_apply_prompt_control_key("one\ntwo", 3, b"\x05", ""), ("one\ntwo", 7, ""))
+        self.assertEqual(_apply_prompt_control_key("abc", 1, b"\x04", ""), ("ac", 1, ""))
+        self.assertEqual(_apply_prompt_control_key("wrong paste", 11, b"\x15", ""), ("", 0, "wrong paste"))
+        self.assertEqual(_apply_prompt_control_key("abc\ndef", 5, b"\x15", ""), ("abc\nef", 4, "d"))
+        self.assertEqual(_apply_prompt_control_key("abc\ndef", 4, b"\x15", ""), ("abcdef", 3, "\n"))
+
+        killed = _apply_prompt_control_key("hello world", 6, b"\x0b", "")
+        self.assertEqual(killed, ("hello ", 6, "world"))
+        assert killed is not None
+        self.assertEqual(_apply_prompt_control_key("hello ", 6, b"\x19", killed[2]), ("hello world", 11, "world"))
+        self.assertEqual(_apply_prompt_control_key("abc\ndef", 1, b"\x0b", ""), ("a\ndef", 1, "bc"))
+        self.assertEqual(_apply_prompt_control_key("abc\ndef", 3, b"\x0b", ""), ("abcdef", 3, "\n"))
+
     def test_slash_palette_filters_and_completes_like_upstream_composer(self) -> None:
         from codex.cli import _AnsiStyle
         from codex.cli import _slash_palette_display_lines
@@ -7033,7 +7243,7 @@ new file mode 100644
                 _AnsiStyle(False),
             )
         )
-        self.assertIn("• Worked for 2m 05s", finished)
+        self.assertIn("✻ Worked for 2m 05s", finished)
         self.assertIn("ctx 12.7K/400K", finished)
         self.assertIn("auth", finished)
         self.assertIn("ChatGPT", finished)
@@ -7058,7 +7268,21 @@ new file mode 100644
                 _AnsiStyle(True),
             )
         )
-        self.assertRegex(colored_finished, r"\x1b\[[0-9;]*2m• Worked for 1s")
+        self.assertRegex(colored_finished, r"\x1b\[[0-9;]*2m✻ Worked for 1s")
+
+    def test_live_status_tracks_background_terminal_waits_like_upstream(self) -> None:
+        from codex.cli import _LiveTurnStatus
+
+        status = _LiveTurnStatus()
+        status.update(
+            codex_types.CodexEvent(
+                "tool.started",
+                {"name": "write_stdin", "arguments": {"session_id": 1, "chars": ""}},
+            )
+        )
+
+        session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True))
+        self.assertEqual(status.snapshot(session).header, "Waiting for background terminal")
 
     def test_command_renderer_hides_unified_exec_metadata_when_no_output(self) -> None:
         from codex.cli import _strip_unified_exec_response_metadata
@@ -7118,6 +7342,244 @@ new file mode 100644
         self.assertIn("  │ PY", rendered)
         self.assertIn("  └ hello from heredoc", rendered)
 
+    def test_cli_human_renderer_matches_upstream_background_terminal_interactions(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "arguments": {"cmd": "python3 -i", "tty": True},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "ok": True,
+                    "metadata": {"session_id": 7, "output": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "arguments": {"session_id": 7, "chars": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "ok": True,
+                    "metadata": {"session_id": 7, "command": "python3 -i", "output": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "write_stdin",
+                    "call_id": "input-1",
+                    "arguments": {"session_id": 7, "chars": "ls\npwd\n"},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "write_stdin",
+                    "call_id": "input-1",
+                    "ok": True,
+                    "metadata": {"session_id": 7, "command": "python3 -i", "output": ""},
+                },
+            )
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn("↳ Interacted with background terminal · python3 -i", rendered)
+        self.assertIn("  └ ls", rendered)
+        self.assertIn("    pwd", rendered)
+        self.assertNotIn("background terminal · 7", rendered)
+
+    def test_cli_human_renderer_streams_exec_output_delta_without_duplicate_completion_output(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "arguments": {"cmd": "printf x"},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "exec_command.output_delta",
+                {"call_id": "cmd-1", "delta": "streamed-output\n", "stream": "stdout"},
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "ok": True,
+                    "metadata": {"command": "printf x", "exit_code": 0, "output": "streamed-output\n"},
+                },
+            )
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn("• Running printf x", rendered)
+        self.assertIn("  └ streamed-output", rendered)
+        self.assertIn("• Ran printf x", rendered)
+        self.assertEqual(rendered.count("streamed-output"), 1)
+
+    def test_cli_human_renderer_hides_running_cells_for_silent_background_command(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "arguments": {"cmd": "sleep 10", "yield_time_ms": 30000},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "ok": True,
+                    "metadata": {"session_id": 7, "command": "sleep 10", "output": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "arguments": {"session_id": 7, "chars": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "ok": True,
+                    "metadata": {
+                        "session_id": 7,
+                        "event_call_id": "cmd-1",
+                        "command": "sleep 10",
+                        "exit_code": 0,
+                        "output": "",
+                    },
+                },
+            )
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn("• Ran sleep 10", rendered)
+        self.assertIn("  └ (no output)", rendered)
+        self.assertNotIn("• Running sleep 10", rendered)
+        self.assertNotIn("Waited for background terminal", rendered)
+
+    def test_cli_human_renderer_streams_background_terminal_wait_output(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "arguments": {"cmd": "python3 -i", "tty": True},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "ok": True,
+                    "metadata": {"session_id": 7, "output": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "arguments": {"session_id": 7, "chars": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "exec_command.output_delta",
+                {"call_id": "cmd-1", "delta": "prompt ready\n", "stream": "stdout"},
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "ok": True,
+                    "metadata": {
+                        "session_id": 7,
+                        "event_call_id": "cmd-1",
+                        "command": "python3 -i",
+                        "output": "prompt ready\n",
+                    },
+                },
+            )
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn("• Waited for background terminal · python3 -i", rendered)
+        self.assertIn("  └ prompt ready", rendered)
+        self.assertEqual(rendered.count("prompt ready"), 1)
+
     def test_resume_transcript_replays_apply_patch_changes_as_file_change(self) -> None:
         from codex.cli import _HumanEventRenderer
         from codex.cli import _render_transcript_event_msg
@@ -7148,6 +7610,44 @@ new file mode 100644
         self.assertIn('    1 +print("bonjour")', rendered)
         self.assertNotIn("patch: completed", rendered)
         self.assertNotIn("Success. Updated the following files", rendered)
+
+    def test_resume_transcript_replays_terminal_interactions_with_command_display(self) -> None:
+        from codex.cli import _HumanEventRenderer
+        from codex.cli import _render_rollout_transcript_records
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        rendered_any = _render_rollout_transcript_records(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "terminal_interaction",
+                        "call_id": "cmd-1",
+                        "process_id": "2",
+                        "stdin": "",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "exec_command_end",
+                        "call_id": "cmd-1",
+                        "process_id": "2",
+                        "command": ["python3 -i"],
+                        "exit_code": 0,
+                        "stdout": "done\n",
+                        "aggregated_output": "done\n",
+                    },
+                },
+            ],
+            renderer,
+        )
+
+        rendered = "\n".join(lines)
+        self.assertTrue(rendered_any)
+        self.assertIn("• Waited for background terminal · python3 -i", rendered)
+        self.assertNotIn("background terminal · 2", rendered)
 
     def test_chat_startup_panel_summarizes_model_auth_and_fallback_without_secret_leaks(self) -> None:
         from codex import cli
@@ -7333,6 +7833,7 @@ new file mode 100644
             env=env,
             interactions=[
                 ("", "run sleep"),
+                ("", "Working"),
                 ("\x1b", "Conversation interrupted"),
                 ("/exit\r", None),
             ],
@@ -7345,7 +7846,7 @@ new file mode 100644
         self.assertIn("session ", plain)
         self.assertNotIn("Ask Codex to do anything", plain)
         self.assertIn("Conversation interrupted", plain)
-        self.assertIn("Running sleep 10", plain)
+        self.assertNotIn("Running sleep 10", plain)
         self.assertNotIn("Chunk ID:", plain)
         self.assertNotIn("Process running with session ID", plain)
 

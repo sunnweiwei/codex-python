@@ -8,7 +8,7 @@ import urllib.request
 
 from collections.abc import Sequence
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -155,7 +155,7 @@ class OpenAIResponsesModel:
         thread_id: str | None = None,
         installation_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        payload = request.to_compact_payload()
+        payload = self._compact_payload(request)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         headers = self._compact_headers(
             session_id=session_id,
@@ -185,6 +185,10 @@ class OpenAIResponsesModel:
         if not isinstance(output, list):
             raise RemoteCompactionError("remote compact response did not include an output list")
         return [_model_dump(item) for item in output]
+
+    def _compact_payload(self, request: PromptRequest) -> dict[str, Any]:
+        # Official Codex omits service_tier on the API-key compact endpoint.
+        return replace(request, service_tier=None).to_compact_payload()
 
     def _compact_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/responses/compact"
@@ -256,7 +260,7 @@ class ChatGPTCodexModel:
         thread_id: str | None = None,
         installation_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        payload = request.to_compact_payload()
+        payload = self._compact_payload(request)
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         headers = self._headers(
             request,
@@ -281,6 +285,9 @@ class ChatGPTCodexModel:
         if not isinstance(output, list):
             raise RemoteCompactionError("remote compact response did not include an output list")
         return [_model_dump(item) for item in output]
+
+    def _compact_payload(self, request: PromptRequest) -> dict[str, Any]:
+        return request.to_compact_payload()
 
     def _stream_via_http(self, request: PromptRequest, *, allow_refresh: bool) -> Iterable[ModelStreamEvent]:
         body_dict = request.to_responses_kwargs()

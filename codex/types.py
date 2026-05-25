@@ -39,6 +39,7 @@ EXEC_LIFECYCLE: tuple[LifecycleStep, ...] = (
     LifecycleStep("model_response", "model.response", "model"),
     LifecycleStep("record_model_item", "item.completed", "item", mutates_history=True),
     LifecycleStep("tool_start", "tool.started", "tool"),
+    LifecycleStep("exec_output_delta", "exec_command.output_delta", "tool"),
     LifecycleStep("tool_complete", "tool.completed", "tool"),
     LifecycleStep("turn_diff", "turn_diff", "turn"),
     LifecycleStep("record_tool_output", "item.completed", "item", mutates_history=True),

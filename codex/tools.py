@@ -184,6 +184,18 @@ class ToolRuntime:
         with self._runtime_event_lock:
             self._runtime_events.append({"type": event_type, "payload": payload})
 
+    def _exec_output_delta_callback(self, call_id: str) -> Callable[[str, str], None]:
+        def emit(text: str, stream: str) -> None:
+            if text:
+                self._record_runtime_event(
+                    "exec_command.output_delta",
+                    call_id=call_id,
+                    delta=text,
+                    stream=stream,
+                )
+
+        return emit
+
     def request_interrupt(self) -> None:
         self._interrupt_event.set()
         interrupt_agents = getattr(self.agent_runtime, "request_interrupt", None)
@@ -377,6 +389,7 @@ class ToolRuntime:
             event_call_id=call_id,
             pty_fd=pty_fd,
             sandbox_metadata=sandboxed.metadata,
+            output_callback=self._exec_output_delta_callback(call_id),
         )
         running.start_readers()
         self._register_active_command(running)
@@ -1059,6 +1072,7 @@ class RunningCommand:
         event_call_id: str,
         pty_fd: int | None = None,
         sandbox_metadata: dict[str, Any] | None = None,
+        output_callback: Callable[[str, str], None] | None = None,
     ):
         self.process = process
         self.command = command
@@ -1067,6 +1081,7 @@ class RunningCommand:
         self.event_call_id = event_call_id
         self.pty_fd = pty_fd
         self.sandbox_metadata = dict(sandbox_metadata or {})
+        self.output_callback = output_callback
         self.last_used = time.monotonic()
         self._lock = threading.Lock()
         self._stdout = _HeadTailTextBuffer()
@@ -1177,8 +1192,11 @@ class RunningCommand:
                 target.append(text)
                 if target is self._stdout:
                     self._all_stdout.append(text)
+                    stream_name = "stdout"
                 else:
                     self._all_stderr.append(text)
+                    stream_name = "stderr"
+            self._record_output_delta(text, stream_name)
 
     def _read_pty(self) -> None:
         assert self.pty_fd is not None
@@ -1212,6 +1230,12 @@ class RunningCommand:
         with self._lock:
             self._stdout.append(text)
             self._all_stdout.append(text)
+        self._record_output_delta(text, "stdout")
+
+    def _record_output_delta(self, text: str, stream: str) -> None:
+        callback = self.output_callback
+        if callback is not None:
+            callback(text, stream)
 
     def _close_pipes(self) -> None:
         for stream in (self.process.stdin, self.process.stdout, self.process.stderr):

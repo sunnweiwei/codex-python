@@ -759,6 +759,7 @@ def _render_resumed_transcript(
 
 def _render_rollout_transcript_records(records: list[dict[str, Any]], renderer: "_HumanEventRenderer") -> bool:
     rendered = False
+    renderer._background_terminal_commands.update(_rollout_background_terminal_commands(records))
     for record in records:
         record_type = record.get("type")
         payload = record.get("payload")
@@ -835,6 +836,14 @@ def _render_transcript_event_msg(payload: dict[str, Any], renderer: "_HumanEvent
             )
         )
         return True
+    if event_type == "terminal_interaction":
+        process_id = str(payload.get("process_id") or "")
+        renderer.render_terminal_interaction(
+            process_id,
+            str(payload.get("stdin") or ""),
+            command=renderer._background_terminal_commands.get(process_id),
+        )
+        return True
     if event_type == "patch_apply_end":
         success = bool(payload.get("success")) or str(payload.get("status") or "") == "completed"
         output = str(payload.get("stdout") if success else payload.get("stderr") or "")
@@ -887,6 +896,25 @@ def _event_msg_command_text(payload: dict[str, Any]) -> str:
     if isinstance(command, str):
         return command
     return ""
+
+
+def _rollout_background_terminal_commands(records: list[dict[str, Any]]) -> dict[str, str]:
+    commands: dict[str, str] = {}
+    for record in records:
+        if record.get("type") != "event_msg":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") not in {"exec_command_begin", "exec_command_end"}:
+            continue
+        process_id = payload.get("process_id")
+        if process_id is None:
+            continue
+        command = _event_msg_command_text(payload)
+        if command:
+            commands[str(process_id)] = _command_display(command)
+    return commands
 
 
 def _duration_seconds_from_payload(raw: Any) -> float:
@@ -1719,6 +1747,10 @@ class _LiveTurnStatus:
                 self._header = "Compacting" if payload.get("compact") else "Working"
             elif event_type == "stream_error":
                 self._header = "Reconnecting"
+            elif event_type == "tool.started" and payload.get("name") == "write_stdin":
+                arguments = payload.get("arguments")
+                args = arguments if isinstance(arguments, dict) else {}
+                self._header = "Waiting for background terminal" if not args.get("chars") else "Working"
             elif event_type in {"tool.started", "tool.completed", "item.completed", "model.response"} and not payload.get("compact"):
                 if self._header in {"Compacting", "Reconnecting"}:
                     self._header = "Working"
@@ -1768,6 +1800,7 @@ class _TurnInputReader:
         self._cursor = 0
         self._pending = b""
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._kill_buffer = ""
         self._rendered_lines = 0
         self._rendered_rows_below_cursor = 0
         self._status_lines: list[str] = []
@@ -1908,6 +1941,12 @@ class _TurnInputReader:
     def _handle_chunk(self, chunk: bytes) -> _TurnInputAction | None:
         if chunk == b"\x03":
             raise KeyboardInterrupt
+        control_update = _apply_prompt_control_key(self._buffer, self._cursor, chunk, self._kill_buffer)
+        if control_update is not None:
+            self._buffer, self._cursor, self._kill_buffer = control_update
+            self._sync_slash_after_edit()
+            self._request_render()
+            return None
         if chunk in {b"\x7f", b"\b"}:
             if self._cursor > 0:
                 self._buffer = self._buffer[: self._cursor - 1] + self._buffer[self._cursor :]
@@ -2114,6 +2153,7 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
 
     buffer = ""
     cursor = 0
+    kill_buffer = ""
     rendered_lines = 0
     rendered_rows_below_cursor = 0
     slash_selection = 0
@@ -2210,6 +2250,14 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
                             render()
                         _clear_prompt_lines(rendered_lines, rows_below_cursor=rendered_rows_below_cursor)
                         return None
+                    control_update = _apply_prompt_control_key(buffer, cursor, chunk, kill_buffer)
+                    if control_update is not None:
+                        buffer, cursor, kill_buffer = control_update
+                        sync_slash_after_edit()
+                        state["dirty"] = True
+                        if not _has_pending_input(fd, pending):
+                            break
+                        continue
                     if chunk in {b"\x7f", b"\b"}:
                         if cursor > 0:
                             buffer = buffer[: cursor - 1] + buffer[cursor:]
@@ -2323,7 +2371,7 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
         return []
     elapsed = _format_elapsed_compact(snapshot.elapsed_seconds)
     if snapshot.finished:
-        parts = [style.dim(f"• {_finished_status_label(snapshot)} {elapsed}")]
+        parts = [style.dim(f"✻ {_finished_status_label(snapshot)} {elapsed}")]
     else:
         parts = [
             f"{style.dim('•')} {style.bold(snapshot.header)} "
@@ -2372,6 +2420,7 @@ def _print_finished_turn_status(
         style,
     )
     if lines:
+        print("", file=sys.stderr)
         print("\n".join(lines), file=sys.stderr, flush=True)
 
 
@@ -2673,6 +2722,49 @@ def _apply_prompt_escape_sequence(buffer: str, cursor: int, sequence: bytes) -> 
         return buffer, _move_cursor_vertical(buffer, cursor, -1)
     if sequence == b"\x1b[B":
         return buffer, _move_cursor_vertical(buffer, cursor, 1)
+    return None
+
+
+def _apply_prompt_control_key(buffer: str, cursor: int, chunk: bytes, kill_buffer: str) -> tuple[str, int, str] | None:
+    cursor = max(0, min(cursor, len(buffer)))
+    if chunk == b"\x01":  # Ctrl+A
+        bol = _line_start_index(buffer, cursor)
+        if cursor == bol and bol > 0:
+            return buffer, _line_start_index(buffer, bol - 1), kill_buffer
+        return buffer, bol, kill_buffer
+    if chunk == b"\x05":  # Ctrl+E
+        eol = _line_end_index(buffer, cursor)
+        if cursor == eol and eol < len(buffer):
+            return buffer, _line_end_index(buffer, cursor + 1), kill_buffer
+        return buffer, eol, kill_buffer
+    if chunk == b"\x04":  # Ctrl+D
+        if cursor >= len(buffer):
+            return buffer, cursor, kill_buffer
+        return buffer[:cursor] + buffer[cursor + 1 :], cursor, kill_buffer
+    if chunk == b"\x0b":  # Ctrl+K
+        eol = _line_end_index(buffer, cursor)
+        if cursor == eol:
+            end = eol + 1 if eol < len(buffer) else eol
+        else:
+            end = eol
+        if end <= cursor:
+            return buffer, cursor, kill_buffer
+        killed = buffer[cursor:end]
+        return buffer[:cursor] + buffer[end:], cursor, killed
+    if chunk == b"\x15":  # Ctrl+U
+        bol = _line_start_index(buffer, cursor)
+        if cursor == bol:
+            start = bol - 1 if bol > 0 else bol
+        else:
+            start = bol
+        if start >= cursor:
+            return buffer, cursor, kill_buffer
+        killed = buffer[start:cursor]
+        return buffer[:start] + buffer[cursor:], start, killed
+    if chunk == b"\x19":  # Ctrl+Y
+        if not kill_buffer:
+            return buffer, cursor, kill_buffer
+        return buffer[:cursor] + kill_buffer + buffer[cursor:], cursor + len(kill_buffer), kill_buffer
     return None
 
 
@@ -4733,6 +4825,14 @@ class _HumanEventRenderer:
     ) -> None:
         self._tool_arguments: dict[str, Any] = {}
         self._exec_calls: dict[str, _ExecDisplayCall] = {}
+        self._background_terminal_commands: dict[str, str] = {}
+        self._background_terminal_call_commands: dict[str, str] = {}
+        self._background_terminal_session_call_ids: dict[str, str] = {}
+        self._active_background_terminal_interactions: dict[str, dict[str, str]] = {}
+        self._rendered_background_terminal_interactions: set[str] = set()
+        self._live_exec_rendered: set[str] = set()
+        self._live_exec_output_seen: set[str] = set()
+        self._live_exec_output_text: dict[str, str] = {}
         self._exploration_calls: list[_ExecDisplayCall] = []
         self._final_message: str = ""
         self._final_message_rendered = False
@@ -4750,6 +4850,8 @@ class _HumanEventRenderer:
             self._render_item(event.payload.get("item"), pending_input=bool(event.payload.get("pending_input")))
         elif event.type == "tool.started":
             self._render_tool_started(event.payload)
+        elif event.type == "exec_command.output_delta":
+            self._render_exec_output_delta(event.payload)
         elif event.type == "tool.completed":
             self._render_tool_completed(event.payload)
         elif event.type == "context_compaction.completed":
@@ -4900,21 +5002,23 @@ class _HumanEventRenderer:
 
         if name in {"exec_command", "shell_command"}:
             command = str(args.get("cmd") or args.get("command") or "")
-            self._exec_calls[call_id] = _ExecDisplayCall(
+            call = _ExecDisplayCall(
                 call_id=call_id,
                 command=command,
                 parsed=parse_command_actions(command),
+                yield_time_ms=_int_value(args.get("yield_time_ms")),
             )
+            self._exec_calls[call_id] = call
         elif name == "write_stdin":
-            self._flush_exploration()
-            self._begin_work_cell()
-            session_id = args.get("session_id")
-            chars = str(args.get("chars") or "")
-            if chars:
-                self._line(f"{self._style.dim('↳')} {self._style.bold('Interacted with background terminal')} {self._style.dim('·')} {self._style.dim(str(session_id))}")
-                self._render_output_block(chars)
-            else:
-                self._line(f"{self._style.dim('•')} {self._style.bold('Waited for background terminal')} {self._style.dim('·')} {self._style.dim(str(session_id))}")
+            session_id = str(args.get("session_id") or "")
+            event_call_id = self._background_terminal_session_call_ids.get(session_id, "")
+            if event_call_id:
+                self._active_background_terminal_interactions[event_call_id] = {
+                    "session_id": session_id,
+                    "stdin": str(args.get("chars") or ""),
+                    "command": self._background_terminal_commands.get(session_id, ""),
+                }
+            return
         elif name == "apply_patch":
             return
         elif name == "web_search":
@@ -4936,7 +5040,7 @@ class _HumanEventRenderer:
         ok = bool(payload.get("ok"))
 
         if name in {"exec_command", "shell_command", "write_stdin"}:
-            self._render_command_completed(call_id, ok, payload, meta)
+            self._render_command_completed(call_id, ok, payload, meta, arguments)
         elif name == "apply_patch":
             self._render_apply_patch_completed(ok, payload, meta, arguments)
         elif name == "update_plan":
@@ -5025,11 +5129,39 @@ class _HumanEventRenderer:
         ok: bool,
         payload: dict[str, Any],
         meta: dict[str, Any],
+        arguments: Any,
     ) -> None:
         if str(payload.get("name") or "") == "write_stdin":
-            output = _visible_command_output(meta, payload)
-            if output.strip():
-                self._render_output_block(output)
+            args = arguments if isinstance(arguments, dict) else {}
+            session_id = str(args.get("session_id") or meta.get("session_id") or "")
+            command = str(meta.get("command") or self._background_terminal_commands.get(session_id) or "")
+            event_call_id = str(
+                meta.get("event_call_id")
+                or self._background_terminal_session_call_ids.get(session_id)
+                or call_id
+            )
+            if ok:
+                output = _visible_command_output(meta, payload)
+                should_render_interaction = bool(str(args.get("chars") or "").strip()) or bool(output.strip())
+                if should_render_interaction and event_call_id not in self._rendered_background_terminal_interactions:
+                    self.render_terminal_interaction(session_id, str(args.get("chars") or ""), command=command)
+                self._render_write_stdin_exec_completion(
+                    call_id,
+                    ok,
+                    payload,
+                    meta,
+                    command=command,
+                    session_id=session_id,
+                )
+            else:
+                self._flush_exploration()
+                self._begin_work_cell()
+                self._line(f"{self._style.bold('write_stdin:')} {self._style.red('failed')}")
+                output = str(payload.get("output") or "")
+                if output.strip():
+                    self._render_output_block(output)
+            self._active_background_terminal_interactions.pop(event_call_id, None)
+            self._rendered_background_terminal_interactions.discard(event_call_id)
             return
         call = self._exec_calls.pop(call_id, None)
         if call is None:
@@ -5037,14 +5169,131 @@ class _HumanEventRenderer:
             call = _ExecDisplayCall(call_id=call_id, command=command, parsed=parse_command_actions(command))
         exit_code = meta.get("exit_code")
         exit_value = _int_value(exit_code)
-        call.output = _visible_command_output(meta, payload)
+        session_id = meta.get("session_id")
+        if session_id is not None and exit_value is None and call.command:
+            self._background_terminal_commands[str(session_id)] = _command_display(call.command)
+            self._background_terminal_call_commands[call_id] = _command_display(call.command)
+            self._background_terminal_session_call_ids[str(session_id)] = call_id
+        live_output_seen = call_id in self._live_exec_output_seen
+        output = _visible_command_output(meta, payload)
+        call.output = self._remaining_live_exec_output(call_id, output) if live_output_seen else output
         call.exit_code = exit_value
         call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
-        if exit_value is not None and call.is_exploration:
+        if exit_value is None and not live_output_seen and not call.output.strip():
+            self._clear_live_exec(call_id)
+            return
+        if live_output_seen and exit_value is None:
+            if call.output.strip():
+                self._render_output_delta_block(call.output, first=False)
+            self._clear_live_exec(call_id)
+            return
+        if exit_value is not None and call.is_exploration and not live_output_seen:
             self._exploration_calls.append(call)
+            self._clear_live_exec(call_id)
             return
         self._flush_exploration()
-        self._render_exec_call(call, running=exit_value is None, ok=ok)
+        self._render_exec_call(
+            call,
+            running=exit_value is None,
+            ok=ok,
+            suppress_empty_output=live_output_seen,
+        )
+        if exit_value is not None:
+            self._background_terminal_call_commands.pop(call_id, None)
+        self._clear_live_exec(call_id)
+
+    def _render_exec_output_delta(self, payload: dict[str, Any]) -> None:
+        call_id = str(payload.get("call_id") or "")
+        delta = str(payload.get("delta") or "")
+        if not call_id or not delta:
+            return
+        interaction = self._active_background_terminal_interactions.get(call_id)
+        call = self._exec_calls.get(call_id)
+        if interaction is None and call is not None and call.is_exploration:
+            return
+        if (
+            interaction is None
+            and call is not None
+            and call.yield_time_ms is not None
+            and call.yield_time_ms < 1000
+            and call_id not in self._live_exec_rendered
+        ):
+            return
+        first_output = call_id not in self._live_exec_output_seen
+        if call_id not in self._live_exec_rendered:
+            if interaction is not None:
+                self.render_terminal_interaction(
+                    interaction.get("session_id", ""),
+                    interaction.get("stdin", ""),
+                    command=interaction.get("command", ""),
+                )
+                self._rendered_background_terminal_interactions.add(call_id)
+            else:
+                if call is None:
+                    command = self._background_terminal_call_commands.get(call_id, "")
+                    call = _ExecDisplayCall(call_id=call_id, command=command, parsed=parse_command_actions(command))
+                self._flush_exploration()
+                self._render_exec_call(call, running=True, ok=True, suppress_empty_output=True)
+            self._live_exec_rendered.add(call_id)
+        self._live_exec_output_seen.add(call_id)
+        self._live_exec_output_text[call_id] = self._live_exec_output_text.get(call_id, "") + delta
+        self._render_output_delta_block(delta, first=first_output)
+
+    def render_terminal_interaction(self, session_id: str, stdin: str, *, command: str | None = None) -> None:
+        self._flush_exploration()
+        self._begin_work_cell()
+        command_display = command or self._background_terminal_commands.get(str(session_id), "")
+        suffix = f" {self._style.dim('·')} {self._style.dim(command_display)}" if command_display else ""
+        if not stdin:
+            self._line(f"{self._style.dim('•')} {self._style.bold('Waited for background terminal')}{suffix}")
+            return
+        self._line(f"{self._style.dim('↳')} {self._style.bold('Interacted with background terminal')}{suffix}")
+        input_lines = stdin.rstrip("\n").splitlines()
+        if input_lines:
+            self._emit_prefixed_lines(
+                input_lines,
+                first_prefix=self._style.dim("  └ "),
+                rest_prefix=self._style.dim("    "),
+            )
+
+    def _render_write_stdin_exec_completion(
+        self,
+        call_id: str,
+        ok: bool,
+        payload: dict[str, Any],
+        meta: dict[str, Any],
+        *,
+        command: str,
+        session_id: str,
+    ) -> None:
+        exit_value = _int_value(meta.get("exit_code"))
+        output = _visible_command_output(meta, payload)
+        if exit_value is None:
+            event_call_id = str(meta.get("event_call_id") or call_id)
+            if output.strip() and event_call_id not in self._live_exec_output_seen:
+                self._render_output_block(output)
+            return
+        if session_id:
+            self._background_terminal_commands.pop(session_id, None)
+            self._background_terminal_session_call_ids.pop(session_id, None)
+        event_call_id = str(meta.get("event_call_id") or call_id)
+        call = _ExecDisplayCall(
+            call_id=event_call_id,
+            command=command,
+            parsed=parse_command_actions(command),
+        )
+        live_output_seen = event_call_id in self._live_exec_output_seen
+        call.output = self._remaining_live_exec_output(event_call_id, output) if live_output_seen else output
+        call.exit_code = exit_value
+        call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
+        self._render_exec_call(
+            call,
+            running=False,
+            ok=ok and exit_value == 0,
+            suppress_empty_output=live_output_seen,
+        )
+        self._background_terminal_call_commands.pop(event_call_id, None)
+        self._clear_live_exec(event_call_id)
 
     def _render_apply_patch_completed(
         self,
@@ -5113,7 +5362,14 @@ class _HumanEventRenderer:
                 rendered = self._style.red(rendered)
             self._emit_prefixed_lines([rendered], first_prefix="", rest_prefix="      ")
 
-    def _render_exec_call(self, call: "_ExecDisplayCall", *, running: bool, ok: bool) -> None:
+    def _render_exec_call(
+        self,
+        call: "_ExecDisplayCall",
+        *,
+        running: bool,
+        ok: bool,
+        suppress_empty_output: bool = False,
+    ) -> None:
         self._begin_work_cell()
         command_lines = _command_display_lines(call.command, self._style)
         if running:
@@ -5135,7 +5391,7 @@ class _HumanEventRenderer:
         )
         if call.output.strip():
             self._render_output_block(call.output)
-        elif not running:
+        elif not running and not suppress_empty_output:
             self._emit_prefixed_lines(
                 [self._style.dim("(no output)")],
                 first_prefix=self._style.dim("  └ "),
@@ -5207,6 +5463,34 @@ class _HumanEventRenderer:
                 rest_prefix=self._style.dim("    "),
                 transform=self._style.dim,
             )
+
+    def _render_output_delta_block(self, output: str, *, first: bool) -> None:
+        lines = output.rstrip("\n").splitlines()
+        if not lines:
+            return
+        self._emit_prefixed_lines(
+            lines,
+            first_prefix=self._style.dim("  └ " if first else "    "),
+            rest_prefix=self._style.dim("    "),
+            transform=self._style.dim,
+        )
+
+    def _remaining_live_exec_output(self, call_id: str, output: str) -> str:
+        if not output:
+            return ""
+        rendered = self._live_exec_output_text.get(call_id, "")
+        if not rendered:
+            return output
+        if output.startswith(rendered):
+            return output[len(rendered):]
+        if output.strip() in rendered.strip():
+            return ""
+        return output
+
+    def _clear_live_exec(self, call_id: str) -> None:
+        self._live_exec_rendered.discard(call_id)
+        self._live_exec_output_seen.discard(call_id)
+        self._live_exec_output_text.pop(call_id, None)
 
     def _render_plan(self, meta: dict[str, Any]) -> None:
         self._line(f"{self._style.dim('•')} {self._style.bold('Updated Plan')}")
@@ -5419,6 +5703,7 @@ class _ExecDisplayCall:
     call_id: str
     command: str
     parsed: list[dict[str, Any]]
+    yield_time_ms: int | None = None
     output: str = ""
     exit_code: int | None = None
     duration_ms: int | None = None

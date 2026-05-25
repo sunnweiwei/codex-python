@@ -667,7 +667,7 @@
       },
       "compaction": {
         "default_behavior": "triggered by context/manual/remote compaction paths",
-        "status_in_python": "partial_manual_and_configured_auto_runtime",
+        "status_in_python": "partial_local_prompt_and_remote_v1_default_runtime_v2_marked_feature_gated",
         "prompt_assets": [
           "codex-rs/core/templates/compact/prompt.md",
           "codex-rs/core/templates/compact/summary_prefix.md"

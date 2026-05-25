@@ -8,7 +8,7 @@ import time
 from collections.abc import Iterator
 from collections import deque
 from copy import deepcopy
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +19,7 @@ from .memory import MemoryBackgroundTask, MemoryStateStore, MemoryStartupResult,
 from .memory import run_memory_startup_pipeline_once, start_memory_startup_task
 from .model import ModelClient, ModelStreamEvent, default_model_client, model_response_to_stream_events
 from .prompts import build_base_instructions, build_initial_context_items
-from .state import CodexState, extract_proposed_plan_text, parse_memory_citation, prepare_prompt_history, reconstruct_history_from_rollout, strip_memory_citations, strip_proposed_plan_blocks, summarization_prompt
+from .state import CodexState, extract_proposed_plan_text, parse_memory_citation, prepare_prompt_history, reconstruct_history_from_rollout, strip_memory_citations, strip_proposed_plan_blocks, summarization_prompt, trim_remote_compaction_history_to_fit_context_window
 from .tools import ToolRuntime, _load_image_for_prompt
 from .tools import ToolResult
 from .types import CodexConfig, CodexEvent, CodexResult, PromptRequest
@@ -315,7 +315,7 @@ class CodexSession:
                 self._end_active_turn()
             return True
 
-        should_inject_initial_context = trigger == "auto" if inject_initial_context is None else inject_initial_context
+        should_inject_initial_context = phase == "mid_turn" if inject_initial_context is None else inject_initial_context
         initial_context = build_initial_context_items(self.config, cwd=cwd) if should_inject_initial_context else []
         summary_suffix = ""
         implementation = "responses"
@@ -380,8 +380,7 @@ class CodexSession:
 
         self.state.recompute_token_usage_from_history()
         self.state.start_new_context_epoch(pre_compact_session_tokens, estimated=pre_compact_session_estimated)
-        if initial_context:
-            self._initial_context_recorded = True
+        self._initial_context_recorded = bool(initial_context)
         completed_payload: dict[str, Any] = {
             "summary": summary_suffix,
             "trigger": trigger,
@@ -467,6 +466,10 @@ class CodexSession:
         cwd: Path,
     ) -> PromptRequest:
         reasoning = compact_config.resolved_reasoning()
+        compact_history, _deleted_items = trim_remote_compaction_history_to_fit_context_window(
+            self.state.history,
+            compact_config,
+        )
         return PromptRequest(
             model=compact_model,
             instructions=build_base_instructions(
@@ -479,7 +482,7 @@ class CodexSession:
                 memory_tool_enabled=compact_config.memory_tool_enabled,
                 use_memories=compact_config.use_memories,
             ),
-            input=prepare_prompt_history(self.state.history, compact_config),
+            input=prepare_prompt_history(compact_history, compact_config),
             tools=self.tools.specs(),
             parallel_tool_calls=compact_config.resolved_parallel_tool_calls(),
             prompt_cache_key=self.state.thread_id,
@@ -560,6 +563,7 @@ class CodexSession:
                         trigger="auto",
                         reason="context_limit",
                         phase="pre_sampling",
+                        inject_initial_context=False,
                     )
                     if compact_aborted:
                         return
@@ -596,6 +600,7 @@ class CodexSession:
                             trigger="auto",
                             reason="context_limit",
                             phase="mid_turn",
+                            inject_initial_context=True,
                         )
                         if compact_aborted:
                             return
@@ -892,8 +897,8 @@ class CodexSession:
                 ]
                 for call, future in zip(calls, futures):
                     self._check_interrupted()
-                    result = future.result()
-                    yield from self._drain_tool_runtime_events()
+                    result = yield from self._await_tool_future(future)
+                    yield from self._drain_tool_runtime_events(include_output_delta=False)
                     yield from self._record_tool_result(call, result)
 
         for call in tool_calls:
@@ -947,13 +952,27 @@ class CodexSession:
                 call_id=call["call_id"],
                 arguments=call["arguments"],
             )
-            result = self.tools.dispatch(call["name"], call["arguments"], call_id=call["call_id"])
-            yield from self._drain_tool_runtime_events()
+            result = yield from self._dispatch_tool_call_with_runtime_events(call)
+            yield from self._drain_tool_runtime_events(include_output_delta=False)
             self._check_interrupted()
             yield from self._record_tool_result(call, result)
         yield from flush_parallel()
 
-    def _drain_tool_runtime_events(self) -> Iterator[CodexEvent]:
+    def _dispatch_tool_call_with_runtime_events(self, call: dict[str, Any]) -> Iterator[CodexEvent | ToolResult]:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self.tools.dispatch, call["name"], call["arguments"], call_id=call["call_id"])
+            result = yield from self._await_tool_future(future)
+        return result
+
+    def _await_tool_future(self, future: Any) -> Iterator[CodexEvent | ToolResult]:
+        while True:
+            try:
+                return future.result(timeout=0.03)
+            except FutureTimeoutError:
+                yield from self._drain_tool_runtime_events(include_output_delta=True)
+                self._check_interrupted()
+
+    def _drain_tool_runtime_events(self, *, include_output_delta: bool = True) -> Iterator[CodexEvent]:
         drain = getattr(self.tools, "drain_runtime_events", None)
         if not callable(drain):
             return
@@ -963,6 +982,8 @@ class CodexSession:
             event_type = event.get("type")
             payload = event.get("payload", {})
             if not isinstance(event_type, str) or not isinstance(payload, dict):
+                continue
+            if not include_output_delta and event_type == "exec_command.output_delta":
                 continue
             yield self.state.emit(event_type, **payload)
 

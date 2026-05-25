@@ -360,6 +360,9 @@ class CodexState:
                 self.previous_turn_settings = _previous_turn_settings(turn_context)
                 self.reference_context_item = dict(turn_context)
                 records.append(_rollout_line("turn_context", turn_context))
+            else:
+                self.previous_turn_settings = None
+                self.reference_context_item = None
             records.append(_rollout_line("event_msg", {"type": "context_compacted"}))
             return records
         return records
@@ -715,6 +718,27 @@ def prepare_prompt_history(history: list[dict[str, Any]], config: CodexConfig) -
     return items
 
 
+def trim_remote_compaction_history_to_fit_context_window(
+    history: list[dict[str, Any]],
+    config: CodexConfig,
+) -> tuple[list[dict[str, Any]], int]:
+    context_window = config.resolved_model_context_window()
+    trimmed = [deepcopy(item) for item in history]
+    deleted_items = 0
+    if context_window is None:
+        return trimmed, deleted_items
+
+    while (
+        trimmed
+        and _estimate_token_count_with_base_instructions(trimmed, config) > context_window
+    ):
+        if not _is_remote_compaction_trim_item(trimmed[-1]):
+            break
+        trimmed.pop()
+        deleted_items += 1
+    return trimmed, deleted_items
+
+
 def _is_api_message(item: dict[str, Any]) -> bool:
     if item.get("type") == "message":
         return item.get("role") != "system"
@@ -976,6 +1000,16 @@ def _is_model_generated_item(item: dict[str, Any]) -> bool:
         "local_shell_call",
         "compaction",
         "context_compaction",
+    }
+
+
+def _is_remote_compaction_trim_item(item: dict[str, Any]) -> bool:
+    if item.get("type") == "message":
+        return item.get("role") == "developer"
+    return item.get("type") in {
+        "function_call_output",
+        "tool_search_output",
+        "custom_tool_call_output",
     }
 
 
