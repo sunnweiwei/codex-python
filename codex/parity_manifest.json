@@ -564,6 +564,53 @@
         },
         "next_gate": "Useful exec args, aliases, JSON events, non-JSON stderr progress rendering, color auto/always/never, cell spacing, active CJK-aware wrapping with continuation indentation, ANSI-safe wrapping for colored long lines, full-cell agent message indentation, work-before-answer separators, lightweight Markdown human rendering with upstream-style boxed/wrapped table rendering, markdown-fence table unwrapping, fenced-code syntax highlighting with upstream-style info-token extraction and [tui].theme//theme support, indented reasoning/thinking cells, upstream-style plan-update/web-search/request-user-input history cells, upstream-style apply_patch file-change blocks, final-message stream deduplication, a partial upstream TUI-style ExecCell renderer for Ran/Explored/Read/List/Search with command continuation gutters and middle output truncation, normalized trace summaries, last-message output, output schema, image attachments, config.toml profile loading, dotted -c overrides, local rollout resume/fork, top-level resume/fork chat entrypoints with raw-TTY picker controls and main-help visibility, bounded large-list resume picker viewport, transcript replay after resume/fork, OSS provider CLI/config selection, bracketed-paste-aware multiline interactive input, basic cursor editing, bottom-anchored live Working/Compacting status rows with elapsed time, API-backed context token display, logical session-context carryover across compactions, and cumulative API-backed session reasoning token usage, running-turn pending input submission, local request_user_input prompting with arrow-key option selection and Other freeform notes, an upstream-derived slash-command catalog that prevents known/unknown commands from leaking to the model, local /status, /rollout, /resume, /fork, /theme, /new, /clear, /goal, /ps, and /stop, upstream-style /compact result rendering plus queued /compact dispatch after an active turn, /plan and /default interactive mode switching including /plan <prompt> inline submission, prompt erase-on-submit to avoid duplicate user-message echo, and a partial Esc interrupt path for local model/tool work are covered. The earlier Python curses full-screen experiment is removed from the default path because it was not an upstream-equivalent port of the ratatui product surface. Remaining CLI gaps are the real ratatui-style interactive shell: exact layout/colors, exact status row shimmer/details/timer scheduling, Shift+Tab mode cycling, full composer editing/keybindings/history search/paste placeholders/attachments, active transcript rewriting, approval overlays, full implementation of popup-backed slash commands (/model, /permissions, /mcp, /apps, /plugins, /agent, /side, /pets, etc.), exact ratatui /goal popup/replace-confirm visuals, exact ratatui resume/fork picker colors/expanded transcript preview/app-server thread names, exact request_user_input overlay/replay UI including unanswered-confirmation and notes layout parity, complete model-transport cancellation parity, a full port of codex-rs/shell-command parse_command.rs, full upstream config surface/permission profiles, local OSS provider transport/readiness, upstream exit-code edge cases, and automated official Codex oracle runs for trace comparison."
       },
+      "remote_control": {
+        "status": "partial",
+        "owner_files": [
+          "agents/codex/remote_control.py",
+          "agents/codex/cli.py",
+          "tests/test_codex_remote_control.py"
+        ],
+        "upstream_refs": [
+          "latest codex-rs/cli/src/remote_control_cmd.rs",
+          "latest codex-rs/app-server/src/request_processors/remote_control_processor.rs",
+          "latest codex-rs/app-server-transport/src/transport/remote_control/protocol.rs",
+          "latest codex-rs/app-server-transport/src/transport/remote_control/enroll.rs",
+          "latest codex-rs/app-server-transport/src/transport/remote_control/websocket.rs",
+          "latest codex-rs/app-server-transport/src/transport/remote_control/segment.rs",
+          "latest codex-rs/app-server-transport/src/transport/remote_control/client_tracker.rs"
+        ],
+        "gates": {
+          "latest_upstream_fetch": "passed",
+          "cli_entrypoint": "passed_static",
+          "native_python_runtime": "passed_static",
+          "url_normalization": "passed_static",
+          "status_human_json_output": "passed_static",
+          "wire_envelopes": "passed_static",
+          "client_message_chunk_reassembly": "passed_static",
+          "server_message_chunking": "passed_static",
+          "ack_outbound_buffer": "passed_static",
+          "reconnect_buffer_replay": "passed_static",
+          "common_mobile_bootstrap_methods": "passed_static",
+          "thread_goal_methods": "passed_static",
+          "native_app_server_thread_protocol": "passed_static",
+          "thread_fork_name_metadata_inject_compact_methods": "passed_static",
+          "thread_rollback_shell_command_methods": "passed_static",
+          "filesystem_utility_methods": "passed_static",
+          "auth_status_git_diff_fuzzy_search_methods": "passed_static",
+          "account_login_logout_helpers": "passed_static",
+          "buffered_command_exec": "passed_static",
+          "streaming_command_exec_write_terminate": "passed_static",
+          "process_spawn_write_kill_resize": "passed_static",
+          "server_request_user_input_and_approval_roundtrip": "passed_static",
+          "empty_plugin_mcp_config_bootstrap_stubs": "passed_static",
+          "native_remote_websocket_relay": "partial",
+          "official_daemon_delegation": "not_applicable",
+          "mobile_chatgpt_live_smoke": "missing",
+          "tests": "passed"
+        },
+        "next_gate": "Python now has an official-shaped remote-control protocol module and top-level `remote-control [start|stop]` command that does not require an installed official Codex binary. The native path includes enrollment, websocket connection, segmented client message reassembly, segmented server responses, ack-based outbound buffering, reconnect replay, common mobile bootstrap methods, server-request response routing for request_user_input and approval prompts, thread list/start/resume/fork/read/name/metadata/inject/compact/rollback/shellCommand, thread goal get/set/clear, turn start/steer/interrupt, filesystem utility methods, fuzzy file search, git diff, auth status, account login/logout helpers, empty plugin/marketplace/MCP/config bootstrap stubs, buffered command execution, streaming command/exec stdin/stdout/terminate/resize, and experimental process/spawn stdin/stdout/kill/resize notifications. Remaining gaps are exact full app-server method coverage, real plugin/app/MCP backends, realtime/audio families, true PTY parity for every command path, and live mobile smoke coverage."
+      },
       "mcp_plugins": {
         "status": "missing",
         "owner_files": [
@@ -691,14 +738,18 @@
       "mcp_and_plugins": {
         "default_behavior": "config/runtime dependent",
         "status_in_python": "missing"
+      },
+      "remote_control": {
+        "default_behavior": "experimental app-server daemon path, enabled by explicit `codex remote-control` command",
+        "status_in_python": "partial_native_python_relay_and_app_server"
       }
     }
   },
   "latest_upstream": {
     "repository": "https://github.com/openai/codex",
-    "local_path": "/private/tmp/openai-codex-latest",
-    "commit": "7d47056ea42636271ac020b86347fbbef49490aa",
-    "commit_subject": "fix: plugin bundle archive handling for upload and install (#23983)",
+    "local_path": "agents/codex/upstream/openai-codex-latest",
+    "commit": "9f42c89c0112771dc29100a6f3fc904049b2655f",
+    "commit_subject": "feat(doctor): add environment diagnostics (#24261)",
     "goal_source_refs": [
       "codex-rs/core/src/goals.rs",
       "codex-rs/core/src/tools/handlers/goal_spec.rs",
@@ -710,6 +761,15 @@
       "codex-rs/tui/src/chatwidget/goal_menu.rs",
       "codex-rs/tui/src/goal_display.rs",
       "codex-rs/core/templates/goals"
+    ],
+    "remote_control_source_refs": [
+      "codex-rs/cli/src/remote_control_cmd.rs",
+      "codex-rs/app-server/src/request_processors/remote_control_processor.rs",
+      "codex-rs/app-server-transport/src/transport/remote_control/protocol.rs",
+      "codex-rs/app-server-transport/src/transport/remote_control/enroll.rs",
+      "codex-rs/app-server-transport/src/transport/remote_control/websocket.rs",
+      "codex-rs/app-server-transport/src/transport/remote_control/segment.rs",
+      "codex-rs/app-server-transport/src/transport/remote_control/client_tracker.rs"
     ]
   },
   "python_current": {
@@ -724,6 +784,7 @@
       "state.py": "in-memory history plus upstream-shaped rollout JSONL scaffold",
       "prompts.py": "copied prompt assets, simplified base instruction assembly, and Memory read/write prompt builders",
       "types.py": "config, lifecycle, event, result, and prompt request dataclasses",
+      "remote_control.py": "native Python remote-control protocol constants, URL/status/envelope helpers, enrollment/websocket connection, segmented transport, ack/reconnect buffering, daemon management, server-request response routing, and partial app-server JSON-RPC bridge with thread/turn, goal, auth/bootstrap, filesystem, search, git diff, empty plugin/MCP/config bootstrap stubs, buffered command-exec, and basic streaming command-exec methods",
       "parity.py": "local parity framework checks plus official codex CLI oracle helper"
     },
     "tool_status": {

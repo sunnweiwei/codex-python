@@ -165,6 +165,19 @@ class CodexConfig:
     input_images: tuple[Path | str, ...] = ()
     provider_is_azure_responses_endpoint: bool = False
     remote_compaction: RemoteCompactionMode = field(default_factory=lambda: _default_remote_compaction_mode())
+    # Reference-port divergence from official Codex. After the normal compaction
+    # runs, this REPLACES the recent-user-message prefix with one coherent,
+    # aggressively-truncated "recent activity" block (recent user turns +
+    # assistant prose + tool calls + program outputs) built from the
+    # pre-compaction history, capped at this many tokens; long content is
+    # offloaded to files under `recent_context_offload_dir` with an inline note so
+    # the model can read the full original back. `None` = auto: on (10k) for
+    # persistent sessions, off for ephemeral ones; set 0 for behavior identical to
+    # official Codex; negative = ~10% of the context window. See PARITY_AUDIT.md.
+    recent_context_offload_tokens: int | None = field(default_factory=lambda: _default_recent_context_offload_tokens())
+    recent_context_offload_dir: Path | str | None = None
+    terminal_resize_reflow_enabled: bool = True
+    terminal_resize_reflow_max_rows: int | None = None
     current_date: str | None = None
     timezone: str | None = None
     use_responses_api: bool = True
@@ -277,6 +290,25 @@ class CodexConfig:
         if config_limit is None:
             return context_limit
         return min(config_limit, context_limit)
+
+    def resolved_recent_context_offload_tokens(self) -> int:
+        """Token budget for the divergent post-compaction recent-activity block.
+
+        `None` (the default) means "auto": on (RECENT_CONTEXT_OFFLOAD_DEFAULT_TOKENS)
+        for persistent sessions, off for ephemeral/throwaway sessions. A negative
+        value derives ~10% of the context window (mirroring the 90% auto-compact
+        threshold's buffer). 0 disables the feature (official-reference-identical
+        behavior).
+        """
+        configured = self.recent_context_offload_tokens
+        if configured is None:
+            return 0 if self.ephemeral else RECENT_CONTEXT_OFFLOAD_DEFAULT_TOKENS
+        if configured < 0:
+            window = self.resolved_model_context_window()
+            if window is None:
+                return 0
+            return window // 10
+        return max(0, configured)
 
 
 @dataclass(frozen=True)
@@ -400,6 +432,20 @@ def _default_auth_mode() -> AuthModeSelection:
     if value in {"api", "apikey"}:
         return "api_key"
     return "auto"
+
+
+RECENT_CONTEXT_OFFLOAD_DEFAULT_TOKENS = 10_000
+
+
+def _default_recent_context_offload_tokens() -> int | None:
+    # None = "auto" (resolved per-session: on for persistent, off for ephemeral).
+    raw = os.environ.get("PY_CODEX_RECENT_CONTEXT_OFFLOAD_TOKENS")
+    if raw is None:
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
 
 
 def _default_remote_compaction_mode() -> RemoteCompactionMode:

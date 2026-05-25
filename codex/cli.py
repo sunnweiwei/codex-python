@@ -35,6 +35,7 @@ from . import types as _types
 
 
 _CLI_SYNTAX_THEME = os.environ.get("PY_CODEX_SYNTAX_THEME", "monokai")
+_UPSTREAM_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS = 1000
 
 
 def _set_raw_keep_opost(fd: int) -> None:
@@ -114,6 +115,12 @@ def _main(argv: list[str] | None = None) -> int:
     login_parser.add_argument("--no-open-browser", action="store_true", help="print the login URL instead of opening a browser")
     login_parser.add_argument("--experimental_issuer", help=argparse.SUPPRESS)
     login_parser.add_argument("--experimental_client-id", dest="experimental_client_id", help=argparse.SUPPRESS)
+    remote_control_parser = subparsers.add_parser(
+        "remote-control",
+        help="[experimental] manage the app-server daemon with remote control enabled",
+    )
+    remote_control_parser.add_argument("--json", action="store_true", dest="remote_control_json")
+    remote_control_parser.add_argument("remote_control_command", nargs="?", choices=["start", "stop"])
     exec_parser = subparsers.add_parser("exec")
     exec_parser.add_argument("prompt", nargs="?")
     _add_exec_options(exec_parser)
@@ -147,6 +154,9 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "login":
         return _main_login(args)
 
+    if args.command == "remote-control":
+        return _main_remote_control(args)
+
     if args.command != "exec":
         parser.print_help(sys.stderr)
         return 2
@@ -167,9 +177,25 @@ def _main(argv: list[str] | None = None) -> int:
 def _should_route_to_chat(raw_argv: list[str]) -> bool:
     if not raw_argv:
         return True
-    if raw_argv[0] in {"-h", "--help", "exec", "parity", "resume", "fork", "login"}:
+    if raw_argv[0] in {"-h", "--help", "exec", "parity", "resume", "fork", "login", "remote-control"}:
         return False
     return True
+
+
+def _main_remote_control(args: argparse.Namespace) -> int:
+    from .remote_control import run_native_remote_control
+
+    config = CodexConfig(
+        cwd=Path.cwd(),
+        codex_home=_default_codex_home(),
+        skip_git_repo_check=True,
+        session_source="cli",
+    )
+    return run_native_remote_control(
+        getattr(args, "remote_control_command", None),
+        json_output=bool(getattr(args, "remote_control_json", False)),
+        codex_config=config,
+    )
 
 
 def _main_login(args: argparse.Namespace) -> int:
@@ -509,6 +535,8 @@ def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
         output_schema=output_schema,
         input_images=tuple(Path(path) for path in _parse_image_args(args.images)),
         remote_compaction=_remote_compaction_config(cli_config),
+        terminal_resize_reflow_enabled=_bool_nested_config(cli_config, ("features", "terminal_resize_reflow"), True),
+        terminal_resize_reflow_max_rows=_terminal_resize_reflow_max_rows_config(cli_config),
     )
     return config
 
@@ -735,7 +763,8 @@ def _render_resumed_transcript(
     source_path: Path | None = None,
     color_mode: str = "auto",
 ) -> bool:
-    renderer = _HumanEventRenderer(color_mode=color_mode)
+    lines: list[Any] = []
+    renderer = _HumanEventRenderer(color_mode=color_mode, line_sink=lines.append)
     rendered = False
     records: list[dict[str, Any]] = []
     if source_path is not None:
@@ -754,7 +783,39 @@ def _render_resumed_transcript(
         rendered = _render_history_transcript_items(session.state.history, renderer)
     if rendered:
         renderer._flush_exploration()
+        _emit_resumed_transcript_lines(
+            _retain_initial_history_replay_lines(
+                lines,
+                max_rows=_initial_history_replay_max_rows(session.config),
+            )
+        )
     return rendered
+
+
+def _initial_history_replay_max_rows(config: CodexConfig) -> int | None:
+    if not config.terminal_resize_reflow_enabled:
+        return None
+    max_rows = config.terminal_resize_reflow_max_rows
+    if max_rows == 0:
+        return None
+    if isinstance(max_rows, int) and max_rows > 0:
+        return max_rows
+    return _UPSTREAM_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS
+
+
+def _retain_initial_history_replay_lines(lines: list[Any], *, max_rows: int | None) -> list[Any]:
+    if max_rows is None or max_rows <= 0 or len(lines) <= max_rows:
+        return list(lines)
+    return list(lines[-max_rows:])
+
+
+def _emit_resumed_transcript_lines(lines: list[Any]) -> None:
+    for line in lines:
+        if isinstance(line, _ConsoleWrite):
+            sys.stderr.write(line.text)
+            sys.stderr.flush()
+        else:
+            print(str(line), file=sys.stderr, flush=True)
 
 
 def _render_rollout_transcript_records(records: list[dict[str, Any]], renderer: "_HumanEventRenderer") -> bool:
@@ -4808,7 +4869,7 @@ def _print_chat_help() -> None:
     print(
         "Commands implemented locally: "
         f"{local}\n"
-        "Unsupported upstream commands are hidden from the chat menu until their Python CLI behavior is implemented.",
+        "Unsupported reference commands are hidden from the chat menu until their Python CLI behavior is implemented.",
         file=sys.stderr,
         flush=True,
     )
@@ -4850,6 +4911,7 @@ class _HumanEventRenderer:
         status_tracker: _LiveTurnStatus | None = None,
     ) -> None:
         self._tool_arguments: dict[str, Any] = {}
+        self._agent_nicknames: dict[str, str] = {}
         self._exec_calls: dict[str, _ExecDisplayCall] = {}
         self._background_terminal_commands: dict[str, str] = {}
         self._background_terminal_call_commands: dict[str, str] = {}
@@ -5053,10 +5115,12 @@ class _HumanEventRenderer:
             self._begin_work_cell()
             query = str(args.get("query") or "")
             self._render_web_search_cell(query, completed=False)
-        elif name in {"spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent"}:
-            self._flush_exploration()
-            self._begin_work_cell()
-            self._line(f"{self._style.bold('agent tool:')} {name}")
+        elif name == "wait_agent":
+            self._render_collab_waiting_begin(args)
+        elif name == "resume_agent":
+            self._render_collab_resume_begin(args)
+        # spawn_agent / send_input / close_agent render nothing while in progress,
+        # matching upstream (multi_agents.rs returns None for the InProgress status).
 
     def _render_tool_completed(self, payload: dict[str, Any]) -> None:
         name = str(payload.get("name") or "")
@@ -5088,14 +5152,16 @@ class _HumanEventRenderer:
                     if ok
                     else f"{self._style.bold('request user input:')} {self._style.red('failed')}"
                 )
-        elif name in {"spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent"}:
-            self._flush_exploration()
-            self._begin_work_cell()
-            status = self._style.green("completed") if ok else self._style.red("failed")
-            self._line(f"{self._style.bold('agent tool:')} {name} {status}")
-            output = str(payload.get("output") or "")
-            if output.strip() and name in {"wait_agent", "close_agent"}:
-                self._line(output)
+        elif name == "spawn_agent":
+            self._render_collab_spawn_end(ok, meta, arguments)
+        elif name == "send_input":
+            self._render_collab_send_end(ok, meta, arguments)
+        elif name == "resume_agent":
+            self._render_collab_resume_end(ok, meta, arguments)
+        elif name == "wait_agent":
+            self._render_collab_waiting_end(ok, meta, arguments)
+        elif name == "close_agent":
+            self._render_collab_close_end(ok, meta, arguments)
         elif name in {"get_goal", "create_goal", "update_goal"}:
             self._flush_exploration()
             self._begin_work_cell()
@@ -5112,6 +5178,230 @@ class _HumanEventRenderer:
             self._line(f"{self._style.bold(name + ':')} {self._style.red('failed')}")
             if output.strip():
                 self._line(output)
+
+    # --- multi-agent (collab) tool rendering ----------------------------------
+    # Mirrors upstream codex-rs/tui/src/multi_agents.rs: each event is a cell
+    # whose title carries a dim "• " prefix and whose details are indented under
+    # a dim "  └ " gutter. spawn/send/close render only on completion; wait and
+    # resume also render an in-progress ("Waiting for"/"Resuming") cell.
+
+    _COLLAB_PROMPT_PREVIEW = 160
+    _COLLAB_ERROR_PREVIEW = 160
+    _COLLAB_RESPONSE_PREVIEW = 240
+
+    def _collab_event(self, title: str, details: list[str]) -> None:
+        self._flush_exploration()
+        self._begin_work_cell()
+        self._line(title)
+        if details:
+            self._emit_prefixed_lines(
+                details,
+                first_prefix=self._style.dim("  └ "),
+                rest_prefix="    ",
+            )
+
+    def _collab_title_text(self, title: str) -> str:
+        return f"{self._style.dim('•')} {self._style.bold(title)}"
+
+    def _collab_title(
+        self,
+        prefix: str,
+        agent_id: str | None,
+        nickname: str | None,
+        *,
+        spawn_args: Any | None = None,
+    ) -> str:
+        title = f"{self._style.dim('•')} {self._style.bold(prefix)} {self._agent_label(agent_id, nickname)}"
+        if spawn_args is not None:
+            extra = self._collab_spawn_request(spawn_args)
+            if extra:
+                title = f"{title} {extra}"
+        return title
+
+    def _agent_label(self, agent_id: str | None, nickname: str | None) -> str:
+        nick = nickname.strip() if isinstance(nickname, str) else ""
+        if nick:
+            return self._style.cyan(self._style.bold(nick))
+        ident = (agent_id or "").strip()
+        if ident:
+            return self._style.cyan(ident)
+        return self._style.cyan("agent")
+
+    def _lookup_agent_nickname(self, agent_id: str | None) -> str | None:
+        if not agent_id:
+            return None
+        return self._agent_nicknames.get(agent_id)
+
+    def _collab_spawn_request(self, args: Any) -> str:
+        args = args if isinstance(args, dict) else {}
+        model = args.get("model")
+        model = model.strip() if isinstance(model, str) else ""
+        effort = args.get("reasoning_effort")
+        effort = effort.strip() if isinstance(effort, str) else ""
+        if model and effort:
+            detail = f"({model} {effort})"
+        elif model:
+            detail = f"({model})"
+        elif effort:
+            detail = f"({effort})"
+        else:
+            return ""
+        return self._style.magenta(detail)
+
+    def _collab_prompt_text(self, args: Any) -> str:
+        args = args if isinstance(args, dict) else {}
+        message = args.get("message")
+        if isinstance(message, str) and message.strip():
+            return message
+        items = args.get("items")
+        if not isinstance(items, list):
+            return ""
+        chunks: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                chunks.append(item["text"])
+            elif isinstance(item.get("path"), str):
+                name = item.get("name")
+                prefix = f"{name}: " if isinstance(name, str) and name else ""
+                chunks.append(f"{prefix}{item['path']}")
+            elif isinstance(item.get("name"), str):
+                chunks.append(item["name"])
+        return "\n".join(chunk for chunk in chunks if chunk.strip())
+
+    def _collab_prompt_details(self, args: Any) -> list[str]:
+        trimmed = self._collab_prompt_text(args).strip()
+        if not trimmed:
+            return []
+        return [_truncate_display_text(trimmed, self._COLLAB_PROMPT_PREVIEW)]
+
+    def _collab_status_summary(self, status: Any, *, fallback_error: str | None = None) -> str:
+        if isinstance(status, dict):
+            if "completed" in status:
+                summary = self._style.green("Completed")
+                message = status.get("completed")
+                preview = self._collab_preview(message, self._COLLAB_RESPONSE_PREVIEW)
+                if preview:
+                    summary = f"{summary}{self._style.dim(' - ')}{preview}"
+                return summary
+            if "errored" in status:
+                message = status.get("errored")
+                return self._collab_error_summary(message if isinstance(message, str) else "Agent errored")
+        if status == "running":
+            return self._style.cyan(self._style.bold("Running"))
+        if status == "interrupted":
+            return self._style.yellow("Interrupted")
+        if status == "shutdown":
+            return "Shutdown"
+        if status == "not_found":
+            return self._style.red("Not found")
+        if status == "pending_init":
+            return self._style.cyan("Pending init")
+        if isinstance(status, str) and status:
+            return status
+        return self._collab_error_summary(fallback_error or "")
+
+    def _collab_error_summary(self, error: str) -> str:
+        summary = self._style.red("Error")
+        preview = self._collab_preview(error, self._COLLAB_ERROR_PREVIEW)
+        if preview:
+            summary = f"{summary}{self._style.dim(' - ')}{preview}"
+        return summary
+
+    def _collab_preview(self, text: Any, limit: int) -> str:
+        if not isinstance(text, str):
+            return ""
+        collapsed = " ".join(text.split())
+        if not collapsed:
+            return ""
+        return _truncate_display_text(collapsed, limit)
+
+    def _render_collab_spawn_end(self, ok: bool, meta: dict[str, Any], arguments: Any) -> None:
+        agent_id = str(meta.get("agent_id") or "") or None
+        nickname = meta.get("nickname")
+        nickname = nickname if isinstance(nickname, str) and nickname.strip() else None
+        if ok and agent_id:
+            if nickname:
+                self._agent_nicknames[agent_id] = nickname
+            title = self._collab_title("Spawned", agent_id, nickname, spawn_args=arguments)
+        else:
+            title = self._collab_title_text("Agent spawn failed")
+        self._collab_event(title, self._collab_prompt_details(arguments))
+
+    def _render_collab_send_end(self, ok: bool, meta: dict[str, Any], arguments: Any) -> None:
+        args = arguments if isinstance(arguments, dict) else {}
+        target = str(args.get("target") or "") or None
+        if not target:
+            return
+        title = self._collab_title("Sent input to", target, self._lookup_agent_nickname(target))
+        self._collab_event(title, self._collab_prompt_details(arguments))
+
+    def _render_collab_resume_begin(self, arguments: Any) -> None:
+        args = arguments if isinstance(arguments, dict) else {}
+        agent_id = str(args.get("id") or "") or None
+        if not agent_id:
+            return
+        self._collab_event(
+            self._collab_title("Resuming", agent_id, self._lookup_agent_nickname(agent_id)),
+            [],
+        )
+
+    def _render_collab_resume_end(self, ok: bool, meta: dict[str, Any], arguments: Any) -> None:
+        args = arguments if isinstance(arguments, dict) else {}
+        agent_id = str(args.get("id") or "") or None
+        if not agent_id:
+            return
+        title = self._collab_title("Resumed", agent_id, self._lookup_agent_nickname(agent_id))
+        detail = self._collab_status_summary(meta.get("status"), fallback_error="Agent resume failed")
+        self._collab_event(title, [detail])
+
+    def _render_collab_waiting_begin(self, arguments: Any) -> None:
+        args = arguments if isinstance(arguments, dict) else {}
+        targets = args.get("targets")
+        ids = [str(item) for item in targets] if isinstance(targets, list) else []
+        if len(ids) == 1:
+            title = self._collab_title("Waiting for", ids[0], self._lookup_agent_nickname(ids[0]))
+            details: list[str] = []
+        elif not ids:
+            title = self._collab_title_text("Waiting for agents")
+            details = []
+        else:
+            title = self._collab_title_text(f"Waiting for {len(ids)} agents")
+            details = [self._agent_label(i, self._lookup_agent_nickname(i)) for i in ids]
+        self._collab_event(title, details)
+
+    def _render_collab_waiting_end(self, ok: bool, meta: dict[str, Any], arguments: Any) -> None:
+        args = arguments if isinstance(arguments, dict) else {}
+        targets = args.get("targets")
+        ids = [str(item) for item in targets] if isinstance(targets, list) else []
+        statuses = meta.get("status") if isinstance(meta.get("status"), dict) else {}
+        self._collab_event(self._collab_title_text("Finished waiting"), self._collab_wait_lines(ids, statuses))
+
+    def _collab_wait_lines(self, ids: list[str], statuses: dict[str, Any]) -> list[str]:
+        entries: list[tuple[str, Any]] = []
+        seen: set[str] = set()
+        for tid in ids:
+            if tid in statuses:
+                entries.append((tid, statuses[tid]))
+                seen.add(tid)
+        extras = sorted((k, v) for k, v in statuses.items() if k not in seen)
+        entries.extend(extras)
+        if not entries:
+            return ["No agents completed yet"]
+        lines: list[str] = []
+        for tid, status in entries:
+            label = self._agent_label(tid, self._lookup_agent_nickname(tid))
+            lines.append(f"{label}{self._style.dim(': ')}{self._collab_status_summary(status)}")
+        return lines
+
+    def _render_collab_close_end(self, ok: bool, meta: dict[str, Any], arguments: Any) -> None:
+        args = arguments if isinstance(arguments, dict) else {}
+        target = str(args.get("target") or "") or None
+        if not target:
+            return
+        title = self._collab_title("Closed", target, self._lookup_agent_nickname(target))
+        self._collab_event(title, [])
 
     def _render_web_search_cell(
         self,
@@ -7292,6 +7582,16 @@ def _int_config(config: dict, key: str) -> int | None:
             return int(value)
         except ValueError:
             return None
+    return None
+
+
+def _terminal_resize_reflow_max_rows_config(config: dict) -> int | None:
+    nested = _int_nested_config(config, ("tui", "terminal_resize_reflow_max_rows"), -1)
+    if nested >= 0:
+        return nested
+    top_level = _int_config(config, "terminal_resize_reflow_max_rows")
+    if top_level is not None and top_level >= 0:
+        return top_level
     return None
 
 

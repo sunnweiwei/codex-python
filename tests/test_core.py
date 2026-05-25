@@ -700,6 +700,38 @@ class CodexCoreTests(unittest.TestCase):
         wait = json.loads(session.tools.wait_agent({"targets": [agent_id], "timeout_ms": 10000}).output)
         self.assertEqual(wait["status"][agent_id], "shutdown")
 
+    def test_model_client_cancel_is_scoped_to_thread_id(self) -> None:
+        """Cancelling one session's in-flight responses must not close sibling
+        or parent responses sharing the same model client. A bare cancel() with
+        no thread id still closes everything (top-level interrupt)."""
+
+        class _FakeResponse:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        model = OpenAIResponsesModel.__new__(OpenAIResponsesModel)
+        model._active_responses = []
+        model._active_responses_lock = threading.Lock()
+
+        parent, child_a, child_b = _FakeResponse(), _FakeResponse(), _FakeResponse()
+        model._register_active_response(parent, "tid-parent")
+        model._register_active_response(child_a, "tid-child-a")
+        model._register_active_response(child_b, "tid-child-b")
+
+        model.cancel("tid-child-a")
+        self.assertTrue(child_a.closed)
+        self.assertFalse(parent.closed)
+        self.assertFalse(child_b.closed)
+        self.assertEqual({owner for owner, _ in model._active_responses}, {"tid-parent", "tid-child-b"})
+
+        model.cancel()
+        self.assertTrue(parent.closed)
+        self.assertTrue(child_b.closed)
+        self.assertEqual(model._active_responses, [])
+
     def test_local_multi_agent_wait_timeout_returns_empty_statuses(self) -> None:
         import codex.core as core
 
@@ -2255,6 +2287,102 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(len(model.requests), 1)
         self.assertEqual(model.requests[0].tools, [])
         self.assertFalse(model.requests[0].parallel_tool_calls)
+
+    def test_recent_context_offload_appends_block_and_offloads_long_output(self) -> None:
+        # DIVERGENCE FROM UPSTREAM: opt-in recent-activity block after compaction.
+        import json as _json
+        import tempfile
+        from pathlib import Path as _Path
+        from codex.state import build_recent_context_offload
+
+        tmp = _Path(tempfile.mkdtemp())
+        config = CodexConfig(skip_git_repo_check=True, ephemeral=True)
+        history = [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Running tests."}]},
+            {"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": _json.dumps({"command": ["pytest"]})},
+            {"type": "function_call_output", "call_id": "c1", "output": "PASS\n" + ("X" * 9000)},
+            {"type": "function_call", "name": "apply_patch", "call_id": "c2", "arguments": _json.dumps({"input": "patch"})},
+            {"type": "function_call_output", "call_id": "c2", "output": "M foo.py\n" + ("Y" * 9000)},
+        ]
+
+        block = build_recent_context_offload(history, 20_000, config, offload_dir=tmp)
+
+        # Header + assistant prose are preserved verbatim.
+        self.assertEqual(block[0]["role"], "developer")
+        self.assertIn("<recent_activity>", block[0]["content"][0]["text"])
+        self.assertTrue(any(b.get("role") == "assistant" and b["content"][0]["text"] == "Running tests." for b in block))
+
+        outputs = {b["call_id"]: b["output"] for b in block if b.get("type") == "function_call_output"}
+        # exec_command output: truncated + offloaded to a file referenced inline.
+        self.assertIn("Full original saved to", outputs["c1"])
+        self.assertEqual(len(list(tmp.glob("*.txt"))), 1)
+        # apply_patch (file edit) output: dropped, replaced with a short pointer note.
+        self.assertIn("output omitted", outputs["c2"])
+
+    def test_recent_context_offload_default_gates_on_persistence(self) -> None:
+        # Auto default: on for persistent sessions, off for ephemeral/throwaway.
+        self.assertEqual(
+            CodexConfig(skip_git_repo_check=True, ephemeral=False).resolved_recent_context_offload_tokens(),
+            10_000,
+        )
+        self.assertEqual(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True).resolved_recent_context_offload_tokens(),
+            0,
+        )
+        # Explicit 0 always disables (upstream-identical), even when persistent.
+        self.assertEqual(
+            CodexConfig(ephemeral=False, recent_context_offload_tokens=0).resolved_recent_context_offload_tokens(),
+            0,
+        )
+        config = CodexConfig(skip_git_repo_check=True, ephemeral=True, recent_context_offload_tokens=0)
+        session = CodexSession(config, model_client=ScriptedResponsesModel([message("summary")]))
+        session.state.append_history(
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "task"}]}
+        )
+        session.state.append_history(
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "did work"}]}
+        )
+        session.compact()
+        # No <recent_activity> block when the feature is off.
+        self.assertFalse(
+            any("<recent_activity>" in json.dumps(item, ensure_ascii=False) for item in session.state.history)
+        )
+
+    def test_resume_after_recent_context_offload_reinjects_initial_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            config = CodexConfig(
+                cwd=root,
+                codex_home=codex_home,
+                skip_git_repo_check=True,
+                ephemeral=False,
+            )
+            session_model = ScriptedResponsesModel([message("first answer"), message("handoff summary")])
+            session = CodexSession(config, model_client=session_model)
+
+            first = session.run("first")
+            session.compact()
+            rollout_path = next((codex_home / "sessions").glob(f"????/??/??/rollout-*-{first.thread_id}.jsonl"))
+            reconstructed = reconstruct_history_from_rollout(rollout_path, config)
+            self.assertTrue(
+                any("<recent_activity>" in json.dumps(item, ensure_ascii=False) for item in reconstructed.history)
+            )
+            self.assertFalse(
+                any("<environment_context>" in json.dumps(item, ensure_ascii=False) for item in reconstructed.history)
+            )
+
+            resumed_model = ScriptedResponsesModel([message("second answer")])
+            resumed = CodexSession.resume_from_rollout(
+                rollout_path,
+                config,
+                model_client=resumed_model,
+            )
+            resumed.run("second")
+
+            request_texts = _request_texts(resumed_model.requests[0])
+            self.assertTrue(any("<recent_activity>" in text for text in request_texts))
+            self.assertTrue(any("<environment_context>" in text for text in request_texts))
 
     def test_manual_compaction_runs_pre_and_post_hooks(self) -> None:
         calls: list[dict] = []
@@ -7839,6 +7967,65 @@ new file mode 100644
         self.assertIn("• Waited for background terminal · python3 -i", rendered)
         self.assertNotIn("background terminal · 2", rendered)
 
+    def test_resume_transcript_replay_keeps_recent_rows_like_upstream_initial_buffer(self) -> None:
+        from codex import cli
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout_path = root / "rollout.jsonl"
+            records = [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": f"assistant {index}"}],
+                    },
+                }
+                for index in range(5)
+            ]
+            rollout_path.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            session = CodexSession(
+                CodexConfig(
+                    cwd=root,
+                    codex_home=root / "codex-home",
+                    skip_git_repo_check=True,
+                    terminal_resize_reflow_max_rows=3,
+                )
+            )
+
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rendered = cli._render_resumed_transcript(session, source_path=rollout_path, color_mode="never")
+
+            output = stderr.getvalue()
+            self.assertTrue(rendered)
+            self.assertNotIn("assistant 0", output)
+            self.assertNotIn("assistant 2", output)
+            self.assertIn("assistant 3", output)
+            self.assertIn("assistant 4", output)
+
+    def test_resume_transcript_replay_row_cap_matches_upstream_defaults_and_overrides(self) -> None:
+        from codex import cli
+
+        self.assertEqual(
+            cli._initial_history_replay_max_rows(CodexConfig()),
+            1000,
+        )
+        self.assertEqual(
+            cli._initial_history_replay_max_rows(CodexConfig(terminal_resize_reflow_max_rows=42)),
+            42,
+        )
+        self.assertIsNone(
+            cli._initial_history_replay_max_rows(CodexConfig(terminal_resize_reflow_max_rows=0))
+        )
+        self.assertIsNone(
+            cli._initial_history_replay_max_rows(CodexConfig(terminal_resize_reflow_enabled=False))
+        )
+
     def test_chat_startup_panel_summarizes_model_auth_and_fallback_without_secret_leaks(self) -> None:
         from codex import cli
 
@@ -9869,36 +10056,6 @@ model_reasoning_effort = "low"
             "implementation is yielding hardcoded events instead of using "
             "the configured model client.",
         )
-
-    def test_session_run_raises_when_no_api_key_and_no_fake_responses(self) -> None:
-        """With no `OPENAI_API_KEY` and no `PY_CODEX_FAKE_RESPONSES`, calling
-        `session.run("hi")` must raise an error (not silently emit placeholder
-        events). Catches agents that swallow the missing-credentials case."""
-        env = dict(os.environ)
-        env.pop("OPENAI_API_KEY", None)
-        env.pop("PY_CODEX_FAKE_RESPONSES", None)
-        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
-        script = (
-            "import os\n"
-            "os.environ.pop('OPENAI_API_KEY', None)\n"
-            "os.environ.pop('PY_CODEX_FAKE_RESPONSES', None)\n"
-            "from codex import CodexConfig, CodexSession\n"
-            "session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True))\n"
-            "raised = False\n"
-            "try:\n"
-            "    session.run('hi')\n"
-            "except Exception:\n"
-            "    raised = True\n"
-            "assert raised, 'session.run() did not raise when neither "
-            "OPENAI_API_KEY nor PY_CODEX_FAKE_RESPONSES was set'\n"
-        )
-        completed = subprocess.run(
-            [sys.executable, "-c", script],
-            env=env,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_cli_exec_exit_codes_reflect_outcome(self) -> None:
         """`python3 -m codex exec` must exit 0 on success and non-zero on

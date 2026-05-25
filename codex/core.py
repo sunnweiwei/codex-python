@@ -19,7 +19,7 @@ from .memory import MemoryBackgroundTask, MemoryStateStore, MemoryStartupResult,
 from .memory import run_memory_startup_pipeline_once, start_memory_startup_task
 from .model import ModelClient, ModelStreamEvent, default_model_client, model_response_to_stream_events
 from .prompts import build_base_instructions, build_initial_context_items
-from .state import CodexState, extract_proposed_plan_text, parse_memory_citation, prepare_prompt_history, reconstruct_history_from_rollout, strip_memory_citations, strip_proposed_plan_blocks, summarization_prompt, trim_remote_compaction_history_to_fit_context_window
+from .state import CodexState, build_compaction_summary_text, extract_proposed_plan_text, parse_memory_citation, prepare_prompt_history, reconstruct_history_from_rollout, strip_memory_citations, strip_proposed_plan_blocks, summarization_prompt, trim_remote_compaction_history_to_fit_context_window
 from .tools import ToolRuntime, _load_image_for_prompt
 from .tools import ToolResult
 from .types import CodexConfig, CodexEvent, CodexResult, PromptRequest
@@ -107,10 +107,21 @@ class CodexSession:
         if not callable(cancel_model) and not callable(interrupt_tools):
             return
 
+        thread_id = self.state.thread_id
+
         def cancel_runtime() -> None:
             if callable(cancel_model):
+                # Scope cancellation to this session's own in-flight responses so
+                # interrupting/closing one agent does not abort sibling agents or
+                # the parent that share the same model client. Fall back to the
+                # argument-less form for clients that do not support scoping.
                 try:
-                    cancel_model()
+                    cancel_model(thread_id)
+                except TypeError:
+                    try:
+                        cancel_model()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             if callable(interrupt_tools):
@@ -377,6 +388,10 @@ class CodexSession:
                 if text:
                     summary_suffix = text
             self.state.compact_with_summary(summary_suffix, initial_context=initial_context)
+            # Pin the persisted checkpoint message to the summary explicitly: the
+            # recent-activity offload block (when enabled) appends items after the
+            # summary, so deriving it from the last history message would be wrong.
+            compacted_message = build_compaction_summary_text(summary_suffix)
 
         self.state.recompute_token_usage_from_history()
         self.state.start_new_context_epoch(pre_compact_session_tokens, estimated=pre_compact_session_estimated)
@@ -1834,6 +1849,8 @@ def _history_has_initial_context(history: list[dict[str, Any]]) -> bool:
         if item.get("type") != "message":
             continue
         if item.get("role") == "developer":
+            if _is_recent_activity_header_message(item):
+                continue
             saw_developer = True
             continue
         if item.get("role") == "user":
@@ -1847,6 +1864,11 @@ def _history_has_initial_context(history: list[dict[str, Any]]) -> bool:
             ):
                 saw_contextual_user = True
     return saw_developer or saw_contextual_user
+
+
+def _is_recent_activity_header_message(item: dict[str, Any]) -> bool:
+    text = _message_text(item).strip()
+    return text.startswith("<recent_activity>") and text.endswith("</recent_activity>")
 
 
 def _user_message(

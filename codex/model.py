@@ -49,11 +49,11 @@ class OpenAIResponsesModel:
         self.api_key = api_key or load_openai_api_key()
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
         self.auth_display_name = "API key" if self.api_key else "OpenAI SDK auth"
-        self._active_responses: list[Any] = []
+        self._active_responses: list[tuple[str | None, Any]] = []
         self._active_responses_lock = threading.Lock()
 
-    def cancel(self) -> None:
-        self._close_active_responses()
+    def cancel(self, thread_id: str | None = None) -> None:
+        self._close_active_responses(thread_id)
 
     def create(self, request: PromptRequest) -> ModelResponse:
         return collect_model_stream_events(self.stream(request))
@@ -78,7 +78,7 @@ class OpenAIResponsesModel:
             kwargs["extra_headers"] = extra_headers
         response = client.responses.create(**kwargs)
         if request.stream:
-            self._register_active_response(response)
+            self._register_active_response(response, request.thread_id)
             try:
                 yield from iter_model_stream_events(response)
             finally:
@@ -124,7 +124,7 @@ class OpenAIResponsesModel:
             yield from _scripted_stream_events(payload)
             return
 
-        self._register_active_response(response)
+        self._register_active_response(response, request.thread_id)
         try:
             with response:
                 yield from iter_model_stream_events(_iter_sse_events(response))
@@ -132,19 +132,23 @@ class OpenAIResponsesModel:
             self._unregister_active_response(response)
             _close_response(response)
 
-    def _register_active_response(self, response: Any) -> None:
+    def _register_active_response(self, response: Any, owner: str | None = None) -> None:
         with self._active_responses_lock:
-            self._active_responses.append(response)
+            self._active_responses.append((owner, response))
 
     def _unregister_active_response(self, response: Any) -> None:
         with self._active_responses_lock:
-            self._active_responses = [item for item in self._active_responses if item is not response]
+            self._active_responses = [item for item in self._active_responses if item[1] is not response]
 
-    def _close_active_responses(self) -> None:
+    def _close_active_responses(self, owner: str | None = None) -> None:
         with self._active_responses_lock:
-            responses = list(self._active_responses)
-            self._active_responses.clear()
-        for response in responses:
+            if owner is None:
+                pending = list(self._active_responses)
+                self._active_responses.clear()
+            else:
+                pending = [item for item in self._active_responses if item[0] == owner]
+                self._active_responses = [item for item in self._active_responses if item[0] != owner]
+        for _owner, response in pending:
             _close_response(response)
 
     def compact(
@@ -240,11 +244,11 @@ class ChatGPTCodexModel:
         self.auth_snapshot = auth_snapshot or self._load_auth()
         self.base_url = chatgpt_codex_base_url(base_url)
         self.auth_display_name = "ChatGPT"
-        self._active_responses: list[Any] = []
+        self._active_responses: list[tuple[str | None, Any]] = []
         self._active_responses_lock = threading.Lock()
 
-    def cancel(self) -> None:
-        self._close_active_responses()
+    def cancel(self, thread_id: str | None = None) -> None:
+        self._close_active_responses(thread_id)
 
     def create(self, request: PromptRequest) -> ModelResponse:
         return collect_model_stream_events(self.stream(request))
@@ -315,7 +319,7 @@ class ChatGPTCodexModel:
             yield from _scripted_stream_events(payload)
             return
 
-        self._register_active_response(response)
+        self._register_active_response(response, request.thread_id)
         try:
             with response:
                 yield from iter_model_stream_events(_iter_sse_events(response))
@@ -323,19 +327,23 @@ class ChatGPTCodexModel:
             self._unregister_active_response(response)
             _close_response(response)
 
-    def _register_active_response(self, response: Any) -> None:
+    def _register_active_response(self, response: Any, owner: str | None = None) -> None:
         with self._active_responses_lock:
-            self._active_responses.append(response)
+            self._active_responses.append((owner, response))
 
     def _unregister_active_response(self, response: Any) -> None:
         with self._active_responses_lock:
-            self._active_responses = [item for item in self._active_responses if item is not response]
+            self._active_responses = [item for item in self._active_responses if item[1] is not response]
 
-    def _close_active_responses(self) -> None:
+    def _close_active_responses(self, owner: str | None = None) -> None:
         with self._active_responses_lock:
-            responses = list(self._active_responses)
-            self._active_responses.clear()
-        for response in responses:
+            if owner is None:
+                pending = list(self._active_responses)
+                self._active_responses.clear()
+            else:
+                pending = [item for item in self._active_responses if item[0] == owner]
+                self._active_responses = [item for item in self._active_responses if item[0] != owner]
+        for _owner, response in pending:
             _close_response(response)
 
     def _urlopen_bytes(

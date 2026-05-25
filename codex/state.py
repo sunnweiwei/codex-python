@@ -6,6 +6,7 @@ import hashlib
 import shlex
 import subprocess
 import time
+import uuid
 
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -123,12 +124,17 @@ class CodexState:
         output.write_text(message, encoding="utf-8")
 
     def compact_with_summary(self, summary_suffix: str, initial_context: list[dict] | None = None) -> list[dict]:
+        pre_compaction_history = list(self.history)
         summary_text = build_compaction_summary_text(summary_suffix)
-        user_messages = collect_user_message_texts(self.history)
+        recent_block = self._build_recent_context_offload(pre_compaction_history)
+        # When the recent block is active it becomes the single carrier of recent
+        # verbatim turns, REPLACING the reference recent-user-message prefix (one
+        # place, no duplication). Everything older is still in the summary.
+        user_messages = [] if recent_block else collect_user_message_texts(self.history)
         compacted = build_compacted_history([], user_messages, summary_text)
         if initial_context:
             compacted = insert_initial_context_before_last_real_user_or_summary(compacted, initial_context)
-        self.history = compacted
+        self.history = compacted + recent_block
         return list(self.history)
 
     def compact_with_remote_history(
@@ -136,8 +142,35 @@ class CodexState:
         compacted_history: list[dict[str, Any]],
         initial_context: list[dict] | None = None,
     ) -> list[dict]:
-        self.history = process_remote_compacted_history(compacted_history, initial_context or [])
+        pre_compaction_history = list(self.history)
+        # Remote output is the SERVER's compacted history (encrypted checkpoint +
+        # whatever verbatim messages it chose to keep). We never discard the
+        # server's choice; we only append our recent-activity block after it. In
+        # practice the endpoint returns just the encrypted item, so there is no
+        # duplication; if it does retain messages, keeping them is the safe call.
+        compacted = process_remote_compacted_history(compacted_history, initial_context or [])
+        self.history = compacted + self._build_recent_context_offload(pre_compaction_history)
         return list(self.history)
+
+    def _build_recent_context_offload(self, pre_compaction_history: list[dict[str, Any]]) -> list[dict]:
+        """Reference-port divergence (opt-in). Build an extra, aggressively
+        truncated "recent activity" block from the pre-compaction history so the
+        next turn can see what the agent just did. Returns [] when disabled."""
+        budget = self.config.resolved_recent_context_offload_tokens()
+        if budget <= 0:
+            return []
+        offload_dir: Path | None = None
+        configured = self.config.recent_context_offload_dir
+        if configured is not None:
+            offload_dir = Path(configured).expanduser()
+        elif not self.config.ephemeral:
+            offload_dir = self.config.resolved_codex_home() / "compaction_offload" / self.thread_id
+        return build_recent_context_offload(
+            pre_compaction_history,
+            budget,
+            self.config,
+            offload_dir=offload_dir,
+        )
 
     def approx_history_tokens(self) -> int:
         return sum(_estimate_prompt_visible_response_item_token_count(item, self.config) for item in self.history)
@@ -934,6 +967,251 @@ def build_compacted_history(
         history.append(_user_message_item(message))
     history.append(_user_message_item(summary_text or "(no summary available)"))
     return history
+
+
+# --- Reference-port divergence: post-compaction recent-activity offload block ---
+# This whole section has no official counterpart. It is gated behind
+# CodexConfig.recent_context_offload_tokens (default 0 = disabled), so the
+# default compaction behavior stays byte-for-byte identical to official Codex.
+# See PARITY_AUDIT.md ("Summary And Compaction").
+RECENT_OFFLOAD_HEADER = (
+    "<recent_activity>\n"
+    "Below is a compressed log of the most recent work done just before this "
+    "context checkpoint, kept so you can continue without redoing finished work. "
+    "Long content was truncated; where it was, the full original was saved to a "
+    "file and the path is noted inline — read that file if you need the complete "
+    "content.\n"
+    "</recent_activity>"
+)
+_RECENT_ASSISTANT_TEXT_MAX_TOKENS = 2_000
+_RECENT_USER_TEXT_MAX_TOKENS = 2_000
+_RECENT_TOOL_ARG_MAX_TOKENS = 400
+_RECENT_TOOL_OUTPUT_MAX_TOKENS = 1_500
+# Tools whose output is reconstructable on demand (re-read the file), so we drop
+# the captured output and leave only a short pointer note.
+_FILE_TOOL_NAMES = frozenset({"apply_patch", "read_file", "view_image"})
+_FILE_READ_COMMAND_PREFIXES = ("cat ", "head ", "tail ", "less ", "more ", "bat ", "sed -n", "nl ", "type ")
+
+
+def build_recent_context_offload(
+    history: list[dict[str, Any]],
+    budget_tokens: int,
+    config: CodexConfig,
+    *,
+    offload_dir: Path | None,
+) -> list[dict]:
+    """Build the divergent recent-activity block (see module section header)."""
+    if budget_tokens <= 0:
+        return []
+
+    name_by_call: dict[str, str] = {}
+    cmd_by_call: dict[str, str] = {}
+    for item in history:
+        if item.get("type") in {"function_call", "custom_tool_call", "local_shell_call"}:
+            call_id = _call_id(item)
+            if not call_id:
+                continue
+            name_by_call[call_id] = str(
+                item.get("name") or ("shell" if item.get("type") == "local_shell_call" else "")
+            )
+            cmd_by_call[call_id] = _recent_call_command_text(item)
+
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for item in reversed(history):
+        compressed = _compress_recent_item(item, name_by_call, cmd_by_call, offload_dir)
+        if compressed is None:
+            continue
+        cost = _estimate_prompt_visible_response_item_token_count(compressed, config)
+        if selected and used + cost > budget_tokens:
+            break
+        selected.append(compressed)
+        used += cost
+    selected.reverse()
+    _remove_orphan_outputs(selected)
+    _ensure_call_outputs_present(selected)
+    if not selected:
+        return []
+
+    header = {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": RECENT_OFFLOAD_HEADER}],
+    }
+    return [header, *selected]
+
+
+def _compress_recent_item(
+    item: dict[str, Any],
+    name_by_call: dict[str, str],
+    cmd_by_call: dict[str, str],
+    offload_dir: Path | None,
+) -> dict[str, Any] | None:
+    item_type = item.get("type")
+
+    if item_type == "message":
+        role = item.get("role")
+        if role == "assistant":
+            text = _message_text(item)
+            if not text:
+                return None
+            kept = _truncate_and_offload(
+                text, max_tokens=_RECENT_ASSISTANT_TEXT_MAX_TOKENS, offload_dir=offload_dir, label="assistant"
+            )
+            return {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": kept}]}
+        if role == "user" and not _is_contextual_user_message(item):
+            # Keep real user turns so the block reads as a coherent recent
+            # transcript (the prompts that triggered the agent's actions), not a
+            # pile of orphan assistant/tool items. Contextual wrappers
+            # (environment_context, AGENTS.md, etc.) are dropped. Long user text
+            # is truncated/offloaded like everything else. This may overlap the
+            # most-recent user turn(s) the prefix already retains; the overlap is
+            # bounded and harmless.
+            text = _message_text(item)
+            if not text:
+                return None
+            kept = _truncate_and_offload(
+                text, max_tokens=_RECENT_USER_TEXT_MAX_TOKENS, offload_dir=offload_dir, label="user"
+            )
+            return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": kept}]}
+        # developer / contextual messages are not part of the recent transcript.
+        return None
+
+    if item_type in {"function_call", "custom_tool_call", "local_shell_call"}:
+        return _compress_recent_call(item)
+
+    if item_type in {"function_call_output", "custom_tool_call_output"}:
+        return _compress_recent_output(item, name_by_call, cmd_by_call, offload_dir)
+
+    # reasoning, web_search_call, tool_search_*, image_generation_call, compaction,
+    # context_compaction, etc. are not useful as verbatim recent context.
+    return None
+
+
+def _compress_recent_call(item: dict[str, Any]) -> dict[str, Any]:
+    item_type = item["type"]
+    call_id = _call_id(item)
+    if item_type == "local_shell_call":
+        sanitized: dict[str, Any] = {"type": "local_shell_call", "action": item.get("action", {})}
+        if item.get("status") is not None:
+            sanitized["status"] = item["status"]
+        if call_id:
+            sanitized["call_id"] = call_id
+        return sanitized
+    if item_type == "custom_tool_call":
+        return {
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": item.get("name", ""),
+            "input": _truncate_text_no_offload(str(item.get("input", "")), _RECENT_TOOL_ARG_MAX_TOKENS),
+        }
+    arguments = item.get("arguments", "")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": item.get("name", ""),
+        "arguments": _truncate_text_no_offload(arguments, _RECENT_TOOL_ARG_MAX_TOKENS),
+    }
+
+
+def _compress_recent_output(
+    item: dict[str, Any],
+    name_by_call: dict[str, str],
+    cmd_by_call: dict[str, str],
+    offload_dir: Path | None,
+) -> dict[str, Any]:
+    call_id = _call_id(item)
+    out_type = item["type"]
+    name = name_by_call.get(call_id, "")
+    command = cmd_by_call.get(call_id, "")
+
+    if _recent_output_is_droppable(name, command):
+        note = "(output omitted to save context — re-read the file or re-run the command if you need it)"
+        return {"type": out_type, "call_id": call_id, "output": note}
+
+    text = _recent_output_text(item.get("output"))
+    kept = _truncate_and_offload(
+        text, max_tokens=_RECENT_TOOL_OUTPUT_MAX_TOKENS, offload_dir=offload_dir, label="output"
+    )
+    return {"type": out_type, "call_id": call_id, "output": kept}
+
+
+def _recent_output_is_droppable(name: str, command: str) -> bool:
+    if name in _FILE_TOOL_NAMES:
+        return True
+    stripped = command.strip().lower()
+    return any(stripped.startswith(prefix) for prefix in _FILE_READ_COMMAND_PREFIXES)
+
+
+def _recent_call_command_text(item: dict[str, Any]) -> str:
+    args = item.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, ValueError):
+            return args
+    if isinstance(args, dict):
+        command = args.get("command")
+        if isinstance(command, list):
+            return " ".join(str(part) for part in command)
+        if isinstance(command, str):
+            return command
+    action = item.get("action")
+    if isinstance(action, dict):
+        command = action.get("command")
+        if isinstance(command, list):
+            return " ".join(str(part) for part in command)
+        if isinstance(command, str):
+            return command
+    return ""
+
+
+def _recent_output_text(output: Any) -> str:
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict):
+        for key in ("output", "text"):
+            value = output.get(key)
+            if isinstance(value, str):
+                return value
+        return json.dumps(output, ensure_ascii=False)
+    if output is None:
+        return ""
+    return json.dumps(output, ensure_ascii=False)
+
+
+def _truncate_text_no_offload(text: str, max_tokens: int) -> str:
+    if _approx_token_count(text) <= max_tokens:
+        return text
+    head = _truncate_to_tokens(text, max_tokens)
+    return f"{head}\n[... truncated {_approx_token_count(text) - max_tokens} tokens ...]"
+
+
+def _truncate_and_offload(text: str, *, max_tokens: int, offload_dir: Path | None, label: str) -> str:
+    if _approx_token_count(text) <= max_tokens:
+        return text
+    omitted = _approx_token_count(text) - max_tokens
+    head = _truncate_to_tokens(text, max_tokens)
+    path = _write_offload_file(offload_dir, label, text)
+    if path is not None:
+        note = f"\n[... truncated {omitted} tokens. Full original saved to {path} — read that file for the complete content. ...]"
+    else:
+        note = f"\n[... truncated {omitted} tokens ...]"
+    return head + note
+
+
+def _write_offload_file(offload_dir: Path | None, label: str, text: str) -> Path | None:
+    if offload_dir is None:
+        return None
+    try:
+        offload_dir.mkdir(parents=True, exist_ok=True)
+        path = offload_dir / f"{label}-{uuid.uuid4().hex}.txt"
+        path.write_text(text, encoding="utf-8")
+        return path
+    except OSError:
+        return None
 
 
 def process_remote_compacted_history(
