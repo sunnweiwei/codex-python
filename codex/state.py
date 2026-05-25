@@ -31,6 +31,11 @@ class RolloutReconstruction:
     reference_context_item: dict[str, Any] | None
     session_meta: dict[str, Any] | None = None
     legacy_compaction_without_replacement_history: bool = False
+    last_token_usage: dict[str, Any] | None = None
+    total_token_usage: int = 0
+    session_reasoning_tokens: int = 0
+    context_carryover_tokens: int = 0
+    context_carryover_estimated: bool = False
 
 
 @dataclass
@@ -138,23 +143,11 @@ class CodexState:
         return sum(_estimate_prompt_visible_response_item_token_count(item, self.config) for item in self.history)
 
     def active_context_tokens(self) -> int:
-        last_tokens = _usage_total_tokens(self.last_token_usage or {})
-        local_tokens = sum(
-            _estimate_prompt_visible_response_item_token_count(item, self.config)
-            for item in _items_after_last_model_generated_item(self.history)
-        )
-        return max(0, last_tokens or 0) + local_tokens
+        tokens, _estimated = _active_context_token_status_for_history(self.history, self.last_token_usage, self.config)
+        return max(0, tokens or 0)
 
     def active_context_token_status(self) -> tuple[int | None, bool]:
-        last_tokens = _usage_total_tokens(self.last_token_usage or {})
-        local_tokens = sum(
-            _estimate_prompt_visible_response_item_token_count(item, self.config)
-            for item in _items_after_last_model_generated_item(self.history)
-        )
-        if last_tokens is None and local_tokens <= 0:
-            return None, True
-        estimated = bool((self.last_token_usage or {}).get("estimated")) or local_tokens > 0
-        return max(0, last_tokens or 0) + local_tokens, estimated
+        return _active_context_token_status_for_history(self.history, self.last_token_usage, self.config)
 
     def session_usage_tokens(self) -> int | None:
         if self.total_token_usage <= 0:
@@ -201,17 +194,7 @@ class CodexState:
         }
 
     def estimate_token_count_with_base_instructions(self) -> int:
-        base_instructions = build_base_instructions(
-            prompt_asset=self.config.prompt_asset,
-            model=self.config.model,
-            cwd=self.config.resolved_cwd(),
-            sandbox=self.config.sandbox,
-            approval_policy=self.config.approval_policy,
-            codex_home=self.config.resolved_codex_home(),
-            memory_tool_enabled=self.config.memory_tool_enabled,
-            use_memories=self.config.use_memories,
-        )
-        return _approx_token_count(base_instructions) + self.approx_history_tokens()
+        return _estimate_token_count_with_base_instructions(self.history, self.config)
 
     def token_usage_info(self) -> dict[str, Any] | None:
         if self.last_token_usage is None and self.total_token_usage <= 0:
@@ -466,7 +449,10 @@ def load_rollout_records(path: Path | str) -> list[dict[str, Any]]:
     return records
 
 
-def reconstruct_history_from_rollout(source: Path | str | list[dict[str, Any]]) -> RolloutReconstruction:
+def reconstruct_history_from_rollout(
+    source: Path | str | list[dict[str, Any]],
+    config: CodexConfig | None = None,
+) -> RolloutReconstruction:
     """Materialize the public rollout history semantics used by resume/fork.
 
     Upstream scans newest-to-oldest to find the surviving compaction checkpoint
@@ -487,6 +473,11 @@ def reconstruct_history_from_rollout(source: Path | str | list[dict[str, Any]]) 
     legacy_compaction_without_replacement_history = False
     last_boundary_from_response_item = False
     last_record_was_compacted = False
+    last_token_usage: dict[str, Any] | None = None
+    total_token_usage = 0
+    session_reasoning_tokens = 0
+    context_carryover_tokens = 0
+    context_carryover_estimated = False
 
     def set_resume_context(turn_context: dict[str, Any] | None) -> None:
         nonlocal previous_turn_settings, reference_context_item
@@ -508,6 +499,32 @@ def reconstruct_history_from_rollout(source: Path | str | list[dict[str, Any]]) 
                 set_resume_context(turn_context)
                 return
         set_resume_context(None)
+
+    def record_token_info(info: dict[str, Any] | None) -> None:
+        nonlocal last_token_usage, total_token_usage, session_reasoning_tokens
+        if not isinstance(info, dict):
+            return
+        usage = info.get("last_token_usage")
+        if isinstance(usage, dict):
+            last_token_usage = dict(usage)
+        total = info.get("total_token_usage")
+        if isinstance(total, (int, float)):
+            total_token_usage = max(0, int(total))
+        reasoning = info.get("session_reasoning_tokens")
+        if isinstance(reasoning, (int, float)):
+            session_reasoning_tokens = max(0, int(reasoning))
+
+    def current_session_context_status() -> tuple[int | None, bool]:
+        active_context, active_estimated = _active_context_token_status_for_history(
+            history,
+            last_token_usage,
+            config,
+        )
+        if active_context is None:
+            if context_carryover_tokens > 0:
+                return context_carryover_tokens, context_carryover_estimated
+            return None, True
+        return context_carryover_tokens + active_context, context_carryover_estimated or active_estimated
 
     for record in records:
         record_type = record.get("type")
@@ -535,6 +552,7 @@ def reconstruct_history_from_rollout(source: Path | str | list[dict[str, Any]]) 
             last_record_was_compacted = False
             continue
         if record_type == "compacted" and isinstance(payload, dict):
+            pre_compact_context, pre_compact_estimated = current_session_context_status()
             replacement_history = payload.get("replacement_history")
             if isinstance(replacement_history, list):
                 history = [item for item in replacement_history if isinstance(item, dict)]
@@ -542,6 +560,17 @@ def reconstruct_history_from_rollout(source: Path | str | list[dict[str, Any]]) 
                 legacy_compaction_without_replacement_history = True
                 message = str(payload.get("message") or "")
                 history = build_compacted_history([], collect_user_message_texts(history), message)
+            if pre_compact_context is not None:
+                context_carryover_tokens = max(0, pre_compact_context)
+                context_carryover_estimated = bool(pre_compact_estimated)
+            if config is not None:
+                estimated_total = _estimate_token_count_with_base_instructions(history, config)
+                last_token_usage = {
+                    "input_tokens": estimated_total,
+                    "output_tokens": 0,
+                    "total_tokens": estimated_total,
+                    "estimated": True,
+                }
             user_turn_contexts = [None for item in history if _is_user_turn_boundary(item)]
             previous_turn_settings = None
             reference_context_item = None
@@ -561,6 +590,8 @@ def reconstruct_history_from_rollout(source: Path | str | list[dict[str, Any]]) 
                 if count > 0:
                     del user_turn_contexts[max(0, len(user_turn_contexts) - count) :]
                     reset_resume_context_from_surviving_turns()
+            elif event_type == "token_count":
+                record_token_info(payload.get("info") if isinstance(payload.get("info"), dict) else None)
             last_boundary_from_response_item = False
             last_record_was_compacted = False
             continue
@@ -584,6 +615,11 @@ def reconstruct_history_from_rollout(source: Path | str | list[dict[str, Any]]) 
         reference_context_item=None if legacy_compaction_without_replacement_history else reference_context_item,
         session_meta=session_meta,
         legacy_compaction_without_replacement_history=legacy_compaction_without_replacement_history,
+        last_token_usage=last_token_usage,
+        total_token_usage=total_token_usage,
+        session_reasoning_tokens=session_reasoning_tokens,
+        context_carryover_tokens=context_carryover_tokens,
+        context_carryover_estimated=context_carryover_estimated,
     )
 
 
@@ -953,6 +989,40 @@ def _estimate_prompt_visible_response_item_token_count(item: dict[str, Any], con
     if not config.resolved_supports_image_input():
         _strip_images_when_unsupported([model_visible])
     return _estimate_response_item_token_count(model_visible)
+
+
+def _active_context_token_status_for_history(
+    history: list[dict[str, Any]],
+    last_token_usage: dict[str, Any] | None,
+    config: CodexConfig | None,
+) -> tuple[int | None, bool]:
+    last_tokens = _usage_total_tokens(last_token_usage or {})
+    local_tokens = 0
+    if config is not None:
+        local_tokens = sum(
+            _estimate_prompt_visible_response_item_token_count(item, config)
+            for item in _items_after_last_model_generated_item(history)
+        )
+    if last_tokens is None and local_tokens <= 0:
+        return None, True
+    estimated = bool((last_token_usage or {}).get("estimated")) or local_tokens > 0
+    return max(0, last_tokens or 0) + local_tokens, estimated
+
+
+def _estimate_token_count_with_base_instructions(history: list[dict[str, Any]], config: CodexConfig) -> int:
+    base_instructions = build_base_instructions(
+        prompt_asset=config.prompt_asset,
+        model=config.model,
+        cwd=config.resolved_cwd(),
+        sandbox=config.sandbox,
+        approval_policy=config.approval_policy,
+        codex_home=config.resolved_codex_home(),
+        memory_tool_enabled=config.memory_tool_enabled,
+        use_memories=config.use_memories,
+    )
+    return _approx_token_count(base_instructions) + sum(
+        _estimate_prompt_visible_response_item_token_count(item, config) for item in history
+    )
 
 
 def _estimate_response_item_model_visible_bytes(item: dict[str, Any]) -> int:

@@ -100,9 +100,26 @@ class CodexSession:
 
     def interrupt(self) -> None:
         self._interrupt_event.set()
-        interrupt_tools = getattr(self.tools, "interrupt_all", None)
-        if callable(interrupt_tools):
-            interrupt_tools()
+        cancel_model = getattr(self.model_client, "cancel", None)
+        interrupt_tools = getattr(self.tools, "request_interrupt", None)
+        if not callable(interrupt_tools):
+            interrupt_tools = getattr(self.tools, "interrupt_all", None)
+        if not callable(cancel_model) and not callable(interrupt_tools):
+            return
+
+        def cancel_runtime() -> None:
+            if callable(cancel_model):
+                try:
+                    cancel_model()
+                except Exception:
+                    pass
+            if callable(interrupt_tools):
+                try:
+                    interrupt_tools()
+                except Exception:
+                    pass
+
+        threading.Thread(target=cancel_runtime, daemon=True).start()
 
     def steer_input(self, prompt: str, *, expected_turn_id: str | None = None) -> str:
         """Attach user input to the currently running regular turn.
@@ -163,12 +180,19 @@ class CodexSession:
         model_client: ModelClient | None = None,
     ) -> "CodexSession":
         session = cls(config, model_client)
-        reconstruction = reconstruct_history_from_rollout(rollout_path)
+        reconstruction = reconstruct_history_from_rollout(rollout_path, session.config)
         session.state.history = deepcopy(reconstruction.history)
         if reconstruction.session_meta and reconstruction.session_meta.get("id"):
             session.state.thread_id = str(reconstruction.session_meta["id"])
         session.state.previous_turn_settings = reconstruction.previous_turn_settings
         session.state.reference_context_item = reconstruction.reference_context_item
+        session.state.last_token_usage = deepcopy(reconstruction.last_token_usage)
+        session.state.total_token_usage = reconstruction.total_token_usage
+        session.state.session_reasoning_tokens = reconstruction.session_reasoning_tokens
+        session.state.context_carryover_tokens = reconstruction.context_carryover_tokens
+        session.state.context_carryover_estimated = reconstruction.context_carryover_estimated
+        if session.state.last_token_usage is None and session.state.history:
+            session.state.recompute_token_usage_from_history()
         session.state._rollout_path = Path(rollout_path)
         session.state._rollout_initialized = True
         session._initial_context_recorded = _history_has_initial_context(session.state.history)
@@ -182,13 +206,20 @@ class CodexSession:
         model_client: ModelClient | None = None,
     ) -> "CodexSession":
         session = cls(config, model_client)
-        reconstruction = reconstruct_history_from_rollout(rollout_path)
+        reconstruction = reconstruct_history_from_rollout(rollout_path, session.config)
         session.state.history = deepcopy(reconstruction.history)
         session.state._rollout_seed_history = deepcopy(reconstruction.history)
         if reconstruction.session_meta and reconstruction.session_meta.get("id"):
             session.state.forked_from_id = str(reconstruction.session_meta["id"])
         session.state.previous_turn_settings = reconstruction.previous_turn_settings
         session.state.reference_context_item = reconstruction.reference_context_item
+        session.state.last_token_usage = deepcopy(reconstruction.last_token_usage)
+        session.state.total_token_usage = reconstruction.total_token_usage
+        session.state.session_reasoning_tokens = reconstruction.session_reasoning_tokens
+        session.state.context_carryover_tokens = reconstruction.context_carryover_tokens
+        session.state.context_carryover_estimated = reconstruction.context_carryover_estimated
+        if session.state.last_token_usage is None and session.state.history:
+            session.state.recompute_token_usage_from_history()
         session._initial_context_recorded = _history_has_initial_context(session.state.history)
         return session
 
@@ -489,8 +520,6 @@ class CodexSession:
         self._begin_active_turn("regular")
         cwd = self.config.resolved_cwd()
         try:
-            if not self.config.skip_git_repo_check and not _inside_git_repo(cwd):
-                raise RuntimeError("not inside a Git repository; pass --skip-git-repo-check to allow this")
             self._maybe_run_memory_startup()
 
             yield self.state.emit("thread.started", cwd=str(cwd), model=self.config.model)
@@ -713,11 +742,13 @@ class CodexSession:
             except TurnInterrupted:
                 raise
             except _ModelStreamFailure as exc:
+                self._check_interrupted()
                 retryable = exc.retryable
                 message = str(exc)
                 error = exc.error
                 response_id = exc.response_id
             except Exception as exc:
+                self._check_interrupted()
                 retryable = _is_retryable_model_stream_error(exc)
                 message = str(exc) or type(exc).__name__
                 error = exc
@@ -1547,6 +1578,28 @@ class _LocalAgentRuntime:
         if interrupt_running:
             record.session.interrupt()
         return _agent_tool_ok({"previous_status": previous})
+
+    def request_interrupt(self) -> None:
+        with self._lock:
+            records = list(self._agents.values())
+        for record in records:
+            with record.condition:
+                if record.running:
+                    record.interrupted = True
+                record.condition.notify_all()
+            record.session.interrupt()
+
+    def interrupt_all(self) -> None:
+        with self._lock:
+            records = list(self._agents.values())
+        for record in records:
+            with record.condition:
+                record.pending.clear()
+                record.shutdown = True
+                if record.running:
+                    record.interrupted = True
+                record.condition.notify_all()
+            record.session.interrupt()
 
     def drain_notifications(self) -> list[dict[str, Any]]:
         with self._lock:

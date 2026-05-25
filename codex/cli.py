@@ -942,7 +942,10 @@ def _run_session_human_interactive(
             for action in reader.poll():
                 if action.kind == "interrupt" and not interrupted:
                     interrupted = True
+                    reader.clear()
                     session.interrupt()
+                    renderer.render_interrupted()
+                    _drain_output_queue(output, input_reader=reader)
                 elif action.kind == "submit" and action.text.strip():
                     accepted = _submit_turn_input(session, action.text, queued_prompts=queued_prompts)
                     renderer.render_pending_input_preview(action.text, active=accepted)
@@ -950,6 +953,13 @@ def _run_session_human_interactive(
             thread.join(timeout=0.03)
     thread.join(timeout=0.1)
     _drain_output_queue(output)
+    outcome = "interrupted" if interrupted else "completed" if status["code"] == 0 else "failed"
+    _print_finished_turn_status(
+        status_tracker,
+        session,
+        color_mode=color_mode,
+        outcome=outcome,
+    )
     return status["code"]
 
 
@@ -997,7 +1007,10 @@ def _run_compact_human_interactive(
             for action in reader.poll():
                 if action.kind == "interrupt" and not interrupted:
                     interrupted = True
+                    reader.clear()
                     session.interrupt()
+                    renderer.render_interrupted()
+                    _drain_output_queue(output, input_reader=reader)
                 elif action.kind == "submit" and action.text.strip():
                     accepted = _submit_turn_input(session, action.text, queued_prompts=queued_prompts)
                     renderer.render_pending_input_preview(action.text, active=accepted)
@@ -1005,6 +1018,13 @@ def _run_compact_human_interactive(
             thread.join(timeout=0.03)
     thread.join(timeout=0.1)
     _drain_output_queue(output)
+    outcome = "interrupted" if interrupted else "compacted" if completed["value"] and not failed["value"] else "failed"
+    _print_finished_turn_status(
+        status_tracker,
+        session,
+        color_mode=color_mode,
+        outcome=outcome,
+    )
     return 0 if completed["value"] else 1
 
 
@@ -1642,6 +1662,8 @@ class _LiveTurnStatusSnapshot:
     session_context_estimated: bool
     session_reasoning_tokens: int | None
     context_window: int | None
+    finished: bool = False
+    outcome: str | None = None
 
 
 class _LiveTurnStatus:
@@ -1667,7 +1689,13 @@ class _LiveTurnStatus:
                 if self._header in {"Compacting", "Reconnecting"}:
                     self._header = "Working"
 
-    def snapshot(self, session: CodexSession) -> _LiveTurnStatusSnapshot:
+    def snapshot(
+        self,
+        session: CodexSession,
+        *,
+        finished: bool = False,
+        outcome: str | None = None,
+    ) -> _LiveTurnStatusSnapshot:
         with self._lock:
             header = self._header
             elapsed = max(0, int(time.monotonic() - self._started_at))
@@ -1690,6 +1718,8 @@ class _LiveTurnStatus:
             session_context_estimated=session_context_estimated,
             session_reasoning_tokens=session_reasoning,
             context_window=context_window,
+            finished=finished,
+            outcome=outcome,
         )
 
 
@@ -2257,10 +2287,13 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
     if snapshot is None:
         return []
     elapsed = _format_elapsed_compact(snapshot.elapsed_seconds)
-    parts = [
-        f"{style.dim('•')} {style.bold(snapshot.header)} "
-        f"{style.dim(f'({elapsed} • esc to interrupt)')}",
-    ]
+    if snapshot.finished:
+        parts = [f"{style.dim('•')} {_finished_status_label(snapshot)} {elapsed}"]
+    else:
+        parts = [
+            f"{style.dim('•')} {style.bold(snapshot.header)} "
+            f"{style.dim(f'({elapsed} • esc to interrupt)')}",
+        ]
     metric_parts: list[str] = []
     if snapshot.goal_status:
         metric_parts.append(snapshot.goal_status)
@@ -2285,6 +2318,37 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
     if len(wrapped) <= 1:
         return wrapped
     return [wrapped[0], *[f"  {style.dim(line)}" for line in wrapped[1:]]]
+
+
+def _print_finished_turn_status(
+    status_tracker: _LiveTurnStatus,
+    session: CodexSession,
+    *,
+    color_mode: str,
+    outcome: str,
+) -> None:
+    if not sys.stderr.isatty():
+        return
+    style = _AnsiStyle(_should_use_color(color_mode))
+    lines = _live_status_display_lines(
+        status_tracker.snapshot(session, finished=True, outcome=outcome),
+        style,
+    )
+    if lines:
+        print("\n".join(lines), file=sys.stderr, flush=True)
+
+
+def _finished_status_label(snapshot: _LiveTurnStatusSnapshot) -> str:
+    outcome = (snapshot.outcome or "completed").lower()
+    if outcome == "interrupted":
+        return "Interrupted after"
+    if outcome == "failed":
+        return "Failed after"
+    if outcome == "compacted":
+        return "Compacted for"
+    if snapshot.header == "Compacting":
+        return "Compacted for"
+    return "Worked for"
 
 
 def _session_auth_indicator(session: CodexSession, *, include_fallback: bool) -> str | None:
@@ -4507,6 +4571,7 @@ class _HumanEventRenderer:
         self._exploration_calls: list[_ExecDisplayCall] = []
         self._final_message: str = ""
         self._final_message_rendered = False
+        self._interrupted_rendered = False
         self._printed_any_cell = False
         self._had_work_activity = False
         self._style = _AnsiStyle(_should_use_color(color_mode))
@@ -4565,6 +4630,9 @@ class _HumanEventRenderer:
         )
 
     def render_interrupted(self) -> None:
+        if self._interrupted_rendered:
+            return
+        self._interrupted_rendered = True
         self._begin_cell()
         self._line(
             f"{self._style.red('■')} "

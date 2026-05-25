@@ -49,6 +49,11 @@ class OpenAIResponsesModel:
         self.api_key = api_key or load_openai_api_key()
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
         self.auth_display_name = "API key" if self.api_key else "OpenAI SDK auth"
+        self._active_responses: list[Any] = []
+        self._active_responses_lock = threading.Lock()
+
+    def cancel(self) -> None:
+        self._close_active_responses()
 
     def create(self, request: PromptRequest) -> ModelResponse:
         return collect_model_stream_events(self.stream(request))
@@ -73,7 +78,12 @@ class OpenAIResponsesModel:
             kwargs["extra_headers"] = extra_headers
         response = client.responses.create(**kwargs)
         if request.stream:
-            yield from iter_model_stream_events(response)
+            self._register_active_response(response)
+            try:
+                yield from iter_model_stream_events(response)
+            finally:
+                self._unregister_active_response(response)
+                _close_response(response)
             return
         data = _model_dump(response)
         yield from _scripted_stream_events(data)
@@ -114,8 +124,28 @@ class OpenAIResponsesModel:
             yield from _scripted_stream_events(payload)
             return
 
-        with response:
-            yield from iter_model_stream_events(_iter_sse_events(response))
+        self._register_active_response(response)
+        try:
+            with response:
+                yield from iter_model_stream_events(_iter_sse_events(response))
+        finally:
+            self._unregister_active_response(response)
+            _close_response(response)
+
+    def _register_active_response(self, response: Any) -> None:
+        with self._active_responses_lock:
+            self._active_responses.append(response)
+
+    def _unregister_active_response(self, response: Any) -> None:
+        with self._active_responses_lock:
+            self._active_responses = [item for item in self._active_responses if item is not response]
+
+    def _close_active_responses(self) -> None:
+        with self._active_responses_lock:
+            responses = list(self._active_responses)
+            self._active_responses.clear()
+        for response in responses:
+            _close_response(response)
 
     def compact(
         self,
@@ -206,6 +236,11 @@ class ChatGPTCodexModel:
         self.auth_snapshot = auth_snapshot or self._load_auth()
         self.base_url = chatgpt_codex_base_url(base_url)
         self.auth_display_name = "ChatGPT"
+        self._active_responses: list[Any] = []
+        self._active_responses_lock = threading.Lock()
+
+    def cancel(self) -> None:
+        self._close_active_responses()
 
     def create(self, request: PromptRequest) -> ModelResponse:
         return collect_model_stream_events(self.stream(request))
@@ -273,8 +308,28 @@ class ChatGPTCodexModel:
             yield from _scripted_stream_events(payload)
             return
 
-        with response:
-            yield from iter_model_stream_events(_iter_sse_events(response))
+        self._register_active_response(response)
+        try:
+            with response:
+                yield from iter_model_stream_events(_iter_sse_events(response))
+        finally:
+            self._unregister_active_response(response)
+            _close_response(response)
+
+    def _register_active_response(self, response: Any) -> None:
+        with self._active_responses_lock:
+            self._active_responses.append(response)
+
+    def _unregister_active_response(self, response: Any) -> None:
+        with self._active_responses_lock:
+            self._active_responses = [item for item in self._active_responses if item is not response]
+
+    def _close_active_responses(self) -> None:
+        with self._active_responses_lock:
+            responses = list(self._active_responses)
+            self._active_responses.clear()
+        for response in responses:
+            _close_response(response)
 
     def _urlopen_bytes(
         self,
@@ -821,6 +876,15 @@ def _event_item_id(data: dict[str, Any]) -> str:
             return str(data[key])
     output_index = data.get("output_index")
     return f"item-{output_index}" if output_index is not None else ""
+
+
+def _close_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 def _model_dump(value: Any) -> dict[str, Any]:

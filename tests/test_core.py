@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import unittest
@@ -444,6 +445,18 @@ class CodexCoreTests(unittest.TestCase):
             "max_iterations exceeded",
             [str(event.payload.get("error")) for event in result.events if event.type == "turn.failed"],
         )
+
+    def test_session_runs_in_non_git_directory_without_skip_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = CodexSession(
+                CodexConfig(cwd=tmp, ephemeral=True),
+                model_client=ScriptedResponsesModel([message("ok outside git")]),
+            )
+
+            result = session.run("hello")
+
+        self.assertEqual(result.final_message, "ok outside git")
+        self.assertFalse([event for event in result.events if event.type == "turn.failed"])
 
     def test_request_user_input_schema_and_default_unavailable_handler(self) -> None:
         runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True))
@@ -1603,6 +1616,36 @@ class CodexCoreTests(unittest.TestCase):
         self.assertNotIn("turn.failed", [event.type for event in events])
         self.assertTrue(any("<turn_aborted>" in text for text in _request_texts(PromptRequest("m", "", session.state.history, []))))
         self.assertTrue(any(item.get("role") == "user" for item in session.state.history))
+
+    def test_interrupt_cancels_model_client_when_available(self) -> None:
+        class CancellableModel:
+            def __init__(self) -> None:
+                self.cancelled = threading.Event()
+
+            def create(self, request: PromptRequest):
+                raise AssertionError("stream expected")
+
+            def stream(self, request: PromptRequest):
+                while not self.cancelled.is_set():
+                    time.sleep(0.01)
+                raise RuntimeError("stream closed")
+
+            def cancel(self) -> None:
+                self.cancelled.set()
+
+        model = CancellableModel()
+        session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True), model_client=model)
+        events: list[Any] = []
+        thread = threading.Thread(target=lambda: events.extend(session.stream("stop this")), daemon=True)
+        thread.start()
+
+        time.sleep(0.05)
+        session.interrupt()
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(model.cancelled.is_set())
+        self.assertIn("turn.aborted", [event.type for event in events])
 
     def test_hook_provider_injects_user_prompt_context_before_model_request(self) -> None:
         class InspectingModel:
@@ -4319,6 +4362,80 @@ class CodexCoreTests(unittest.TestCase):
             self.assertEqual(token_count["info"]["total_token_usage"], 3)
             self.assertEqual(token_count["info"]["last_token_usage"]["total_tokens"], 3)
 
+    def test_resume_from_rollout_restores_token_usage_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            response = message("counted answer")
+            response["usage"] = {
+                "input_tokens": 80,
+                "output_tokens": 20,
+                "total_tokens": 100,
+                "output_tokens_details": {"reasoning_tokens": 7},
+            }
+
+            first = CodexSession(
+                CodexConfig(cwd=root, codex_home=codex_home, skip_git_repo_check=True, ephemeral=False),
+                model_client=ScriptedResponsesModel([response]),
+            ).run("persist token count")
+
+            rollout_path = next((codex_home / "sessions").glob(f"????/??/??/rollout-*-{first.thread_id}.jsonl"))
+            resumed = CodexSession.resume_from_rollout(
+                rollout_path,
+                CodexConfig(cwd=root, codex_home=codex_home, skip_git_repo_check=True, ephemeral=False),
+                model_client=ScriptedResponsesModel([]),
+            )
+
+            self.assertEqual(resumed.state.last_token_usage["total_tokens"], 100)
+            self.assertEqual(resumed.state.session_usage_tokens(), 100)
+            self.assertEqual(resumed.state.session_reasoning_usage_tokens(), 7)
+            self.assertEqual(resumed.state.active_context_token_status(), (100, False))
+            self.assertEqual(resumed.state.session_context_token_status(), (100, False))
+
+    def test_resume_from_compacted_rollout_restores_context_carryover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            config = CodexConfig(cwd=root, codex_home=codex_home, skip_git_repo_check=True, ephemeral=False)
+            session = CodexSession(config, model_client=ScriptedResponsesModel([]))
+            user_item = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first"}]}
+            assistant_item = {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "work"}]}
+
+            session.state.emit("thread.started")
+            session.state.append_history(user_item)
+            session.state.emit("item.completed", item=user_item)
+            session.state.append_history(assistant_item)
+            session.state.emit("item.completed", item=assistant_item)
+            session.state.record_token_usage({"input_tokens": 80, "output_tokens": 20, "total_tokens": 100})
+            session.state.emit("token_count", info=session.state.token_usage_info())
+            pre_compact_context, pre_compact_estimated = session.state.session_context_token_status()
+            session.state.compact_with_summary("handoff summary")
+            session.state.recompute_token_usage_from_history()
+            session.state.start_new_context_epoch(pre_compact_context, estimated=pre_compact_estimated)
+            session.state.emit(
+                "context_compaction.completed",
+                summary="handoff summary",
+                replacement_history=list(session.state.history),
+                active_context_tokens=session.state.active_context_tokens(),
+            )
+
+            rollout_path = session.state.rollout_path()
+            resumed = CodexSession.resume_from_rollout(
+                rollout_path,
+                config,
+                model_client=ScriptedResponsesModel([]),
+            )
+
+            self.assertEqual(resumed.state.context_carryover_tokens, 100)
+            self.assertFalse(resumed.state.context_carryover_estimated)
+            self.assertTrue(resumed.state.last_token_usage["estimated"])
+            active_context, active_estimated = resumed.state.active_context_token_status()
+            session_context, session_estimated = resumed.state.session_context_token_status()
+            self.assertGreater(active_context, 0)
+            self.assertTrue(active_estimated)
+            self.assertEqual(session_context, 100 + active_context)
+            self.assertTrue(session_estimated)
+
     def test_resume_and_fork_from_rollout_seed_session_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5215,6 +5332,64 @@ new file mode 100644
         second = runtime.write_stdin({"session_id": payload["session_id"], "chars": "hello\n", "yield_time_ms": 1500})
         self.assertIn("hello", second.output)
         self.assertIn("ready", second.metadata["aggregated_output"])
+
+    def test_shell_command_interrupts_running_process(self) -> None:
+        runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True, include_shell_command_tool=True))
+        result_holder: dict[str, ToolResult] = {}
+        command = f"{sys.executable!r} -c \"import time; time.sleep(10)\""
+        thread = threading.Thread(
+            target=lambda: result_holder.setdefault(
+                "result",
+                runtime.shell_command({"command": command, "timeout_ms": 30000}),
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with runtime._session_lock:
+                if runtime._active_commands:
+                    break
+            time.sleep(0.01)
+        runtime.interrupt_all()
+        thread.join(timeout=2.0)
+
+        self.assertFalse(thread.is_alive())
+        result = result_holder["result"]
+        self.assertFalse(result.ok)
+        self.assertTrue(result.metadata["metadata"]["interrupted"])
+
+    def test_request_interrupt_preserves_running_unified_exec_session(self) -> None:
+        runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True))
+        result_holder: dict[str, ToolResult] = {}
+        command = f"{sys.executable!r} -c \"import time; print('ready', flush=True); time.sleep(10)\""
+        thread = threading.Thread(
+            target=lambda: result_holder.setdefault(
+                "result",
+                runtime.exec_command({"cmd": command, "yield_time_ms": 30000}),
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with runtime._session_lock:
+                if runtime._active_commands:
+                    break
+            time.sleep(0.01)
+        runtime.request_interrupt()
+        thread.join(timeout=2.0)
+
+        self.assertFalse(thread.is_alive())
+        result = result_holder["result"]
+        self.assertTrue(result.ok)
+        self.assertIn("session_id", result.metadata)
+        session_id = result.metadata["session_id"]
+        with runtime._session_lock:
+            self.assertIn(session_id, runtime._sessions)
+        runtime.interrupt_all()
 
     def test_exec_command_captures_partial_output_without_newline(self) -> None:
         runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True))
@@ -6151,12 +6326,12 @@ new file mode 100644
         self.assertIn("ERROR: scripted model exhausted", completed.stderr)
         self.assertNotIn("Traceback (most recent call last)", completed.stderr)
 
-    def test_cli_human_output_renders_git_check_errors_without_traceback(self) -> None:
-        non_git_dir = Path(os.getcwd()).anchor or os.path.abspath(os.sep)
-        self.assertFalse((Path(non_git_dir) / ".git").exists())
-        with tempfile.TemporaryDirectory():
+    def test_cli_human_output_runs_outside_git_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as non_git_dir:
+            self.assertFalse((Path(non_git_dir) / ".git").exists())
             env = {
                 **os.environ,
+                "PY_CODEX_FAKE_RESPONSES": json.dumps([message("ok outside git")]),
                 "PYTHONPATH": os.getcwd(),
             }
             completed = subprocess.run(
@@ -6176,9 +6351,9 @@ new file mode 100644
                 check=False,
             )
 
-        self.assertEqual(completed.returncode, 1, completed.stderr)
-        self.assertEqual(completed.stdout, "")
-        self.assertIn("ERROR: not inside a Git repository", completed.stderr)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("ok outside git", completed.stdout)
+        self.assertNotIn("not inside a Git repository", completed.stderr)
         self.assertNotIn("Traceback (most recent call last)", completed.stderr)
 
     def test_cli_top_level_errors_do_not_show_runpy_traceback(self) -> None:
@@ -6752,6 +6927,31 @@ new file mode 100644
         self.assertIn("1.5K", rendered)
         self.assertNotIn("~", rendered)
 
+        finished = "\n".join(
+            _live_status_display_lines(
+                _LiveTurnStatusSnapshot(
+                    header="Working",
+                    elapsed_seconds=125,
+                    auth_label="ChatGPT",
+                    goal_status=None,
+                    active_context_tokens=12_700,
+                    active_context_estimated=True,
+                    session_context_tokens=18_200,
+                    session_context_estimated=True,
+                    session_reasoning_tokens=1_500,
+                    context_window=400_000,
+                    finished=True,
+                    outcome="completed",
+                ),
+                _AnsiStyle(False),
+            )
+        )
+        self.assertIn("• Worked for 2m 05s", finished)
+        self.assertIn("ctx 12.7K/400K", finished)
+        self.assertIn("auth", finished)
+        self.assertIn("ChatGPT", finished)
+        self.assertNotIn("esc to interrupt", finished)
+
     def test_chat_startup_panel_summarizes_model_auth_and_fallback_without_secret_leaks(self) -> None:
         from codex import cli
 
@@ -6948,7 +7148,7 @@ new file mode 100644
         self.assertIn("session ", plain)
         self.assertNotIn("Ask Codex to do anything", plain)
         self.assertIn("Conversation interrupted", plain)
-        self.assertIn("Process exited with code", plain)
+        self.assertIn("Process running with session ID", plain)
 
     def test_cli_tty_chat_pending_input_submits_during_running_turn(self) -> None:
         if sys.platform == "win32":

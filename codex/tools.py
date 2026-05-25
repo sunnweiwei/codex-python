@@ -97,6 +97,10 @@ class AgentRuntime(Protocol):
 
     def close_agent(self, arguments: dict[str, Any]) -> ToolResult: ...
 
+    def request_interrupt(self) -> None: ...
+
+    def interrupt_all(self) -> None: ...
+
 
 class ToolRuntime:
     def __init__(
@@ -116,6 +120,7 @@ class ToolRuntime:
         self._approval_cache: set[str] = set()
         self._runtime_event_lock = threading.Lock()
         self._runtime_events: list[dict[str, Any]] = []
+        self._interrupt_event = threading.Event()
 
     def definitions(self) -> list[ToolDefinition]:
         tools = []
@@ -179,7 +184,14 @@ class ToolRuntime:
         with self._runtime_event_lock:
             self._runtime_events.append({"type": event_type, "payload": payload})
 
+    def request_interrupt(self) -> None:
+        self._interrupt_event.set()
+        interrupt_agents = getattr(self.agent_runtime, "request_interrupt", None)
+        if callable(interrupt_agents):
+            interrupt_agents()
+
     def dispatch(self, name: str, arguments: Any, *, call_id: str | None = None) -> ToolResult:
+        self._interrupt_event.clear()
         registry = {tool.name: tool for tool in self.definitions()}
         tool = registry.get(name)
         if tool is None:
@@ -256,6 +268,7 @@ class ToolRuntime:
         }
 
     def interrupt_all(self) -> None:
+        self._interrupt_event.set()
         with self._session_lock:
             commands = [*self._active_commands, *self._sessions.values()]
             self._sessions.clear()
@@ -266,6 +279,9 @@ class ToolRuntime:
                 continue
             seen.add(identity)
             running.interrupt()
+        interrupt_agents = getattr(self.agent_runtime, "interrupt_all", None)
+        if callable(interrupt_agents):
+            interrupt_agents()
 
     def exec_command(self, arguments: Any) -> ToolResult:
         args = _expect_object(arguments)
@@ -365,7 +381,7 @@ class ToolRuntime:
         running.start_readers()
         self._register_active_command(running)
         try:
-            _wait_for_process_or_timeout(process, yield_time_ms)
+            _wait_for_process_or_timeout(process, yield_time_ms, stop_event=self._interrupt_event)
 
             if process.poll() is None:
                 session_id = self._register_session(running)
@@ -399,7 +415,7 @@ class ToolRuntime:
         start = time.monotonic()
         if chars and running.process.poll() is None:
             running.write_stdin(chars)
-        _wait_for_process_or_timeout(running.process, yield_time_ms)
+        _wait_for_process_or_timeout(running.process, yield_time_ms, stop_event=self._interrupt_event)
         try:
             running.process.wait(timeout=0.1)
         except subprocess.TimeoutExpired:
@@ -425,25 +441,53 @@ class ToolRuntime:
         if permission_error is not None:
             return permission_error
         workdir = self._resolve_workdir(args.get("workdir"))
-        timeout = max(int(args.get("timeout_ms", 120000)) / 1000, 1)
+        timeout_ms = max(int(args.get("timeout_ms", 120000)), 1000)
         start = time.monotonic()
-        completed = subprocess.run(
-            _shell_argv(_default_shell(), command, bool(args.get("login", True))),
-            cwd=workdir,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+        try:
+            process, _pty_fd = _spawn_process(
+                _shell_argv(_default_shell(), command, bool(args.get("login", True))),
+                cwd=workdir,
+                tty=False,
+            )
+        except OSError as exc:
+            return ToolResult(False, f"shell_command failed: {exc}", {"tool": "shell_command"})
+        running = RunningCommand(
+            process,
+            command=command,
+            workdir=workdir,
+            tty=False,
+            event_call_id="",
         )
-        output = _join_output(completed.stdout, completed.stderr)
+        running.start_readers()
+        self._register_active_command(running)
+        timed_out = False
+        interrupted = False
+        try:
+            _wait_for_process_or_timeout(process, timeout_ms, stop_event=self._interrupt_event)
+            interrupted = self._interrupt_event.is_set()
+            if process.poll() is None:
+                timed_out = not interrupted
+                running.interrupt()
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+            payload_snapshot = running.snapshot(start, DEFAULT_MAX_OUTPUT_TOKENS)
+        finally:
+            self._unregister_active_command(running)
+        output = payload_snapshot.get("aggregated_output") or payload_snapshot.get("output") or ""
+        exit_code = process.returncode
+        ok = exit_code == 0 and not timed_out and not interrupted
         payload = {
             "output": output,
             "metadata": {
-                "exit_code": completed.returncode,
+                "exit_code": exit_code,
                 "duration_seconds": round(time.monotonic() - start, 3),
+                "timed_out": timed_out,
+                "interrupted": interrupted,
             },
         }
-        return ToolResult(completed.returncode == 0, json.dumps(payload), payload)
+        return ToolResult(ok, json.dumps(payload), payload)
 
     def apply_patch(self, arguments: Any) -> ToolResult:
         if isinstance(arguments, str):
@@ -2148,9 +2192,16 @@ def _session_id_to_prune(sessions: dict[int, RunningCommand]) -> int | None:
     return None
 
 
-def _wait_for_process_or_timeout(process: subprocess.Popen[str], yield_time_ms: int) -> None:
+def _wait_for_process_or_timeout(
+    process: subprocess.Popen[str],
+    yield_time_ms: int,
+    *,
+    stop_event: threading.Event | None = None,
+) -> None:
     deadline = time.monotonic() + max(yield_time_ms, 0) / 1000
     while process.poll() is None and time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return
         time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
 
 
