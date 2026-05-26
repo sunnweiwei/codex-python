@@ -1152,6 +1152,47 @@ def _thread_payload(
     }
 
 
+_CHATGPT_REMOTE_CLIENT_NAMES = {"codex_chatgpt_android_remote", "codex_chatgpt_ios_remote"}
+_REDACTED_PAYLOAD = "[redacted]"
+
+
+def _should_redact_thread_resume_payloads(client_name: str | None) -> bool:
+    return client_name in _CHATGPT_REMOTE_CLIENT_NAMES
+
+
+def _redact_thread_resume_payloads(thread: dict[str, Any]) -> None:
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        return
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        items = turn.get("items")
+        if not isinstance(items, list):
+            continue
+        redacted_items: list[Any] = []
+        for item in items:
+            if not isinstance(item, dict):
+                redacted_items.append(item)
+                continue
+            item_type = item.get("type")
+            if item_type == "imageGeneration":
+                continue
+            if item_type == "mcpToolCall":
+                item["arguments"] = _REDACTED_PAYLOAD
+                if item.get("result") is not None:
+                    item["result"] = {
+                        "content": [{"type": "text", "text": _REDACTED_PAYLOAD}],
+                        "structuredContent": None,
+                        "meta": None,
+                    }
+                error = item.get("error")
+                if isinstance(error, dict):
+                    error["message"] = _REDACTED_PAYLOAD
+            redacted_items.append(item)
+        turn["items"] = redacted_items
+
+
 _DEFAULT_INTERACTIVE_SESSION_SOURCE_STRINGS = {"cli", "vscode"}
 _DEFAULT_INTERACTIVE_CUSTOM_SESSION_SOURCES = {"atlas", "chatgpt"}
 
@@ -1226,6 +1267,8 @@ def _thread_payload_from_rollout(
     include_turns: bool = True,
     items_view: str | None = None,
 ) -> dict[str, Any] | None:
+    if not include_turns:
+        return _thread_metadata_payload_from_rollout(path, config)
     try:
         records = load_rollout_records(path)
         reconstruction = reconstruct_history_from_rollout(records, CodexConfig(codex_home=config.codex_home))
@@ -1249,7 +1292,7 @@ def _thread_payload_from_rollout(
         session_id=str(meta.get("session_id") or thread_id),
         forked_from_id=_optional_string(meta.get("forked_from_id")),
         cwd=cwd,
-        model_provider=str(meta.get("model_provider") or config.model or "openai"),
+        model_provider=str(meta.get("model_provider") or _fallback_model_provider(config)),
         source=_api_session_source(meta.get("source") or "cli"),
         preview=_preview_from_history(reconstruction.history),
         path=str(path),
@@ -1260,6 +1303,97 @@ def _thread_payload_from_rollout(
         ephemeral=False,
         cli_version=str(meta.get("cli_version") or PYTHON_REMOTE_CONTROL_VERSION),
     )
+
+
+def _thread_metadata_payload_from_rollout(
+    path: Path,
+    config: RemoteControlConfig,
+) -> dict[str, Any] | None:
+    meta, preview = _rollout_meta_and_preview(path)
+    if meta is None:
+        return None
+    thread_id = str(meta.get("id") or _thread_id_from_rollout_path(path) or path.stem)
+    cwd = str(meta.get("cwd") or config.cwd)
+    timestamp = _timestamp_to_seconds(meta.get("timestamp")) or int(path.stat().st_mtime)
+    updated_at = int(path.stat().st_mtime)
+    return _thread_payload(
+        thread_id=thread_id,
+        session_id=str(meta.get("session_id") or thread_id),
+        forked_from_id=_optional_string(meta.get("forked_from_id")),
+        cwd=cwd,
+        model_provider=str(meta.get("model_provider") or _fallback_model_provider(config)),
+        source=_api_session_source(meta.get("source") or "cli"),
+        preview=preview,
+        path=str(path),
+        status={"type": "idle"},
+        turns=[],
+        created_at=timestamp,
+        updated_at=updated_at,
+        ephemeral=False,
+        cli_version=str(meta.get("cli_version") or PYTHON_REMOTE_CONTROL_VERSION),
+    )
+
+
+def _rollout_meta_and_preview(path: Path) -> tuple[dict[str, Any] | None, str]:
+    meta: dict[str, Any] | None = None
+    preview = ""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                record_type = record.get("type")
+                payload = record.get("payload")
+                if record_type == "session_meta" and isinstance(payload, dict):
+                    raw_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else payload
+                    meta = dict(raw_meta)
+                if not preview:
+                    preview = _preview_from_rollout_record(record)
+                if meta is not None and preview:
+                    break
+    except Exception:
+        return None, ""
+    return meta, preview
+
+
+def _rollout_cwd(path: Path) -> Path | None:
+    meta, _preview = _rollout_meta_and_preview(path)
+    if not meta:
+        return None
+    cwd = meta.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    return Path(cwd).expanduser()
+
+
+def _fallback_model_provider(config: RemoteControlConfig) -> str:
+    if config.codex_config is not None:
+        return config.codex_config.model_provider_id
+    return "openai"
+
+
+def _preview_from_rollout_record(record: dict[str, Any]) -> str:
+    record_type = record.get("type")
+    payload = record.get("payload")
+    item = record.get("item")
+    text = ""
+    if record_type in {"response_item", "item.completed"}:
+        candidate = payload if isinstance(payload, dict) else item
+        if isinstance(candidate, dict) and candidate.get("type") == "message" and candidate.get("role") == "user":
+            text = _message_text(candidate)
+    elif record_type == "event_msg" and isinstance(payload, dict) and payload.get("type") == "user_message":
+        text = str(payload.get("message") or "")
+    text = text.strip()
+    if not text or text.startswith("<environment_context>"):
+        return ""
+    return text[:160]
 
 
 def _turns_from_history(session: CodexSession, *, items_view: str | None = None) -> list[dict[str, Any]]:

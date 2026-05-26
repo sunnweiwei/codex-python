@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 from typing import Any
 
@@ -11,8 +12,8 @@ from .app_helpers import _initialize_client_name, _opt_out_notification_methods_
 from .app_server import _RemoteAppServer
 from .constants import (
     REMOTE_CONTROL_RECONNECT_SECONDS,
-    REMOTE_CONTROL_WEBSOCKET_CLIENT_PING_TIMEOUT_SECONDS,
     REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL_SECONDS,
+    REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT_SECONDS,
 )
 from .display import remote_control_start_human_lines, remote_control_start_json_output
 from .local import _LocalControlSocketServer, app_server_control_socket_path
@@ -72,6 +73,10 @@ class RemoteControlService:
         self._stream_connections: dict[tuple[str, str], Any] = {}
         self._notification_opt_outs: dict[tuple[str, str], set[str]] = {}
         self._local_control = _LocalControlSocketServer(self, app_server_control_socket_path(config.codex_home))
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_lock = threading.Lock()
+        self._last_pong_at = 0.0
 
     def run_foreground(self) -> int:
         self.config.codex_home.mkdir(parents=True, exist_ok=True)
@@ -202,17 +207,22 @@ class RemoteControlService:
             on_message=lambda ws, message: self._on_message(ws, message),
             on_error=lambda ws, error: self._on_error(error),
             on_close=lambda ws, code, reason: self._on_close(code, reason),
+            on_pong=lambda ws, message: self._on_pong(message),
         )
-        self._ws.run_forever(
-            ping_interval=REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL_SECONDS,
-            ping_timeout=REMOTE_CONTROL_WEBSOCKET_CLIENT_PING_TIMEOUT_SECONDS,
-            http_proxy_host=None,
-            http_proxy_port=None,
-        )
+        try:
+            self._ws.run_forever(
+                ping_interval=0,
+                ping_timeout=None,
+                http_proxy_host=None,
+                http_proxy_port=None,
+            )
+        finally:
+            self._stop_heartbeat()
 
     def _on_open(self, ws: Any) -> None:
         self.status = "connected"
         _remote_log("websocket_open", environment_id=self.environment_id, server_name=self.config.server_name)
+        self._start_heartbeat(ws)
         for envelope in self._outbound_buffer.server_envelopes():
             try:
                 self._send_wire_envelope(ws, envelope)
@@ -237,9 +247,78 @@ class RemoteControlService:
             print(f"Remote control websocket error: {error}", file=sys.stderr, flush=True)
 
     def _on_close(self, code: Any, reason: Any) -> None:
+        self._stop_heartbeat()
         _remote_log("websocket_close", code=code, reason=reason)
         if not self._stop.is_set():
             self.status = "connecting"
+
+    def _on_pong(self, _message: Any) -> None:
+        with self._heartbeat_lock:
+            self._last_pong_at = time.monotonic()
+
+    def _start_heartbeat(self, ws: Any) -> None:
+        self._stop_heartbeat()
+        stop = threading.Event()
+        with self._heartbeat_lock:
+            self._last_pong_at = time.monotonic()
+        self._heartbeat_stop = stop
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            args=(ws, stop),
+            name="codex-remote-control-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        stop = self._heartbeat_stop
+        stop.set()
+        thread = self._heartbeat_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._heartbeat_thread = None
+
+    def _heartbeat_loop(self, ws: Any, stop: threading.Event) -> None:
+        try:
+            import websocket
+        except Exception:
+            return
+        next_ping_at = time.monotonic() + REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL_SECONDS
+        while not stop.is_set() and not self._stop.is_set():
+            with self._heartbeat_lock:
+                pong_deadline = self._last_pong_at + REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT_SECONDS
+            now = time.monotonic()
+            wake_at = min(next_ping_at, pong_deadline)
+            if stop.wait(max(0.0, wake_at - now)):
+                return
+            now = time.monotonic()
+            with self._heartbeat_lock:
+                pong_deadline = self._last_pong_at + REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT_SECONDS
+            if now >= pong_deadline:
+                self.status = "connecting"
+                message = "remote control websocket pong timeout"
+                _remote_log(
+                    "websocket_pong_timeout",
+                    timeout_seconds=REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT_SECONDS,
+                )
+                if not self.config.quiet:
+                    print(f"Remote control websocket error: {message}", file=sys.stderr, flush=True)
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                return
+            if now >= next_ping_at:
+                try:
+                    ws.send("", opcode=websocket.ABNF.OPCODE_PING)
+                except Exception as exc:
+                    _remote_log("websocket_ping_failed", error=str(exc))
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return
+                next_ping_at = now + REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL_SECONDS
 
     def _on_message(self, ws: Any, raw_message: str) -> None:
         trace.append_event(

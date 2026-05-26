@@ -71,6 +71,7 @@ from .app_helpers import (
     _initialize_response,
     _input_text,
     _is_agent_message_delta,
+    _initialize_client_name,
     _join_reader_threads,
     _jsonrpc_error,
     _last_user_message_index,
@@ -85,12 +86,15 @@ from .app_helpers import (
     _remote_approval_decision_grants,
     _remote_control_status_payload,
     _request_user_input_question_payload,
+    _redact_thread_resume_payloads,
     _resize_remote_process_pty,
     _response_item_is_assistant_message,
     _response_item_is_live_tool_echo,
     _response_item_protocol_id,
     _rollout_paths,
+    _rollout_cwd,
     _sandbox_policy_payload,
+    _should_redact_thread_resume_payloads,
     _source_kinds_filter,
     _spawn_remote_process,
     _terminal_interaction_from_write_stdin,
@@ -217,10 +221,14 @@ class _RemoteAppServer:
         self._command_processes: dict[tuple[str, str], _RemoteCommandProcess] = {}
         self._process_processes: dict[tuple[str, str], _RemoteCommandProcess] = {}
         self._pending_server_requests: dict[Any, queue.Queue[dict[str, Any]]] = {}
+        self._client_names: dict[tuple[str, str], str | None] = {}
         self._next_server_request_id = 1
 
     def close_client(self, client_id: str, stream_id: str) -> None:
         with self._lock:
+            for key in list(self._client_names):
+                if key[0] == client_id and (stream_id is None or key[1] == stream_id):
+                    self._client_names.pop(key, None)
             for key in list(self._fs_watches):
                 if key[0] == client_id:
                     self._fs_watches.pop(key, None)
@@ -283,6 +291,8 @@ class _RemoteAppServer:
         request_id: Any = None,
     ) -> dict[str, Any]:
         if method == "initialize":
+            with self._lock:
+                self._client_names[(client_id, stream_id)] = _initialize_client_name(params)
             return _initialize_response(self.service.config, params)
         if method == "initialized":
             return {}
@@ -398,17 +408,21 @@ class _RemoteAppServer:
             self._announce_loaded_thread(session, thread=payload["thread"], fallback=(ws, client_id, stream_id))
             return payload
         if method == "thread/read":
-            session = self._session_from_params(params)
-            return {"thread": self._thread_payload(session, include_turns=bool(params.get("includeTurns", True)))}
+            return {"thread": self._thread_read_payload(params)}
         if method == "thread/resume":
             session = self._resume_session(params)
             self._subscribe_thread(session, ws, client_id, stream_id)
-            return self._thread_start_response(session, include_turns=True)
+            return self._thread_resume_response(
+                session,
+                include_turns=not _remote_bool(params, "excludeTurns", "exclude_turns"),
+                client_id=client_id,
+                stream_id=stream_id,
+            )
         if method == "thread/fork":
             session = self._fork_session(params)
-            payload = self._thread_start_response(session, include_turns=True)
+            payload = self._thread_start_response(session, include_turns=not _remote_bool(params, "excludeTurns", "exclude_turns"))
             self._subscribe_thread(session, ws, client_id, stream_id)
-            self._announce_loaded_thread(session, thread=payload["thread"], fallback=(ws, client_id, stream_id))
+            self._announce_loaded_thread(session, fallback=(ws, client_id, stream_id))
             return payload
         if method == "thread/name/set":
             session = self._session_by_id(str(params.get("threadId") or ""))
@@ -1015,7 +1029,14 @@ class _RemoteAppServer:
         if rollout_path is None:
             raise RemoteControlError("thread/resume could not find the requested thread")
         session_ref: list[CodexSession] = []
-        session = CodexSession.resume_from_rollout(rollout_path, self._config_from_params(params, session_ref=session_ref))
+        session = CodexSession.resume_from_rollout(
+            rollout_path,
+            self._config_from_params(
+                params,
+                session_ref=session_ref,
+                default_cwd=_rollout_cwd(rollout_path),
+            ),
+        )
         session_ref.append(session)
         with self._lock:
             self._sessions[session.state.thread_id] = session
@@ -1030,7 +1051,14 @@ class _RemoteAppServer:
         if rollout_path is None:
             raise RemoteControlError("thread/fork could not find the requested thread")
         session_ref: list[CodexSession] = []
-        session = CodexSession.fork_from_rollout(rollout_path, self._config_from_params(params, session_ref=session_ref))
+        session = CodexSession.fork_from_rollout(
+            rollout_path,
+            self._config_from_params(
+                params,
+                session_ref=session_ref,
+                default_cwd=_rollout_cwd(rollout_path),
+            ),
+        )
         session_ref.append(session)
         with self._lock:
             self._sessions[session.state.thread_id] = session
@@ -1043,7 +1071,11 @@ class _RemoteAppServer:
         path = params.get("path")
         if isinstance(path, str) and path:
             session_ref: list[CodexSession] = []
-            session = CodexSession.resume_from_rollout(path, self._config_from_params({}, session_ref=session_ref))
+            rollout_path = Path(path).expanduser()
+            session = CodexSession.resume_from_rollout(
+                rollout_path,
+                self._config_from_params({}, session_ref=session_ref, default_cwd=_rollout_cwd(rollout_path)),
+            )
             session_ref.append(session)
             return session
         raise RemoteControlError("missing threadId")
@@ -1057,11 +1089,31 @@ class _RemoteAppServer:
         if rollout_path is None:
             raise RemoteControlError(f"unknown thread `{thread_id}`")
         session_ref: list[CodexSession] = []
-        session = CodexSession.resume_from_rollout(rollout_path, self._config_from_params({}, session_ref=session_ref))
+        session = CodexSession.resume_from_rollout(
+            rollout_path,
+            self._config_from_params({}, session_ref=session_ref, default_cwd=_rollout_cwd(rollout_path)),
+        )
         session_ref.append(session)
         with self._lock:
             self._sessions[session.state.thread_id] = session
         return session
+
+    def _thread_read_payload(self, params: dict[str, Any]) -> dict[str, Any]:
+        thread_id = str(params.get("threadId") or "")
+        include_turns = _remote_bool(params, "includeTurns", "include_turns")
+        if not thread_id:
+            raise RemoteControlError("missing threadId")
+        with self._lock:
+            session = self._sessions.get(thread_id)
+        if session is not None:
+            return self._thread_payload(session, include_turns=include_turns)
+        rollout_path = _find_rollout_path(self.service.config.codex_home, thread_id)
+        if rollout_path is None:
+            raise RemoteControlError(f"unknown thread `{thread_id}`")
+        thread = _thread_payload_from_rollout(rollout_path, self.service.config, include_turns=include_turns)
+        if thread is None:
+            raise RemoteControlError(f"could not read thread `{thread_id}`")
+        return thread
 
     def _thread_list_response(self, params: dict[str, Any]) -> dict[str, Any]:
         rows = self._thread_list(params)
@@ -1154,6 +1206,24 @@ class _RemoteAppServer:
             "reasoningEffort": session.config.model_reasoning_effort,
             "instructionSources": [],
         }
+
+    def _thread_resume_response(
+        self,
+        session: CodexSession,
+        *,
+        include_turns: bool,
+        client_id: str,
+        stream_id: str,
+    ) -> dict[str, Any]:
+        payload = self._thread_start_response(session, include_turns=include_turns)
+        self._redact_thread_payload_for_client(payload["thread"], client_id=client_id, stream_id=stream_id)
+        return payload
+
+    def _redact_thread_payload_for_client(self, thread: dict[str, Any], *, client_id: str, stream_id: str) -> None:
+        with self._lock:
+            client_name = self._client_names.get((client_id, stream_id))
+        if _should_redact_thread_resume_payloads(client_name):
+            _redact_thread_resume_payloads(thread)
 
     def _thread_payload(self, session: CodexSession, *, include_turns: bool) -> dict[str, Any]:
         active = session.state.thread_id in self._active_turn_clients
@@ -1835,6 +1905,7 @@ class _RemoteAppServer:
         params: dict[str, Any],
         *,
         session_ref: list[CodexSession] | None = None,
+        default_cwd: Path | str | None = None,
     ) -> CodexConfig:
         base = self.service.config
         template = base.codex_config or CodexConfig(
@@ -1846,7 +1917,7 @@ class _RemoteAppServer:
         )
         return replace(
             template,
-            **_remote_config_override_kwargs(template, params, default_cwd=base.cwd),
+            **_remote_config_override_kwargs(template, params, default_cwd=default_cwd or base.cwd),
             codex_home=base.codex_home,
             auth_codex_home=base.auth_codex_home,
             session_source="cli",
@@ -1974,6 +2045,20 @@ def _items_view_param(raw: Any) -> str | None:
         "NotLoaded": "notLoaded",
     }
     return aliases.get(value)
+
+
+def _remote_bool(params: dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        value = params.get(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+    return False
 
 
 def _thread_list_sort_key_param(raw: Any) -> str:

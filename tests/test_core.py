@@ -8253,6 +8253,48 @@ new file mode 100644
         self.assertIn("  └ write_stdin failed: stdin is closed", rendered)
         self.assertNotIn("write_stdin: failed", rendered)
 
+    def test_cli_human_renderer_write_stdin_argument_failure_renders_as_tool_failure(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer._tool_arguments["stdin-1"] = {"chars": ""}
+        renderer._render_tool_completed(
+            {
+                "name": "write_stdin",
+                "call_id": "stdin-1",
+                "ok": False,
+                "output": "ValueError: missing field `session_id`",
+                "metadata": {"tool": "write_stdin"},
+            }
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn("• Write stdin failed", rendered)
+        self.assertIn("  └ ValueError: missing field `session_id`", rendered)
+        self.assertNotIn("write_stdin: failed", rendered)
+        self.assertNotIn("Waited for background terminal", rendered)
+
+    def test_cli_human_renderer_unknown_tool_failure_uses_action_cell(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer._render_tool_completed(
+            {
+                "name": "write_sdtin",
+                "call_id": "bad-1",
+                "ok": False,
+                "output": "unknown tool: write_sdtin",
+                "metadata": {"tool": "write_sdtin"},
+            }
+        )
+
+        rendered = "\n".join(lines)
+        self.assertIn("• Write sdtin failed", rendered)
+        self.assertIn("  └ unknown tool: write_sdtin", rendered)
+        self.assertFalse(rendered.startswith("write_sdtin:"))
+
     def test_resume_transcript_replays_terminal_interactions_with_command_display(self) -> None:
         from codex.cli import _HumanEventRenderer
         from codex.cli import _render_rollout_transcript_records

@@ -13,7 +13,7 @@ import time
 import unittest
 import base64
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -1671,6 +1671,204 @@ class CodexRemoteControlTests(unittest.TestCase):
         self.assertEqual(loaded["createdAt"], self._seconds("2026-05-21T10:00:00Z"))
         self.assertEqual(loaded["updatedAt"], self._seconds("2026-05-25T15:00:00Z"))
 
+    def test_remote_resume_preserves_rollout_cwd_like_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daemon_cwd = root / "daemon"
+            project_cwd = root / "project"
+            daemon_cwd.mkdir()
+            project_cwd.mkdir()
+            codex_home = root / "codex-home"
+            rollout_path = self._write_rollout(
+                codex_home,
+                thread_id="thread-cwd",
+                source="cli",
+                cwd=project_cwd,
+                preview="project thread",
+            )
+            config = RemoteControlConfig(codex_home=codex_home, auth_codex_home=root / "auth-home", cwd=daemon_cwd)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": config,
+                    "status": "connected",
+                    "installation_id": "install-test",
+                    "environment_id": "env-test",
+                    "send_message": lambda self, ws, client_id, stream_id, message: ws.send(json.dumps(message)),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {"id": 1, "method": "thread/resume", "params": {"path": str(rollout_path), "excludeTurns": True}},
+            )
+            app_server.handle_message(ws, "client-a", "stream-a", {"id": 2, "method": "thread/list", "params": {}})
+
+        responses = {message["id"]: message["result"] for message in ws.sent if "id" in message}
+        resumed = responses[1]["thread"]  # type: ignore[index]
+        listed = responses[2]["data"][0]  # type: ignore[index]
+        self.assertEqual(resumed["cwd"], str(project_cwd.resolve()))
+        self.assertEqual(listed["cwd"], str(project_cwd.resolve()))
+        self.assertEqual(app_server._sessions["thread-cwd"].config.resolved_cwd(), project_cwd.resolve())  # type: ignore[index]
+
+    def test_remote_thread_read_defaults_to_metadata_without_loading_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            self._write_rollout(
+                codex_home,
+                thread_id="thread-read-default",
+                source="cli",
+                cwd=root,
+                preview="read without turns",
+            )
+            config = RemoteControlConfig(codex_home=codex_home, auth_codex_home=root / "auth-home", cwd=root)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": config,
+                    "status": "connected",
+                    "installation_id": "install-test",
+                    "environment_id": "env-test",
+                    "send_message": lambda self, ws, client_id, stream_id, message: ws.send(json.dumps(message)),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {"id": 1, "method": "thread/read", "params": {"threadId": "thread-read-default"}},
+            )
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {"id": 2, "method": "thread/read", "params": {"threadId": "thread-read-default", "includeTurns": True}},
+            )
+
+        responses = {message["id"]: message["result"] for message in ws.sent if "id" in message}
+        self.assertEqual(responses[1]["thread"]["turns"], [])  # type: ignore[index]
+        self.assertEqual(responses[2]["thread"]["turns"][0]["items"][0]["type"], "userMessage")  # type: ignore[index]
+        self.assertEqual(app_server._sessions, {})  # type: ignore[attr-defined]
+
+    def test_remote_resume_and_fork_honor_exclude_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            rollout_path = self._write_rollout(
+                codex_home,
+                thread_id="thread-exclude-turns",
+                source="cli",
+                cwd=root,
+                preview="exclude turns",
+            )
+            config = RemoteControlConfig(codex_home=codex_home, auth_codex_home=root / "auth-home", cwd=root)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": config,
+                    "status": "connected",
+                    "installation_id": "install-test",
+                    "environment_id": "env-test",
+                    "send_message": lambda self, ws, client_id, stream_id, message: ws.send(json.dumps(message)),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {"id": 1, "method": "thread/resume", "params": {"path": str(rollout_path), "excludeTurns": True}},
+            )
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {"id": 2, "method": "thread/fork", "params": {"path": str(rollout_path), "excludeTurns": True}},
+            )
+
+        responses = {message["id"]: message["result"] for message in ws.sent if "id" in message}
+        self.assertEqual(responses[1]["thread"]["turns"], [])  # type: ignore[index]
+        self.assertEqual(responses[2]["thread"]["turns"], [])  # type: ignore[index]
+        thread_started = [message for message in ws.sent if message.get("method") == "thread/started"]
+        self.assertEqual(thread_started[-1]["params"]["thread"]["turns"], [])  # type: ignore[index]
+
+    def test_remote_resume_redacts_mobile_payloads_like_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = RemoteControlConfig(codex_home=root / "codex-home", auth_codex_home=root / "auth-home", cwd=root)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": config,
+                    "status": "connected",
+                    "installation_id": "install-test",
+                    "environment_id": "env-test",
+                    "send_message": lambda self, ws, client_id, stream_id, message: ws.send(json.dumps(message)),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"clientInfo": {"name": "codex_chatgpt_ios_remote", "version": "test"}},
+                },
+            )
+            thread = {
+                "turns": [
+                    {
+                        "items": [
+                            {
+                                "type": "mcpToolCall",
+                                "arguments": {"secret": "arg"},
+                                "result": {"content": [{"type": "text", "text": "secret"}]},
+                                "error": {"message": "secret error"},
+                            },
+                            {"type": "imageGeneration", "result": "base64"},
+                            {"type": "agentMessage", "text": "kept"},
+                        ]
+                    }
+                ]
+            }
+
+            app_server._redact_thread_payload_for_client(thread, client_id="client-a", stream_id="stream-a")  # type: ignore[attr-defined]
+
+        items = thread["turns"][0]["items"]
+        self.assertEqual([item["type"] for item in items], ["mcpToolCall", "agentMessage"])
+        self.assertEqual(items[0]["arguments"], "[redacted]")
+        self.assertEqual(items[0]["result"]["content"][0]["text"], "[redacted]")
+        self.assertEqual(items[0]["error"]["message"], "[redacted]")
+
     def test_remote_thread_loaded_list_returns_loaded_thread_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2359,8 +2557,8 @@ class CodexRemoteControlTests(unittest.TestCase):
             self.assertEqual(
                 _NoopWebSocketApp.instances[0].run_kwargs,
                 {
-                    "ping_interval": REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL_SECONDS,
-                    "ping_timeout": REMOTE_CONTROL_WEBSOCKET_CLIENT_PING_TIMEOUT_SECONDS,
+                    "ping_interval": 0,
+                    "ping_timeout": None,
                     "http_proxy_host": None,
                     "http_proxy_port": None,
                 },
@@ -2402,10 +2600,42 @@ class CodexRemoteControlTests(unittest.TestCase):
     def test_remote_control_websocket_timing_matches_upstream(self) -> None:
         self.assertEqual(REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL_SECONDS, 10)
         self.assertEqual(REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT_SECONDS, 60)
-        self.assertLess(
+        self.assertEqual(
             REMOTE_CONTROL_WEBSOCKET_CLIENT_PING_TIMEOUT_SECONDS,
-            REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL_SECONDS,
+            REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT_SECONDS,
         )
+
+    def test_remote_control_heartbeat_closes_after_upstream_pong_deadline(self) -> None:
+        class _HeartbeatWebSocket:
+            def __init__(self) -> None:
+                self.closed = threading.Event()
+                self.pings = 0
+
+            def send(self, _payload: str, *, opcode: object | None = None) -> None:
+                self.pings += 1
+
+            def close(self) -> None:
+                self.closed.set()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = RemoteControlService(
+                RemoteControlConfig(codex_home=Path(tmp) / "codex-home", cwd=Path(tmp), quiet=False)
+            )
+            service.status = "connected"
+            ws = _HeartbeatWebSocket()
+            stderr = StringIO()
+            with (
+                patch.object(remote_control_service_module, "REMOTE_CONTROL_WEBSOCKET_PING_INTERVAL_SECONDS", 0.01),
+                patch.object(remote_control_service_module, "REMOTE_CONTROL_WEBSOCKET_PONG_TIMEOUT_SECONDS", 0.03),
+                redirect_stdout(StringIO()),
+                redirect_stderr(stderr),
+            ):
+                service._start_heartbeat(ws)
+                self.assertTrue(ws.closed.wait(1.0))
+                service._stop_heartbeat()
+            self.assertGreaterEqual(ws.pings, 1)
+            self.assertEqual(service.status, "connecting")
+            self.assertIn("remote control websocket pong timeout", stderr.getvalue())
 
     def test_remote_control_server_name_override_is_rejected(self) -> None:
         previous = os.environ.get("PY_CODEX_REMOTE_CONTROL_NAME")

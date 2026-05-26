@@ -5921,11 +5921,14 @@ class _HumanEventRenderer:
             self._flush_exploration()
             self._begin_work_cell()
             if not self._render_request_user_input_result(meta, interrupted=not ok):
-                self._line(
-                    f"{self._style.bold('request user input:')} {self._style.green('completed')}"
-                    if ok
-                    else f"{self._style.bold('request user input:')} {self._style.red('failed')}"
-                )
+                if ok:
+                    self._emit_prefixed_lines(
+                        [f"{self._style.bold('Request user input')} {self._style.green('completed')}"],
+                        first_prefix=f"{self._style.dim('•')} ",
+                        rest_prefix="  ",
+                    )
+                else:
+                    self._render_tool_failure(name, _tool_failure_output(payload, meta))
         elif name == "spawn_agent":
             self._render_collab_spawn_end(ok, meta, arguments)
         elif name == "send_input":
@@ -5937,21 +5940,18 @@ class _HumanEventRenderer:
         elif name == "close_agent":
             self._render_collab_close_end(ok, meta, arguments)
         elif name in {"get_goal", "create_goal", "update_goal"}:
-            self._flush_exploration()
-            self._begin_work_cell()
-            status = self._style.green("completed") if ok else self._style.red("failed")
-            self._line(f"{self._style.bold('goal tool:')} {name} {status}")
-            if not ok:
-                output = str(payload.get("output") or "")
-                if output.strip():
-                    self._line(output)
+            if ok:
+                self._flush_exploration()
+                self._begin_work_cell()
+                self._emit_prefixed_lines(
+                    [f"{self._style.bold(_tool_display_title(name))} {self._style.green('completed')}"],
+                    first_prefix=f"{self._style.dim('•')} ",
+                    rest_prefix="  ",
+                )
+            else:
+                self._render_tool_failure(name, _tool_failure_output(payload, meta))
         elif not ok:
-            self._flush_exploration()
-            self._begin_work_cell()
-            output = str(payload.get("output") or "")
-            self._line(f"{self._style.bold(name + ':')} {self._style.red('failed')}")
-            if output.strip():
-                self._line(output)
+            self._render_tool_failure(name, _tool_failure_output(payload, meta))
 
     # --- multi-agent (collab) tool rendering ----------------------------------
     # Mirrors upstream codex-rs/tui/src/multi_agents.rs: each event is a cell
@@ -6250,15 +6250,20 @@ class _HumanEventRenderer:
                 # terminal + the input we sent) followed by the error rendered as a
                 # dim output block, instead of a bare unrendered "write_stdin: failed".
                 chars = str(args.get("chars") or "")
-                output = str(payload.get("output") or "")
-                should_render_interaction = bool(chars.strip()) or bool(output.strip())
+                output = _tool_failure_output(payload, meta)
+                has_terminal_context = bool(command) or event_call_id in self._background_terminal_call_commands
+                should_render_interaction = has_terminal_context and (bool(chars.strip()) or bool(output.strip()))
                 if should_render_interaction and event_call_id not in self._rendered_background_terminal_interactions:
                     self.render_terminal_interaction(session_id, chars, command=command)
-                else:
+                elif should_render_interaction:
                     self._flush_exploration()
                     self._begin_work_cell()
-                if output.strip():
-                    self._render_output_block(output)
+                else:
+                    self._render_tool_failure("write_stdin", output)
+                    self._active_background_terminal_interactions.pop(event_call_id, None)
+                    self._rendered_background_terminal_interactions.discard(event_call_id)
+                    return
+                self._render_output_block(output or "write_stdin failed")
             self._active_background_terminal_interactions.pop(event_call_id, None)
             self._rendered_background_terminal_interactions.discard(event_call_id)
             return
@@ -6607,6 +6612,18 @@ class _HumanEventRenderer:
                 rest_prefix=self._style.dim("    "),
                 transform=self._style.dim,
             )
+
+    def _render_tool_failure(self, name: str, output: str = "") -> None:
+        self._flush_exploration()
+        self._begin_work_cell()
+        title = f"{_tool_display_title(name)} failed"
+        self._emit_prefixed_lines(
+            [self._style.bold(title)],
+            first_prefix=f"{self._style.red('•')} ",
+            rest_prefix="  ",
+        )
+        if output.strip():
+            self._render_output_block(output)
 
     def _ensure_live_exec_region(
         self,
@@ -7130,6 +7147,22 @@ def _visible_command_output(meta: dict[str, Any], payload: dict[str, Any]) -> st
     if not isinstance(output, str) or not output.strip():
         return ""
     return _strip_unified_exec_response_metadata(output)
+
+
+def _tool_failure_output(payload: dict[str, Any], meta: dict[str, Any]) -> str:
+    for source in (payload, meta):
+        for key in ("output", "error", "message"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return ""
+
+
+def _tool_display_title(name: str) -> str:
+    words = " ".join(part for part in name.replace("-", "_").split("_") if part)
+    if not words:
+        return "Tool"
+    return words[:1].upper() + words[1:]
 
 
 def _strip_unified_exec_response_metadata(text: str) -> str:
