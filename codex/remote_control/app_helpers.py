@@ -1276,7 +1276,7 @@ def _thread_payload_from_rollout(
         return None
     meta = reconstruction.session_meta or {}
     thread_id = str(meta.get("id") or _thread_id_from_rollout_path(path) or path.stem)
-    cwd = str(meta.get("cwd") or config.cwd)
+    cwd = _normalized_thread_cwd(meta.get("cwd"), config.cwd)
     timestamp = _timestamp_to_seconds(meta.get("timestamp")) or int(path.stat().st_mtime)
     updated_at = int(path.stat().st_mtime)
     turns: list[dict[str, Any]] = []
@@ -1313,7 +1313,7 @@ def _thread_metadata_payload_from_rollout(
     if meta is None:
         return None
     thread_id = str(meta.get("id") or _thread_id_from_rollout_path(path) or path.stem)
-    cwd = str(meta.get("cwd") or config.cwd)
+    cwd = _normalized_thread_cwd(meta.get("cwd"), config.cwd)
     timestamp = _timestamp_to_seconds(meta.get("timestamp")) or int(path.stat().st_mtime)
     updated_at = int(path.stat().st_mtime)
     return _thread_payload(
@@ -1370,7 +1370,12 @@ def _rollout_cwd(path: Path) -> Path | None:
     cwd = meta.get("cwd")
     if not isinstance(cwd, str) or not cwd:
         return None
-    return Path(cwd).expanduser()
+    return Path(cwd).expanduser().resolve()
+
+
+def _normalized_thread_cwd(raw_cwd: Any, fallback: Path | str) -> str:
+    cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else fallback
+    return str(Path(cwd).expanduser().resolve())
 
 
 def _fallback_model_provider(config: RemoteControlConfig) -> str:
@@ -2192,15 +2197,11 @@ def _find_rollout_path(codex_home: Path, thread_id: str) -> Path | None:
     for path in _rollout_paths(codex_home):
         if thread_id in path.name:
             return path
-        try:
-            records = load_rollout_records(path)
-            for record in records[:4]:
-                payload = record.get("payload")
-                meta = payload.get("meta") if isinstance(payload, dict) else None
-                if isinstance(meta, dict) and meta.get("id") == thread_id:
-                    return path
-        except Exception:
+        meta, _preview = _rollout_meta_and_preview(path)
+        if meta is None:
             continue
+        if meta.get("id") == thread_id or meta.get("session_id") == thread_id:
+            return path
     return None
 
 

@@ -1499,6 +1499,57 @@ class CodexRemoteControlTests(unittest.TestCase):
             self.assertEqual(not_loaded_turns[0]["itemsView"], "notLoaded")
             self.assertEqual(not_loaded_turns[0]["items"], [])
 
+    def test_remote_thread_turns_list_unloaded_rollout_does_not_resume_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            thread_id = "thread-unloaded-turns"
+            rollout_dir = codex_home / "sessions" / "2026" / "05" / "25"
+            rollout_dir.mkdir(parents=True)
+            rollout_path = rollout_dir / f"rollout-2026-05-25T00-00-00-{thread_id}.jsonl"
+            records = [
+                {"type": "session_meta", "payload": {"id": thread_id, "session_id": thread_id, "cwd": str(root), "source": "cli"}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1", "started_at": 1779718400}},
+                {"type": "event_msg", "payload": {"type": "user_message", "message": "第一页。"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": "第一页回复。"}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1", "completed_at": 1779718401}},
+            ]
+            rollout_path.write_text(
+                "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            config = RemoteControlConfig(codex_home=codex_home, auth_codex_home=root / "auth-home", cwd=root)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": config,
+                    "status": "connected",
+                    "installation_id": "install-test",
+                    "environment_id": "env-test",
+                    "send_message": lambda self, ws, client_id, stream_id, message: ws.send(json.dumps(message)),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {"id": 1, "method": "thread/turns/list", "params": {"threadId": thread_id, "itemsView": "summary"}},
+            )
+            app_server.handle_message(ws, "client-a", "stream-a", {"id": 2, "method": "thread/list", "params": {}})
+
+        responses = {message["id"]: message["result"] for message in ws.sent if "id" in message}
+        turns = responses[1]["data"]  # type: ignore[index]
+        self.assertEqual([item["type"] for item in turns[0]["items"]], ["userMessage", "agentMessage"])
+        self.assertEqual(app_server._sessions, {})  # type: ignore[attr-defined]
+        self.assertEqual(responses[2]["data"][0]["cwd"], str(root.resolve()))  # type: ignore[index]
+
     def test_remote_thread_list_defaults_to_upstream_interactive_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1718,6 +1769,62 @@ class CodexRemoteControlTests(unittest.TestCase):
         self.assertEqual(resumed["cwd"], str(project_cwd.resolve()))
         self.assertEqual(listed["cwd"], str(project_cwd.resolve()))
         self.assertEqual(app_server._sessions["thread-cwd"].config.resolved_cwd(), project_cwd.resolve())  # type: ignore[index]
+
+    def test_remote_loaded_thread_keeps_normalized_rollout_cwd_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daemon_cwd = root / "daemon"
+            project_cwd = root / "project"
+            daemon_cwd.mkdir()
+            project_cwd.mkdir()
+            codex_home = root / "codex-home"
+            rollout_path = self._write_rollout(
+                codex_home,
+                thread_id="thread-normalized-cwd",
+                source="cli",
+                cwd=project_cwd / ".." / "project",
+                preview="stable folder",
+            )
+            config = RemoteControlConfig(codex_home=codex_home, auth_codex_home=root / "auth-home", cwd=daemon_cwd)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": config,
+                    "status": "connected",
+                    "installation_id": "install-test",
+                    "environment_id": "env-test",
+                    "send_message": lambda self, ws, client_id, stream_id, message: ws.send(json.dumps(message)),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+
+            app_server.handle_message(ws, "client-a", "stream-a", {"id": 1, "method": "thread/list", "params": {}})
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {"id": 2, "method": "thread/resume", "params": {"path": str(rollout_path), "excludeTurns": True}},
+            )
+            app_server.handle_message(
+                ws,
+                "client-a",
+                "stream-a",
+                {"id": 3, "method": "thread/read", "params": {"threadId": "thread-normalized-cwd"}},
+            )
+            app_server.handle_message(ws, "client-a", "stream-a", {"id": 4, "method": "thread/list", "params": {}})
+
+        responses = {message["id"]: message["result"] for message in ws.sent if "id" in message}
+        expected_cwd = str(project_cwd.resolve())
+        self.assertEqual(responses[1]["data"][0]["cwd"], expected_cwd)  # type: ignore[index]
+        self.assertEqual(responses[2]["thread"]["cwd"], expected_cwd)  # type: ignore[index]
+        self.assertEqual(responses[3]["thread"]["cwd"], expected_cwd)  # type: ignore[index]
+        self.assertEqual(responses[4]["data"][0]["cwd"], expected_cwd)  # type: ignore[index]
+        self.assertEqual(app_server._sessions["thread-normalized-cwd"].config.resolved_cwd(), project_cwd.resolve())  # type: ignore[index]
 
     def test_remote_thread_read_defaults_to_metadata_without_loading_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1106,6 +1106,8 @@ class _RemoteAppServer:
         with self._lock:
             session = self._sessions.get(thread_id)
         if session is not None:
+            if not include_turns:
+                return self._thread_metadata_payload_for_session(session)
             return self._thread_payload(session, include_turns=include_turns)
         rollout_path = _find_rollout_path(self.service.config.codex_home, thread_id)
         if rollout_path is None:
@@ -1135,7 +1137,7 @@ class _RemoteAppServer:
         search_term = str(params.get("searchTerm") or params.get("search_term") or "").strip().lower()
         rows: list[dict[str, Any]] = []
         with self._lock:
-            rows.extend(self._thread_payload(session, include_turns=False) for session in self._sessions.values())
+            rows.extend(self._thread_metadata_payload_for_session(session) for session in self._sessions.values())
         for path in _rollout_paths(self.service.config.codex_home):
             thread = _thread_payload_from_rollout(path, self.service.config, include_turns=False)
             if thread is None:
@@ -1182,14 +1184,57 @@ class _RemoteAppServer:
         if not thread_id:
             raise RemoteControlError("missing threadId")
         items_view = _items_view_param(params.get("itemsView") or params.get("items_view")) or "summary"
-        session = self._session_by_id(thread_id)
-        turns = _turns_from_history(session, items_view=items_view)
+        with self._lock:
+            session = self._sessions.get(thread_id)
+        if session is not None:
+            turns = _turns_from_history(session, items_view=items_view)
+        else:
+            rollout_path = _find_rollout_path(self.service.config.codex_home, thread_id)
+            if rollout_path is None:
+                raise RemoteControlError(f"unknown thread `{thread_id}`")
+            thread = _thread_payload_from_rollout(
+                rollout_path,
+                self.service.config,
+                include_turns=True,
+                items_view=items_view,
+            )
+            if thread is None:
+                raise RemoteControlError(f"could not read thread `{thread_id}`")
+            turns = list(thread.get("turns") or [])
         return _paginate_thread_turns(
             turns,
             cursor=params.get("cursor"),
             limit=params.get("limit"),
             sort_direction=params.get("sortDirection") or params.get("sort_direction"),
         )
+
+    def _thread_metadata_payload_for_session(self, session: CodexSession) -> dict[str, Any]:
+        if not session.config.ephemeral:
+            try:
+                rollout_path = session.state.rollout_path()
+            except Exception:
+                rollout_path = None
+            if isinstance(rollout_path, Path) and rollout_path.exists():
+                thread = _thread_payload_from_rollout(
+                    rollout_path,
+                    self.service.config,
+                    include_turns=False,
+                )
+                if thread is not None:
+                    thread["status"] = (
+                        {"type": "active", "activeFlags": []}
+                        if session.state.thread_id in self._active_turn_clients
+                        else {"type": "idle"}
+                    )
+                    with self._lock:
+                        name = self._thread_names.get(session.state.thread_id)
+                        git_info = self._thread_git_info.get(session.state.thread_id)
+                    if name is not None:
+                        thread["name"] = name
+                    if git_info is not None:
+                        thread["gitInfo"] = git_info
+                    return thread
+        return self._thread_payload(session, include_turns=False)
 
     def _thread_start_response(self, session: CodexSession, *, include_turns: bool = False) -> dict[str, Any]:
         return {
