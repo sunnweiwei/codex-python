@@ -531,8 +531,8 @@ class CodexRemoteControlTests(unittest.TestCase):
         self.assertFalse(process_spawn["streamStdin"])
         self.assertFalse(process_spawn["tty"])
 
-        self.assertEqual(mobile_messages[3]["params"]["cwds"], ["/Users/sunweiwei/NLP/swarm/swarm"])
-        self.assertEqual(mobile_messages[4]["params"]["cwds"], ["/Users/sunweiwei/NLP/swarm/swarm"])
+        self.assertEqual(mobile_messages[3]["params"]["cwds"], [str(Path.cwd().resolve())])
+        self.assertEqual(mobile_messages[4]["params"]["cwds"], [str(Path.cwd().resolve())])
 
     def test_remote_control_desktop_client_identity_can_be_explicitly_disabled(self) -> None:
         previous_originator = os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
@@ -2512,25 +2512,66 @@ def _load_success_trace_fixture() -> list[dict[str, object]]:
     path = Path(__file__).parent / "fixtures" / "remote_control_success_trace.jsonl"
     host = REQUIRED_REMOTE_CONTROL_SERVER_NAME
     host_b64 = base64.b64encode(host.encode("utf-8")).decode("ascii")
+    codex_home = str((Path.home() / ".codex-python").resolve())
+    workspace_cwd = str(Path.cwd().resolve())
+    user_codex_skills = str((Path.home() / ".codex" / "skills").resolve())
     return [
-        _expand_success_trace_placeholders(json.loads(line), host=host, host_b64=host_b64)
+        _expand_success_trace_placeholders(
+            json.loads(line),
+            host=host,
+            host_b64=host_b64,
+            codex_home=codex_home,
+            workspace_cwd=workspace_cwd,
+            user_codex_skills=user_codex_skills,
+        )
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
 
 
-def _expand_success_trace_placeholders(value: object, *, host: str, host_b64: str) -> object:
+def _expand_success_trace_placeholders(
+    value: object,
+    *,
+    host: str,
+    host_b64: str,
+    codex_home: str,
+    workspace_cwd: str,
+    user_codex_skills: str,
+) -> object:
     if isinstance(value, dict):
         return {
-            key: _expand_success_trace_placeholders(item, host=host, host_b64=host_b64)
+            key: _expand_success_trace_placeholders(
+                item,
+                host=host,
+                host_b64=host_b64,
+                codex_home=codex_home,
+                workspace_cwd=workspace_cwd,
+                user_codex_skills=user_codex_skills,
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_expand_success_trace_placeholders(item, host=host, host_b64=host_b64) for item in value]
+        return [
+            _expand_success_trace_placeholders(
+                item,
+                host=host,
+                host_b64=host_b64,
+                codex_home=codex_home,
+                workspace_cwd=workspace_cwd,
+                user_codex_skills=user_codex_skills,
+            )
+            for item in value
+        ]
     if value == "__REMOTE_CONTROL_SERVER_NAME__":
         return host
     if value == "__REMOTE_CONTROL_SERVER_NAME_B64__":
         return host_b64
+    if value == "__CODEX_HOME__":
+        return codex_home
+    if value == "__WORKSPACE_CWD__":
+        return workspace_cwd
+    if value == "__USER_CODEX_SKILLS__":
+        return user_codex_skills
     return value
 
 
