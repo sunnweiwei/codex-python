@@ -567,7 +567,7 @@
       "remote_control": {
         "status": "partial",
         "owner_files": [
-          "agents/codex/remote_control.py",
+          "agents/codex/remote_control/",
           "agents/codex/cli.py",
           "tests/test_codex_remote_control.py"
         ],
@@ -594,22 +594,31 @@
           "common_mobile_bootstrap_methods": "passed_static",
           "thread_goal_methods": "passed_static",
           "native_app_server_thread_protocol": "passed_static",
+          "thread_search_environment_and_memory_methods": "passed_static",
+          "thread_list_provider_defaults": "passed_static",
+          "thread_list_timestamp_cursors": "passed_static",
           "thread_fork_name_metadata_inject_compact_methods": "passed_static",
           "thread_rollback_shell_command_methods": "passed_static",
           "filesystem_utility_methods": "passed_static",
+          "fuzzy_file_search_sessions": "passed_static",
           "auth_status_git_diff_fuzzy_search_methods": "passed_static",
           "account_login_logout_helpers": "passed_static",
           "buffered_command_exec": "passed_static",
+          "command_exec_validation_default_timeout_and_caps": "passed_static",
           "streaming_command_exec_write_terminate": "passed_static",
           "process_spawn_write_kill_resize": "passed_static",
+          "process_spawn_validation_default_timeout_and_caps": "passed_static",
           "server_request_user_input_and_approval_roundtrip": "passed_static",
+          "mobile_collab_agent_tool_call_lifecycle": "passed_static",
+          "mobile_collab_agent_history_replay": "passed_static",
+          "python_rollout_collab_agent_event_persistence": "passed_static",
           "empty_plugin_mcp_config_bootstrap_stubs": "passed_static",
           "native_remote_websocket_relay": "partial",
           "official_daemon_delegation": "not_applicable",
           "mobile_chatgpt_live_smoke": "missing",
           "tests": "passed"
         },
-        "next_gate": "Python now has an official-shaped remote-control protocol module and top-level `remote-control [start|stop]` command that does not require an installed official Codex binary. The native path includes enrollment, websocket connection, segmented client message reassembly, segmented server responses, ack-based outbound buffering, reconnect replay, common mobile bootstrap methods, server-request response routing for request_user_input and approval prompts, thread list/start/resume/fork/read/name/metadata/inject/compact/rollback/shellCommand, thread goal get/set/clear, turn start/steer/interrupt, filesystem utility methods, fuzzy file search, git diff, auth status, account login/logout helpers, empty plugin/marketplace/MCP/config bootstrap stubs, buffered command execution, streaming command/exec stdin/stdout/terminate/resize, and experimental process/spawn stdin/stdout/kill/resize notifications. Remaining gaps are exact full app-server method coverage, real plugin/app/MCP backends, realtime/audio families, true PTY parity for every command path, and live mobile smoke coverage."
+        "next_gate": "Python now has an official-shaped remote-control protocol module and top-level `remote-control [start|stop]` command that does not require an installed official Codex binary. The native path includes enrollment, websocket connection, segmented client message reassembly, segmented server responses, ack-based outbound buffering, reconnect replay, common mobile bootstrap methods, server-request response routing for request_user_input and approval prompts, thread list/search/start/resume/fork/read/name/metadata/settings/memoryMode/inject/compact/rollback/shellCommand/backgroundTerminals, upstream-style thread-list provider defaults and timestamp keyset cursors, thread goal get/set/clear, turn start/steer/interrupt, filesystem utility methods, one-shot and session fuzzy file search, git diff, auth status, account login/logout helpers, environment registration, empty plugin/marketplace/MCP/config bootstrap stubs, buffered command execution with upstream validation/default-timeout/output-cap semantics, streaming command/exec stdin/stdout/terminate/resize, experimental process/spawn stdin/stdout/kill/resize/default-timeout notifications, upstream-shaped mobile collabAgentToolCall lifecycle notifications for multi-agent tools, matching rollout/history replay for official collab_agent_* events, and Python rollout persistence for those events. Remaining gaps are realtime/audio families, real plugin/app/MCP backends, true PTY parity for every command path, test-only upstream mock APIs, and live mobile smoke coverage."
       },
       "mcp_plugins": {
         "status": "missing",
@@ -784,7 +793,7 @@
       "state.py": "in-memory history plus upstream-shaped rollout JSONL scaffold",
       "prompts.py": "copied prompt assets, simplified base instruction assembly, and Memory read/write prompt builders",
       "types.py": "config, lifecycle, event, result, and prompt request dataclasses",
-      "remote_control.py": "native Python remote-control protocol constants, URL/status/envelope helpers, enrollment/websocket connection, segmented transport, ack/reconnect buffering, daemon management, server-request response routing, and partial app-server JSON-RPC bridge with thread/turn, goal, auth/bootstrap, filesystem, search, git diff, empty plugin/MCP/config bootstrap stubs, buffered command-exec, and basic streaming command-exec methods",
+      "remote_control/": "native Python remote-control protocol constants, URL/status/envelope helpers, enrollment/websocket connection, segmented transport, ack/reconnect buffering, daemon management, server-request response routing, and partial app-server JSON-RPC bridge with thread/turn, goal, auth/bootstrap, filesystem, thread search, fuzzy search sessions, git diff, environment registration, empty plugin/MCP/config bootstrap stubs, buffered command-exec validation/default-timeout/output-cap semantics, streaming command-exec methods, process/spawn validation/default-timeout/output-cap semantics, and upstream-shaped mobile item mappings including live and replayed collabAgentToolCall",
       "parity.py": "local parity framework checks plus official codex CLI oracle helper"
     },
     "tool_status": {
@@ -854,27 +863,27 @@
       "spawn_agent": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local Python subagent sessions can spawn/run in background, enforce the depth limit, inherit effective model/reasoning, and sanitize fork_context history to upstream-allowed message items. App-server/cloud thread management and persisted recursive tree semantics remain incomplete."
+        "notes": "Model-visible schema is present and local Python subagent sessions can spawn/run in background, enforce the depth limit, inherit effective model/reasoning, sanitize fork_context history to upstream-allowed message items, persist upstream-shaped collab_agent rollout events, and emit/replay upstream-shaped mobile collabAgentToolCall lifecycle items. Cloud thread management and persisted recursive tree semantics remain incomplete."
       },
       "send_input": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local Python subagent sessions accept queued follow-up input; interrupt=true aborts the active child turn/tools before running the new prompt."
+        "notes": "Model-visible schema is present and local Python subagent sessions accept queued follow-up input; interrupt=true aborts the active child turn/tools before running the new prompt; mobile app-server maps live and replayed rollout events to the upstream sendInput collab tool item."
       },
       "resume_agent": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local closed-agent state can be reopened; app-server persistence remains incomplete."
+        "notes": "Model-visible schema is present and local closed-agent state can be reopened; mobile app-server maps live and replayed status/not-found results to upstream resumeAgent collab states; app-server persistence remains incomplete."
       },
       "wait_agent": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local waits return only final statuses, return an empty status map on timeout, and queue upstream-style subagent completion notifications for the parent context."
+        "notes": "Model-visible schema is present and local waits return only final statuses, return an empty status map on timeout, queue upstream-style subagent completion notifications for the parent context, and mobile app-server maps live and replayed status dictionaries to upstream wait collab states."
       },
       "close_agent": {
         "status": "partial",
         "upstream_default_non_windows": true,
-        "notes": "Model-visible schema is present and local agents can be marked shutdown; running child turns/tools are interrupted, while persisted descendant-tree shutdown remains incomplete."
+        "notes": "Model-visible schema is present and local agents can be marked shutdown; running child turns/tools are interrupted; mobile app-server maps live and replayed previous status to upstream closeAgent collab states, while persisted descendant-tree shutdown remains incomplete."
       },
       "web_search": {
         "status": "partial",

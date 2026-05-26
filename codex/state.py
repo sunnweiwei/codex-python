@@ -1702,6 +1702,15 @@ def _hook_completed_payload(event: CodexEvent) -> dict[str, Any]:
     }
 
 
+_COLLAB_AGENT_TOOL_EVENT_TYPES = {
+    "spawn_agent",
+    "send_input",
+    "resume_agent",
+    "wait_agent",
+    "close_agent",
+}
+
+
 def _tool_started_event_payload(state: CodexState, event: CodexEvent) -> dict[str, Any] | None:
     name = str(event.payload.get("name") or "")
     call_id = str(event.payload.get("call_id") or "")
@@ -1719,7 +1728,163 @@ def _tool_started_event_payload(state: CodexState, event: CodexEvent) -> dict[st
             "parsed_cmd": parse_command_actions(command),
             "source": "agent",
         }
+    if name in _COLLAB_AGENT_TOOL_EVENT_TYPES:
+        return _collab_tool_started_event_payload(state, event)
     return None
+
+
+def _collab_tool_started_event_payload(state: CodexState, event: CodexEvent) -> dict[str, Any] | None:
+    name = str(event.payload.get("name") or "")
+    call_id = str(event.payload.get("call_id") or "")
+    arguments = event.payload.get("arguments")
+    args = arguments if isinstance(arguments, dict) else {}
+    base = {
+        "call_id": call_id,
+        "started_at_ms": int(time.time() * 1000),
+        "sender_thread_id": state.thread_id,
+    }
+    if name == "spawn_agent":
+        return {
+            **base,
+            "type": "collab_agent_spawn_begin",
+            "prompt": _collab_prompt(args),
+            "model": _collab_spawn_model(state, args),
+            "reasoning_effort": _collab_spawn_reasoning_effort(state, args),
+        }
+    if name == "send_input":
+        return {
+            **base,
+            "type": "collab_agent_interaction_begin",
+            "receiver_thread_id": str(args.get("target") or ""),
+            "prompt": _collab_prompt(args),
+        }
+    if name == "wait_agent":
+        targets = args.get("targets")
+        return {
+            **base,
+            "type": "collab_waiting_begin",
+            "receiver_thread_ids": [str(item) for item in targets] if isinstance(targets, list) else [],
+        }
+    if name == "close_agent":
+        return {
+            **base,
+            "type": "collab_close_begin",
+            "receiver_thread_id": str(args.get("target") or ""),
+        }
+    if name == "resume_agent":
+        return {
+            **base,
+            "type": "collab_resume_begin",
+            "receiver_thread_id": str(args.get("id") or ""),
+        }
+    return None
+
+
+def _collab_tool_completed_event_payload(state: CodexState, event: CodexEvent) -> dict[str, Any] | None:
+    name = str(event.payload.get("name") or "")
+    call_id = str(event.payload.get("call_id") or "")
+    raw_args = state._tool_arguments_by_call.pop(call_id, {})
+    args = raw_args if isinstance(raw_args, dict) else {}
+    state._tool_started_at.pop(call_id, None)
+    result = _collab_tool_result_payload(event)
+    base = {
+        "call_id": call_id,
+        "completed_at_ms": int(time.time() * 1000),
+        "sender_thread_id": state.thread_id,
+    }
+    if name == "spawn_agent":
+        agent_id = _optional_str(result.get("agent_id"))
+        return {
+            **base,
+            "type": "collab_agent_spawn_end",
+            "new_thread_id": agent_id,
+            "prompt": _collab_prompt(args),
+            "model": _collab_spawn_model(state, args),
+            "reasoning_effort": _collab_spawn_reasoning_effort(state, args),
+            "status": "running" if bool(event.payload.get("ok")) and agent_id else "not_found",
+        }
+    if name == "send_input":
+        return {
+            **base,
+            "type": "collab_agent_interaction_end",
+            "receiver_thread_id": str(args.get("target") or ""),
+            "prompt": _collab_prompt(args),
+            "status": result.get("status") or ("running" if bool(event.payload.get("ok")) else {"errored": str(event.payload.get("output") or "")}),
+        }
+    if name == "wait_agent":
+        statuses = result.get("status")
+        return {
+            **base,
+            "type": "collab_waiting_end",
+            "statuses": statuses if isinstance(statuses, dict) else {},
+        }
+    if name == "close_agent":
+        return {
+            **base,
+            "type": "collab_close_end",
+            "receiver_thread_id": str(args.get("target") or ""),
+            "status": result.get("previous_status") or ("not_found" if not bool(event.payload.get("ok")) else "shutdown"),
+        }
+    if name == "resume_agent":
+        return {
+            **base,
+            "type": "collab_resume_end",
+            "receiver_thread_id": str(args.get("id") or ""),
+            "status": result.get("status") or ("not_found" if not bool(event.payload.get("ok")) else "running"),
+        }
+    return None
+
+
+def _collab_tool_result_payload(event: CodexEvent) -> dict[str, Any]:
+    metadata = event.payload.get("metadata")
+    result = dict(metadata) if isinstance(metadata, dict) else {}
+    output = event.payload.get("output")
+    if isinstance(output, str) and output:
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            result = {**parsed, **result}
+    return result
+
+
+def _collab_prompt(args: dict[str, Any]) -> str:
+    message = args.get("message")
+    if isinstance(message, str):
+        return message
+    items = args.get("items")
+    if not isinstance(items, list):
+        return ""
+    chunks: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text" and isinstance(item.get("text"), str):
+            chunks.append(item["text"])
+        elif isinstance(item.get("path"), str):
+            chunks.append(item["path"])
+        elif isinstance(item.get("name"), str):
+            chunks.append(item["name"])
+    return "\n".join(chunks)
+
+
+def _collab_spawn_model(state: CodexState, args: dict[str, Any]) -> str:
+    value = args.get("model")
+    return value if isinstance(value, str) and value else state.config.model
+
+
+def _collab_spawn_reasoning_effort(state: CodexState, args: dict[str, Any]) -> str | None:
+    value = args.get("reasoning_effort")
+    effort = value if isinstance(value, str) and value else state.config.model_reasoning_effort
+    return effort if effort in {"none", "minimal", "low", "medium", "high", "xhigh"} else None
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _tool_completed_event_payload(state: CodexState, event: CodexEvent) -> dict[str, Any] | list[dict[str, Any]] | None:
@@ -1777,6 +1942,8 @@ def _tool_completed_event_payload(state: CodexState, event: CodexEvent) -> dict[
             "explanation": metadata.get("explanation"),
             "plan": metadata.get("plan", []),
         }
+    if name in _COLLAB_AGENT_TOOL_EVENT_TYPES:
+        return _collab_tool_completed_event_payload(state, event)
     if name != "exec_command":
         if name == "write_stdin":
             return _write_stdin_event_payload(state, event)

@@ -2143,7 +2143,7 @@ def _item_stream_payload(event: ModelStreamEvent) -> dict[str, Any]:
 
 def _delta_stream_payload(event: ModelStreamEvent) -> dict[str, Any]:
     payload: dict[str, Any] = {}
-    for key in ("item_id", "output_index", "content_index", "delta", "raw_type"):
+    for key in ("item_id", "output_index", "content_index", "summary_index", "delta", "raw_type"):
         if key in event.payload:
             payload[key] = event.payload[key]
     return payload

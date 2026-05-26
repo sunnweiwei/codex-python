@@ -796,6 +796,7 @@ def iter_model_stream_events(events: Iterable[Any]) -> Iterable[ModelStreamEvent
                     "item_id": _event_item_id(data),
                     "output_index": data.get("output_index"),
                     "content_index": data.get("content_index"),
+                    "summary_index": data.get("summary_index"),
                     "delta": data.get("delta"),
                     "raw_type": event_type,
                 },
@@ -859,13 +860,21 @@ def _scripted_item_deltas(item: dict[str, Any]) -> Iterable[dict[str, Any]]:
         for key in ("summary", "content"):
             value = item.get(key)
             if isinstance(value, str):
-                yield {"delta": value, "raw_type": "response.reasoning_summary_text.delta"}
+                yield {"delta": value, "raw_type": "response.reasoning_summary_text.delta", "summary_index": 0}
             elif isinstance(value, list):
-                for part in value:
+                for summary_index, part in enumerate(value):
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        yield {"delta": part["text"], "raw_type": "response.reasoning_summary_text.delta"}
+                        yield {
+                            "delta": part["text"],
+                            "raw_type": "response.reasoning_summary_text.delta",
+                            "summary_index": summary_index,
+                        }
                     elif isinstance(part, str):
-                        yield {"delta": part, "raw_type": "response.reasoning_summary_text.delta"}
+                        yield {
+                            "delta": part,
+                            "raw_type": "response.reasoning_summary_text.delta",
+                            "summary_index": summary_index,
+                        }
     elif item.get("type") == "function_call" and isinstance(item.get("arguments"), str):
         yield {"delta": item["arguments"], "raw_type": "response.function_call_arguments.delta"}
     elif item.get("type") == "custom_tool_call" and isinstance(item.get("input"), str):

@@ -23,7 +23,7 @@ from ..auth import (
 from ..core import CodexSession
 from ..state import load_rollout_records, parse_command_actions, reconstruct_history_from_rollout
 from ..types import CodexConfig
-from .constants import DEFAULT_REMOTE_PROCESS_OUTPUT_BYTES_CAP, PYTHON_REMOTE_CONTROL_VERSION
+from .constants import DEFAULT_REMOTE_EXEC_TIMEOUT_MS, DEFAULT_REMOTE_PROCESS_OUTPUT_BYTES_CAP, PYTHON_REMOTE_CONTROL_VERSION
 from .types import RemoteControlConfig, RemoteControlError
 from .utils import (
     _codex_user_agent,
@@ -45,6 +45,7 @@ class _RemoteCommandProcess:
     cwd: Path
     pty_master_fd: int | None = None
     stdin_enabled: bool = False
+    timeout_timer: threading.Timer | None = None
     stdout_chunks: list[bytes] = field(default_factory=list)
     stderr_chunks: list[bytes] = field(default_factory=list)
     stdout_cap_reached: bool = False
@@ -149,7 +150,7 @@ def _config_read_response(config: RemoteControlConfig) -> dict[str, Any]:
             "sandbox_workspace_write": None,
             "forced_chatgpt_workspace_id": None,
             "forced_login_method": None,
-            "web_search": "enabled" if active.include_web_search_tool else None,
+            "web_search": "live" if active.include_web_search_tool else "disabled",
             "tools": None,
             "instructions": None,
             "developer_instructions": None,
@@ -163,6 +164,16 @@ def _config_read_response(config: RemoteControlConfig) -> dict[str, Any]:
         },
         "origins": {},
         "layers": None,
+    }
+
+
+def _config_write_response(config: RemoteControlConfig) -> dict[str, Any]:
+    config_path = config.codex_home / "config.toml"
+    return {
+        "status": "ok",
+        "version": "python-codex",
+        "filePath": str(config_path),
+        "overriddenMetadata": None,
     }
 
 
@@ -861,36 +872,68 @@ def _close_remote_process_fds(process: _RemoteCommandProcess) -> None:
 
 
 def _command_exec_response(params: dict[str, Any], config: RemoteControlConfig) -> dict[str, Any]:
+    _validate_command_exec_params(params)
     command = _command_exec_argv(params)
     cwd = _command_exec_cwd(params, config)
-    timeout_ms = params.get("timeoutMs")
-    timeout = None
-    if isinstance(timeout_ms, (int, float)) and timeout_ms >= 0:
-        timeout = timeout_ms / 1000
-    if params.get("disableTimeout") is True:
-        timeout = None
+    timeout = _command_exec_timeout_seconds(params)
     env = _command_exec_env(params)
+    cap = _command_exec_output_bytes_cap(params)
     try:
         result = subprocess.run(
             command,
             cwd=str(cwd),
             env=env,
-            text=True,
+            text=False,
             capture_output=True,
             timeout=timeout,
             check=False,
         )
-        return {"exitCode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+        stdout, _observed, _cap_reached = _cap_process_chunk(result.stdout or b"", 0, cap)
+        stderr, _observed, _cap_reached = _cap_process_chunk(result.stderr or b"", 0, cap)
+        return {
+            "exitCode": result.returncode,
+            "stdout": _decode_process_capture([stdout]),
+            "stderr": _decode_process_capture([stderr]),
+        }
     except subprocess.TimeoutExpired as exc:
+        stdout_raw = exc.stdout if isinstance(exc.stdout, bytes) else b""
+        stderr_raw = exc.stderr if isinstance(exc.stderr, bytes) else b"command timed out"
+        stdout, _observed, _cap_reached = _cap_process_chunk(stdout_raw, 0, cap)
+        stderr, _observed, _cap_reached = _cap_process_chunk(stderr_raw, 0, cap)
         return {
             "exitCode": 124,
-            "stdout": exc.stdout if isinstance(exc.stdout, str) else "",
-            "stderr": exc.stderr if isinstance(exc.stderr, str) else "command timed out",
+            "stdout": _decode_process_capture([stdout]),
+            "stderr": _decode_process_capture([stderr]),
         }
 
 
 def _command_exec_is_streaming(params: dict[str, Any]) -> bool:
     return bool(params.get("tty") or params.get("streamStdin") or params.get("streamStdoutStderr"))
+
+
+def _validate_command_exec_params(params: dict[str, Any]) -> None:
+    if params.get("sandboxPolicy") is not None and params.get("permissionProfile") is not None:
+        raise RemoteControlError("`permissionProfile` cannot be combined with `sandboxPolicy`")
+    if params.get("size") is not None and params.get("tty") is not True:
+        raise RemoteControlError("command/exec size requires tty: true")
+    if params.get("disableOutputCap") is True and params.get("outputBytesCap") is not None:
+        raise RemoteControlError("command/exec cannot set both outputBytesCap and disableOutputCap")
+    if params.get("disableTimeout") is True and params.get("timeoutMs") is not None:
+        raise RemoteControlError("command/exec cannot set both timeoutMs and disableTimeout")
+    timeout_ms = params.get("timeoutMs")
+    if isinstance(timeout_ms, (int, float)) and timeout_ms < 0:
+        raise RemoteControlError(f"command/exec timeoutMs must be non-negative, got {timeout_ms}")
+    if _command_exec_is_streaming(params) and not params.get("processId"):
+        raise RemoteControlError("command/exec tty or streaming requires a client-supplied processId")
+
+
+def _command_exec_timeout_seconds(params: dict[str, Any]) -> float | None:
+    if params.get("disableTimeout") is True:
+        return None
+    timeout_ms = params.get("timeoutMs")
+    if isinstance(timeout_ms, (int, float)) and timeout_ms >= 0:
+        return float(timeout_ms) / 1000
+    return DEFAULT_REMOTE_EXEC_TIMEOUT_MS / 1000
 
 
 def _command_exec_output_bytes_cap(params: dict[str, Any]) -> int | None:
@@ -905,7 +948,7 @@ def _command_exec_output_bytes_cap(params: dict[str, Any]) -> int | None:
 def _command_exec_argv(params: dict[str, Any]) -> list[str]:
     command = params.get("command")
     if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
-        raise RemoteControlError("command/exec requires a non-empty command array")
+        raise RemoteControlError("command must not be empty")
     return list(command)
 
 
@@ -951,6 +994,33 @@ def _process_spawn_output_bytes_cap(params: dict[str, Any]) -> int | None:
     if isinstance(cap, int) and cap >= 0:
         return cap
     raise RemoteControlError("process/spawn outputBytesCap must be non-negative")
+
+
+def _process_spawn_timeout_seconds(params: dict[str, Any]) -> float | None:
+    if "timeoutMs" not in params:
+        return DEFAULT_REMOTE_EXEC_TIMEOUT_MS / 1000
+    timeout_ms = params.get("timeoutMs")
+    if timeout_ms is None:
+        return None
+    if isinstance(timeout_ms, (int, float)) and timeout_ms >= 0:
+        return float(timeout_ms) / 1000
+    raise RemoteControlError(f"process/spawn timeoutMs must be non-negative, got {timeout_ms}")
+
+
+def _start_remote_process_timeout(process: _RemoteCommandProcess, timeout_seconds: float | None) -> None:
+    if timeout_seconds is None:
+        return
+    timer = threading.Timer(timeout_seconds, _terminate_remote_process, args=(process,))
+    timer.daemon = True
+    process.timeout_timer = timer
+    timer.start()
+
+
+def _cancel_remote_process_timeout(process: _RemoteCommandProcess) -> None:
+    timer = process.timeout_timer
+    if timer is not None:
+        timer.cancel()
+        process.timeout_timer = None
 
 
 def _terminate_process(popen: subprocess.Popen[Any]) -> None:
@@ -1473,6 +1543,27 @@ def _thread_item_from_response_item(item: Any, *, item_id: Any | None = None) ->
                 "phase": None,
                 "memoryCitation": None,
             }
+    if response_type == "reasoning":
+        return {
+            "type": "reasoning",
+            "id": item_id_str,
+            "summary": _string_list_from_value(item.get("summary")),
+            "content": _string_list_from_value(item.get("content")),
+        }
+    if response_type == "web_search_call":
+        call_id = str(item.get("id") or item.get("call_id") or item_id_str)
+        action = item.get("action")
+        query = item.get("query")
+        if not isinstance(action, dict):
+            action = None
+        if not isinstance(query, str):
+            query = action.get("query") if isinstance(action, dict) else ""
+        return {
+            "type": "webSearch",
+            "id": call_id,
+            "query": query if isinstance(query, str) else "",
+            "action": action,
+        }
     if response_type in {"function_call", "custom_tool_call"}:
         tool = str(item.get("name") or item.get("call_id") or "tool")
         arguments = _json_tool_arguments(item.get("arguments") or item.get("input") or {})
@@ -1498,6 +1589,20 @@ def _thread_item_from_response_item(item: Any, *, item_id: Any | None = None) ->
             "durationMs": None,
         }
     return None
+
+
+def _string_list_from_value(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value else []
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item:
+            out.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"]:
+            out.append(item["text"])
+    return out
 
 
 def _command_execution_item(
@@ -1528,7 +1633,28 @@ def _command_execution_item(
     }
 
 
-_REMOTE_LIVE_TOOL_NAMES = {"exec_command", "shell_command", "write_stdin"}
+_REMOTE_CANONICAL_TOOL_NAMES = {
+    "apply_patch",
+    "exec_command",
+    "request_user_input",
+    "shell_command",
+    "close_agent",
+    "resume_agent",
+    "send_input",
+    "spawn_agent",
+    "update_plan",
+    "view_image",
+    "wait_agent",
+    "write_stdin",
+}
+
+_COLLAB_AGENT_TOOLS = {
+    "spawn_agent": "spawnAgent",
+    "send_input": "sendInput",
+    "resume_agent": "resumeAgent",
+    "wait_agent": "wait",
+    "close_agent": "closeAgent",
+}
 
 
 def _response_item_protocol_id(item: Any, *, item_id: Any | None = None) -> str:
@@ -1552,7 +1678,7 @@ def _response_item_is_live_tool_echo(item: Any, live_tool_call_ids: set[str]) ->
     call_id = str(item.get("call_id") or item.get("id") or "")
     if response_type in {"function_call", "custom_tool_call"}:
         name = str(item.get("name") or "")
-        return name in _REMOTE_LIVE_TOOL_NAMES or call_id in live_tool_call_ids
+        return name in _REMOTE_CANONICAL_TOOL_NAMES or call_id in live_tool_call_ids
     if response_type == "function_call_output":
         return call_id in live_tool_call_ids
     return False
@@ -1599,6 +1725,378 @@ def _command_execution_item_from_tool_started(session: CodexSession, payload: di
         status="inProgress",
         command_actions=_command_actions_from_payload(parse_command_actions(command), command),
     )
+
+
+def _collab_agent_item_from_tool_started(session: CodexSession, payload: dict[str, Any]) -> dict[str, Any] | None:
+    name = str(payload.get("name") or "")
+    tool = _COLLAB_AGENT_TOOLS.get(name)
+    if tool is None:
+        return None
+    call_id = str(payload.get("call_id") or "")
+    if not call_id:
+        return None
+    arguments = payload.get("arguments")
+    args = arguments if isinstance(arguments, dict) else _json_tool_arguments(arguments)
+    return _collab_agent_item(
+        call_id,
+        tool=tool,
+        status="inProgress",
+        sender_thread_id=session.state.thread_id,
+        receiver_thread_ids=_collab_receiver_ids_for_started_tool(name, args),
+        prompt=_collab_prompt_for_tool(name, args),
+        model=_collab_model_for_tool(session, name, args),
+        reasoning_effort=_collab_reasoning_effort_for_tool(session, name, args),
+        agents_states={},
+    )
+
+
+def _collab_agent_item_from_tool_completed(
+    session: CodexSession,
+    payload: dict[str, Any],
+    arguments: Any,
+) -> dict[str, Any] | None:
+    name = str(payload.get("name") or "")
+    tool = _COLLAB_AGENT_TOOLS.get(name)
+    if tool is None:
+        return None
+    call_id = str(payload.get("call_id") or "")
+    if not call_id:
+        return None
+    args = arguments if isinstance(arguments, dict) else _json_tool_arguments(arguments)
+    metadata = payload.get("metadata")
+    result = dict(metadata) if isinstance(metadata, dict) else {}
+    output = payload.get("output")
+    if isinstance(output, str) and output:
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            result = {**parsed, **result}
+    receiver_thread_ids = _collab_receiver_ids_for_completed_tool(name, args, result)
+    agents_states = _collab_agents_states_for_completed_tool(name, receiver_thread_ids, result)
+    status = _collab_tool_call_status(bool(payload.get("ok")), name, receiver_thread_ids, agents_states)
+    return _collab_agent_item(
+        call_id,
+        tool=tool,
+        status=status,
+        sender_thread_id=session.state.thread_id,
+        receiver_thread_ids=receiver_thread_ids,
+        prompt=_collab_prompt_for_tool(name, args),
+        model=_collab_model_for_tool(session, name, args),
+        reasoning_effort=_collab_reasoning_effort_for_tool(session, name, args),
+        agents_states=agents_states,
+    )
+
+
+def _collab_agent_item(
+    item_id: str,
+    *,
+    tool: str,
+    status: str,
+    sender_thread_id: str,
+    receiver_thread_ids: list[str],
+    prompt: str | None,
+    model: str | None,
+    reasoning_effort: str | None,
+    agents_states: dict[str, dict[str, str | None]],
+) -> dict[str, Any]:
+    return {
+        "type": "collabAgentToolCall",
+        "id": item_id,
+        "tool": tool,
+        "status": status,
+        "senderThreadId": sender_thread_id,
+        "receiverThreadIds": receiver_thread_ids,
+        "prompt": prompt,
+        "model": model,
+        "reasoningEffort": reasoning_effort,
+        "agentsStates": agents_states,
+    }
+
+
+def _collab_receiver_ids_for_started_tool(name: str, arguments: dict[str, Any]) -> list[str]:
+    if name == "spawn_agent":
+        return []
+    if name == "wait_agent":
+        targets = arguments.get("targets")
+        return [str(item) for item in targets] if isinstance(targets, list) else []
+    if name == "resume_agent":
+        value = arguments.get("id")
+    else:
+        value = arguments.get("target")
+    return [str(value)] if value is not None and str(value) else []
+
+
+def _collab_receiver_ids_for_completed_tool(
+    name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> list[str]:
+    if name == "spawn_agent":
+        agent_id = result.get("agent_id")
+        return [str(agent_id)] if agent_id is not None and str(agent_id) else []
+    if name == "wait_agent":
+        statuses = result.get("status")
+        if isinstance(statuses, dict) and statuses:
+            return [str(agent_id) for agent_id in statuses.keys()]
+        return _collab_receiver_ids_for_started_tool(name, arguments)
+    return _collab_receiver_ids_for_started_tool(name, arguments)
+
+
+def _collab_agents_states_for_completed_tool(
+    name: str,
+    receiver_thread_ids: list[str],
+    result: dict[str, Any],
+) -> dict[str, dict[str, str | None]]:
+    if name == "spawn_agent":
+        if receiver_thread_ids:
+            return {receiver_thread_ids[0]: _collab_agent_state("running")}
+        return {}
+    if name == "send_input":
+        return {agent_id: _collab_agent_state(result.get("status") or "running") for agent_id in receiver_thread_ids}
+    if name == "resume_agent":
+        status = result.get("status")
+        return {agent_id: _collab_agent_state(status or "running") for agent_id in receiver_thread_ids}
+    if name == "wait_agent":
+        statuses = result.get("status")
+        if isinstance(statuses, dict):
+            return {str(agent_id): _collab_agent_state(status) for agent_id, status in statuses.items()}
+        return {}
+    if name == "close_agent":
+        status = result.get("previous_status")
+        return {agent_id: _collab_agent_state(status or "not_found") for agent_id in receiver_thread_ids}
+    return {}
+
+
+def _collab_agent_state(value: Any) -> dict[str, str | None]:
+    if isinstance(value, dict):
+        if "completed" in value:
+            message = value.get("completed")
+            return {"status": "completed", "message": message if isinstance(message, str) else None}
+        if "errored" in value:
+            message = value.get("errored")
+            return {"status": "errored", "message": str(message) if message is not None else None}
+    raw = str(value or "").strip()
+    normalized = {
+        "pending_init": "pendingInit",
+        "pendingInit": "pendingInit",
+        "running": "running",
+        "interrupted": "interrupted",
+        "completed": "completed",
+        "errored": "errored",
+        "shutdown": "shutdown",
+        "not_found": "notFound",
+        "notFound": "notFound",
+    }.get(raw, "errored" if raw else "running")
+    return {"status": normalized, "message": None}
+
+
+def _collab_tool_call_status(
+    ok: bool,
+    name: str,
+    receiver_thread_ids: list[str],
+    agents_states: dict[str, dict[str, str | None]],
+) -> str:
+    if not ok:
+        return "failed"
+    if name == "spawn_agent" and not receiver_thread_ids:
+        return "failed"
+    if any(state.get("status") in {"errored", "notFound"} for state in agents_states.values()):
+        return "failed"
+    return "completed"
+
+
+def _collab_prompt_for_tool(name: str, arguments: dict[str, Any]) -> str | None:
+    if name not in {"spawn_agent", "send_input"}:
+        return None
+    message = arguments.get("message")
+    if isinstance(message, str) and message.strip():
+        return message
+    items = arguments.get("items")
+    if not isinstance(items, list):
+        return ""
+    chunks: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text" and isinstance(item.get("text"), str):
+            chunks.append(item["text"])
+        elif isinstance(item.get("path"), str):
+            chunks.append(item["path"])
+        elif isinstance(item.get("name"), str):
+            chunks.append(item["name"])
+    return "\n".join(chunk for chunk in chunks if chunk.strip())
+
+
+def _collab_model_for_tool(session: CodexSession, name: str, arguments: dict[str, Any]) -> str | None:
+    if name != "spawn_agent":
+        return None
+    value = arguments.get("model")
+    return value if isinstance(value, str) and value else session.config.model
+
+
+def _collab_reasoning_effort_for_tool(session: CodexSession, name: str, arguments: dict[str, Any]) -> str | None:
+    if name != "spawn_agent":
+        return None
+    value = arguments.get("reasoning_effort")
+    effort = value if isinstance(value, str) and value else session.config.model_reasoning_effort
+    return effort if effort in {"none", "minimal", "low", "medium", "high", "xhigh"} else None
+
+
+def _collab_agent_item_from_event(payload: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = str(payload.get("type") or "")
+    call_id = str(payload.get("call_id") or "")
+    sender_thread_id = str(payload.get("sender_thread_id") or "")
+    if not call_id or not sender_thread_id:
+        return None
+    if event_type == "collab_agent_spawn_begin":
+        return _collab_agent_item(
+            call_id,
+            tool="spawnAgent",
+            status="inProgress",
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=[],
+            prompt=_optional_string(payload.get("prompt")),
+            model=_optional_string(payload.get("model")),
+            reasoning_effort=_collab_reasoning_effort_value(payload.get("reasoning_effort")),
+            agents_states={},
+        )
+    if event_type == "collab_agent_spawn_end":
+        new_thread_id = _optional_string(payload.get("new_thread_id"))
+        receiver_thread_ids = [new_thread_id] if new_thread_id else []
+        agents_states = {new_thread_id: _collab_agent_state(payload.get("status"))} if new_thread_id else {}
+        return _collab_agent_item(
+            call_id,
+            tool="spawnAgent",
+            status=_collab_tool_call_status(True, "spawn_agent", receiver_thread_ids, agents_states),
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=receiver_thread_ids,
+            prompt=_optional_string(payload.get("prompt")),
+            model=_optional_string(payload.get("model")),
+            reasoning_effort=_collab_reasoning_effort_value(payload.get("reasoning_effort")),
+            agents_states=agents_states,
+        )
+    if event_type == "collab_agent_interaction_begin":
+        receiver_id = _optional_string(payload.get("receiver_thread_id"))
+        return _collab_agent_item(
+            call_id,
+            tool="sendInput",
+            status="inProgress",
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=[receiver_id] if receiver_id else [],
+            prompt=_optional_string(payload.get("prompt")),
+            model=None,
+            reasoning_effort=None,
+            agents_states={},
+        )
+    if event_type == "collab_agent_interaction_end":
+        receiver_id = _optional_string(payload.get("receiver_thread_id"))
+        receiver_thread_ids = [receiver_id] if receiver_id else []
+        agents_states = {receiver_id: _collab_agent_state(payload.get("status"))} if receiver_id else {}
+        return _collab_agent_item(
+            call_id,
+            tool="sendInput",
+            status=_collab_tool_call_status(True, "send_input", receiver_thread_ids, agents_states),
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=receiver_thread_ids,
+            prompt=_optional_string(payload.get("prompt")),
+            model=None,
+            reasoning_effort=None,
+            agents_states=agents_states,
+        )
+    if event_type == "collab_waiting_begin":
+        receiver_thread_ids = _string_list_from_value(payload.get("receiver_thread_ids"))
+        return _collab_agent_item(
+            call_id,
+            tool="wait",
+            status="inProgress",
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=receiver_thread_ids,
+            prompt=None,
+            model=None,
+            reasoning_effort=None,
+            agents_states={},
+        )
+    if event_type == "collab_waiting_end":
+        statuses = payload.get("statuses")
+        agents_states = {
+            str(agent_id): _collab_agent_state(status)
+            for agent_id, status in statuses.items()
+        } if isinstance(statuses, dict) else {}
+        return _collab_agent_item(
+            call_id,
+            tool="wait",
+            status=_collab_tool_call_status(True, "wait_agent", list(agents_states.keys()), agents_states),
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=list(agents_states.keys()),
+            prompt=None,
+            model=None,
+            reasoning_effort=None,
+            agents_states=agents_states,
+        )
+    if event_type == "collab_close_begin":
+        receiver_id = _optional_string(payload.get("receiver_thread_id"))
+        return _collab_agent_item(
+            call_id,
+            tool="closeAgent",
+            status="inProgress",
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=[receiver_id] if receiver_id else [],
+            prompt=None,
+            model=None,
+            reasoning_effort=None,
+            agents_states={},
+        )
+    if event_type == "collab_close_end":
+        receiver_id = _optional_string(payload.get("receiver_thread_id"))
+        receiver_thread_ids = [receiver_id] if receiver_id else []
+        agents_states = {receiver_id: _collab_agent_state(payload.get("status"))} if receiver_id else {}
+        return _collab_agent_item(
+            call_id,
+            tool="closeAgent",
+            status=_collab_tool_call_status(True, "close_agent", receiver_thread_ids, agents_states),
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=receiver_thread_ids,
+            prompt=None,
+            model=None,
+            reasoning_effort=None,
+            agents_states=agents_states,
+        )
+    if event_type == "collab_resume_begin":
+        receiver_id = _optional_string(payload.get("receiver_thread_id"))
+        return _collab_agent_item(
+            call_id,
+            tool="resumeAgent",
+            status="inProgress",
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=[receiver_id] if receiver_id else [],
+            prompt=None,
+            model=None,
+            reasoning_effort=None,
+            agents_states={},
+        )
+    if event_type == "collab_resume_end":
+        receiver_id = _optional_string(payload.get("receiver_thread_id"))
+        receiver_thread_ids = [receiver_id] if receiver_id else []
+        agents_states = {receiver_id: _collab_agent_state(payload.get("status"))} if receiver_id else {}
+        return _collab_agent_item(
+            call_id,
+            tool="resumeAgent",
+            status=_collab_tool_call_status(True, "resume_agent", receiver_thread_ids, agents_states),
+            sender_thread_id=sender_thread_id,
+            receiver_thread_ids=receiver_thread_ids,
+            prompt=None,
+            model=None,
+            reasoning_effort=None,
+            agents_states=agents_states,
+        )
+    return None
+
+
+def _collab_reasoning_effort_value(value: Any) -> str | None:
+    effort = value if isinstance(value, str) else None
+    return effort if effort in {"none", "minimal", "low", "medium", "high", "xhigh"} else None
 
 
 def _command_execution_item_from_tool_completed(
@@ -1727,6 +2225,102 @@ def _file_change_item_from_apply_patch_completed(payload: dict[str, Any]) -> dic
         "changes": changes,
         "status": status,
     }
+
+
+def _file_change_patch_updated_payload(
+    thread_id: str,
+    turn_id: str,
+    file_change_item: dict[str, Any],
+) -> dict[str, Any] | None:
+    if file_change_item.get("type") != "fileChange":
+        return None
+    item_id = str(file_change_item.get("id") or "")
+    changes = file_change_item.get("changes")
+    if not item_id or not isinstance(changes, list):
+        return None
+    return {
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "itemId": item_id,
+        "changes": changes,
+    }
+
+
+def _turn_plan_update_payload(
+    thread_id: str,
+    turn_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    if str(payload.get("name") or "") != "update_plan":
+        return None
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    plan = metadata.get("plan")
+    if not isinstance(plan, list):
+        return None
+    steps: list[dict[str, str]] = []
+    for item in plan:
+        if not isinstance(item, dict):
+            continue
+        step = str(item.get("step") or "").strip()
+        if not step:
+            continue
+        status = _plan_step_status(item.get("status"))
+        steps.append({"step": step, "status": status})
+    return {
+        "threadId": thread_id,
+        "turnId": turn_id,
+        "explanation": metadata.get("explanation") if isinstance(metadata.get("explanation"), str) else None,
+        "plan": steps,
+    }
+
+
+def _plan_step_status(value: Any) -> str:
+    normalized = str(value or "pending").strip()
+    if normalized in {"inProgress", "in_progress"}:
+        return "inProgress"
+    if normalized == "completed":
+        return "completed"
+    return "pending"
+
+
+def _context_compaction_item(item_id: str | None = None) -> dict[str, Any]:
+    return {"type": "contextCompaction", "id": item_id or f"context_compaction_{uuid.uuid4().hex}"}
+
+
+def _reasoning_delta_notification(
+    thread_id: str,
+    turn_id: str,
+    payload: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    raw_type = str(payload.get("raw_type") or "")
+    delta = payload.get("delta")
+    item_id = str(payload.get("item_id") or "")
+    if not item_id or not isinstance(delta, str) or not delta:
+        return None
+    if raw_type == "response.reasoning_summary_text.delta":
+        return (
+            "item/reasoning/summaryTextDelta",
+            {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": item_id,
+                "delta": delta,
+                "summaryIndex": _optional_int(payload.get("summary_index")) or 0,
+            },
+        )
+    if raw_type == "response.reasoning_text.delta":
+        return (
+            "item/reasoning/textDelta",
+            {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "itemId": item_id,
+                "delta": delta,
+                "contentIndex": _optional_int(payload.get("content_index")) or 0,
+            },
+        )
+    return None
 
 
 def _protocol_file_update_changes(raw_changes: Any) -> list[dict[str, Any]]:
@@ -1910,6 +2504,9 @@ def _turns_from_rollout_record_iter(records: Iterable[dict[str, Any]]) -> list[d
                         "memoryCitation": payload.get("memory_citation"),
                     }
                 )
+            continue
+        if event_type.startswith("collab_"):
+            append_item(_collab_agent_item_from_event(payload))
             continue
         if event_type in {"exec_command_begin", "exec_command_end"}:
             append_item(_command_execution_item_from_event(payload))

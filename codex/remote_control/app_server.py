@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,23 +40,30 @@ from .app_helpers import (
     _auth_mode_from_account,
     _auth_status_response,
     _cap_process_chunk,
+    _cancel_remote_process_timeout,
     _close_remote_process_fds,
     _collaboration_mode_list_response,
+    _collab_agent_item_from_tool_completed,
+    _collab_agent_item_from_tool_started,
     _command_exec_argv,
     _command_exec_cwd,
     _command_exec_env,
     _command_exec_is_streaming,
     _command_exec_output_bytes_cap,
     _command_exec_response,
+    _command_exec_timeout_seconds,
     _command_execution_item,
     _command_execution_item_from_tool_completed,
     _command_execution_item_from_tool_started,
     _config_read_response,
+    _config_write_response,
+    _context_compaction_item,
     _conversation_summary_response,
     _cwd_filter,
     _decode_process_capture,
     _empty_plugin_detail,
     _file_change_item_from_apply_patch_completed,
+    _file_change_patch_updated_payload,
     _find_rollout_path,
     _fs_copy,
     _fs_create_directory,
@@ -82,9 +90,11 @@ from .app_helpers import (
     _process_spawn_argv,
     _process_spawn_cwd,
     _process_spawn_output_bytes_cap,
+    _process_spawn_timeout_seconds,
     _process_stream_cap_reached,
     _remote_approval_decision_grants,
     _remote_control_status_payload,
+    _reasoning_delta_notification,
     _request_user_input_question_payload,
     _redact_thread_resume_payloads,
     _resize_remote_process_pty,
@@ -97,6 +107,7 @@ from .app_helpers import (
     _should_redact_thread_resume_payloads,
     _source_kinds_filter,
     _spawn_remote_process,
+    _start_remote_process_timeout,
     _terminal_interaction_from_write_stdin,
     _terminate_remote_process,
     _thread_item_from_response_item,
@@ -105,14 +116,22 @@ from .app_helpers import (
     _thread_settings_payload,
     _thread_source_matches,
     _token_usage_payload,
+    _turn_plan_update_payload,
     _turn_payload,
     _turns_from_history,
     _utc_now_iso,
+    _validate_command_exec_params,
     _write_remote_process,
 )
 
 if TYPE_CHECKING:
     from .service import RemoteControlService
+
+
+class _JsonRpcRemoteControlError(RemoteControlError):
+    def __init__(self, message: str, *, code: int = -32000) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _config_sandbox_from_remote_policy(policy: Any, template: CodexConfig) -> tuple[str, str, tuple[Path | str, ...], bool, bool]:
@@ -267,7 +286,11 @@ class _RemoteAppServer:
         self._turn_threads: dict[str, threading.Thread] = {}
         self._thread_names: dict[str, str] = {}
         self._thread_git_info: dict[str, dict[str, str | None]] = {}
+        self._thread_elicitation_counts: dict[str, int] = {}
+        self._thread_memory_modes: dict[str, str] = {}
+        self._remote_environments: dict[str, str] = {}
         self._fs_watches: dict[tuple[str, str], Path] = {}
+        self._fuzzy_search_sessions: dict[tuple[str, str], list[str]] = {}
         self._command_processes: dict[tuple[str, str], _RemoteCommandProcess] = {}
         self._process_processes: dict[tuple[str, str], _RemoteCommandProcess] = {}
         self._pending_server_requests: dict[Any, queue.Queue[dict[str, Any]]] = {}
@@ -282,6 +305,9 @@ class _RemoteAppServer:
             for key in list(self._fs_watches):
                 if key[0] == client_id:
                     self._fs_watches.pop(key, None)
+            for key in list(self._fuzzy_search_sessions):
+                if key[0] == client_id:
+                    self._fuzzy_search_sessions.pop(key, None)
             for thread_id, subscribers in list(self._thread_subscribers.items()):
                 for key in list(subscribers):
                     if key[0] == client_id and (stream_id is None or key[1] == stream_id):
@@ -329,7 +355,7 @@ class _RemoteAppServer:
                 error=str(exc),
             )
             if request_id is not None:
-                self.service.send_message(ws, client_id, stream_id, _jsonrpc_error(request_id, str(exc)))
+                self.service.send_message(ws, client_id, stream_id, _jsonrpc_error(request_id, str(exc), code=getattr(exc, "code", -32000)))
             return
         if isinstance(result, _DeferredResponse):
             return
@@ -431,6 +457,14 @@ class _RemoteAppServer:
         if method == "experimentalFeature/enablement/set":
             enablement = params.get("enablement")
             return {"enablement": enablement if isinstance(enablement, dict) else {}}
+        if method == "environment/add":
+            environment_id = str(params.get("environmentId") or "")
+            exec_server_url = str(params.get("execServerUrl") or "")
+            if not environment_id:
+                raise RemoteControlError("environmentId must not be empty")
+            with self._lock:
+                self._remote_environments[environment_id] = exec_server_url
+            return {}
         if method in {"externalAgentConfig/detect"}:
             return {"items": []}
         if method in {"externalAgentConfig/import"}:
@@ -466,11 +500,15 @@ class _RemoteAppServer:
         if method == "getAuthStatus":
             return _auth_status_response(self.service.config, include_token=bool(params.get("includeToken")))
         if method in {"config/value/write", "config/batchWrite"}:
-            return {}
+            return _config_write_response(self.service.config)
         if method == "thread/list":
             return self._thread_list_response(params)
+        if method == "thread/search":
+            return self._thread_search_response(params)
         if method == "thread/turns/list":
             return self._thread_turns_list(params)
+        if method == "thread/turns/items/list":
+            raise _JsonRpcRemoteControlError("thread/turns/items/list is not supported yet", code=-32601)
         if method == "thread/loaded/list":
             return self._thread_loaded_list(params)
         if method == "thread/start":
@@ -509,6 +547,24 @@ class _RemoteAppServer:
                 {"threadId": session.state.thread_id, "threadName": name},
             )
             return {}
+        if method == "thread/increment_elicitation":
+            session = self._session_by_id(str(params.get("threadId") or ""))
+            with self._lock:
+                count = self._thread_elicitation_counts.get(session.state.thread_id, 0) + 1
+                self._thread_elicitation_counts[session.state.thread_id] = count
+            return {"count": count, "paused": count > 0}
+        if method == "thread/decrement_elicitation":
+            session = self._session_by_id(str(params.get("threadId") or ""))
+            with self._lock:
+                count = self._thread_elicitation_counts.get(session.state.thread_id, 0)
+                if count <= 0:
+                    raise RemoteControlError("out-of-band elicitation count is already zero")
+                count -= 1
+                if count:
+                    self._thread_elicitation_counts[session.state.thread_id] = count
+                else:
+                    self._thread_elicitation_counts.pop(session.state.thread_id, None)
+            return {"count": count, "paused": count > 0}
         if method == "thread/metadata/update":
             session = self._session_by_id(str(params.get("threadId") or ""))
             git_info = params.get("gitInfo")
@@ -533,6 +589,28 @@ class _RemoteAppServer:
                 },
                 fallback=(ws, client_id, stream_id),
             )
+            return {}
+        if method == "thread/memoryMode/set":
+            session = self._session_by_id(str(params.get("threadId") or ""))
+            mode = str(params.get("mode") or "")
+            if mode not in {"enabled", "disabled"}:
+                raise RemoteControlError(f"invalid thread memory mode: {mode}")
+            with self._lock:
+                self._thread_memory_modes[session.state.thread_id] = mode
+            store = getattr(session.config, "memory_state_store", None)
+            if store is not None and hasattr(store, "set_thread_memory_mode"):
+                try:
+                    store.set_thread_memory_mode(session.state.thread_id, mode)
+                except Exception:
+                    pass
+            return {}
+        if method == "memory/reset":
+            store = getattr(self.service.config.codex_config, "memory_state_store", None) if self.service.config.codex_config is not None else None
+            if store is not None and hasattr(store, "clear_memory_data"):
+                try:
+                    store.clear_memory_data()
+                except Exception as exc:
+                    raise RemoteControlError(f"failed to clear memory data: {exc}") from exc
             return {}
         if method == "thread/inject_items":
             session = self._session_by_id(str(params.get("threadId") or ""))
@@ -567,6 +645,9 @@ class _RemoteAppServer:
             return {}
         if method == "thread/approveGuardianDeniedAction":
             return {}
+        if method == "thread/backgroundTerminals/clean":
+            self._session_by_id(str(params.get("threadId") or ""))
+            return {}
         if method == "thread/goal/get":
             session = self._session_by_id(str(params.get("threadId") or params.get("thread_id") or ""))
             goal = session.goals.get_goal()
@@ -585,7 +666,7 @@ class _RemoteAppServer:
             self._notify_thread(
                 session.state.thread_id,
                 "thread/goal/updated",
-                {"goal": goal.to_protocol()},
+                {"threadId": session.state.thread_id, "turnId": None, "goal": goal.to_protocol()},
             )
             return {"goal": goal.to_protocol()}
         if method == "thread/goal/clear":
@@ -672,6 +753,44 @@ class _RemoteAppServer:
             return {}
         if method == "fuzzyFileSearch":
             return _fuzzy_file_search_response(params)
+        if method == "fuzzyFileSearch/sessionStart":
+            session_id = str(params.get("sessionId") or "")
+            if not session_id:
+                raise RemoteControlError("sessionId must not be empty")
+            roots = params.get("roots")
+            if not isinstance(roots, list):
+                roots = []
+            with self._lock:
+                self._fuzzy_search_sessions[(client_id, session_id)] = [root for root in roots if isinstance(root, str)]
+            return {}
+        if method == "fuzzyFileSearch/sessionUpdate":
+            session_id = str(params.get("sessionId") or "")
+            query = str(params.get("query") or "")
+            with self._lock:
+                roots = self._fuzzy_search_sessions.get((client_id, session_id))
+            if roots is None:
+                raise RemoteControlError(f"fuzzy file search session not found: {session_id}")
+            files = _fuzzy_file_search_response({"query": query, "roots": roots}).get("files", [])
+            self.service.send_notification(
+                ws,
+                client_id,
+                stream_id,
+                "fuzzyFileSearch/sessionUpdated",
+                {"sessionId": session_id, "query": query, "files": files},
+            )
+            return {}
+        if method == "fuzzyFileSearch/sessionStop":
+            session_id = str(params.get("sessionId") or "")
+            with self._lock:
+                self._fuzzy_search_sessions.pop((client_id, session_id), None)
+            self.service.send_notification(
+                ws,
+                client_id,
+                stream_id,
+                "fuzzyFileSearch/sessionCompleted",
+                {"sessionId": session_id},
+            )
+            return {}
         if method == "gitDiffToRemote":
             return _git_diff_to_remote_response(params)
         if method == "getConversationSummary":
@@ -819,6 +938,7 @@ class _RemoteAppServer:
     ) -> None:
         started_at = int(time.time())
         current_agent_item_id: str | None = None
+        current_compaction_item_id: str | None = None
         announced_start = False
         tool_arguments_by_call_id: dict[str, Any] = {}
         live_tool_call_ids: set[str] = set()
@@ -838,15 +958,6 @@ class _RemoteAppServer:
                         except queue.Full:
                             pass
                     announced_start = True
-                    self._notify_thread(
-                        session.state.thread_id,
-                        "thread/settings/updated",
-                        {
-                            "threadId": session.state.thread_id,
-                            "threadSettings": _thread_settings_payload(session),
-                        },
-                        fallback=fallback_ref,
-                    )
                     self._notify_thread(
                         session.state.thread_id,
                         "thread/status/changed",
@@ -903,6 +1014,20 @@ class _RemoteAppServer:
                             fallback=fallback_ref,
                         )
                 elif event.type == "item.delta":
+                    reasoning_delta = _reasoning_delta_notification(
+                        session.state.thread_id,
+                        session.state.turn_id,
+                        event.payload,
+                    )
+                    if reasoning_delta is not None:
+                        method, params = reasoning_delta
+                        self._notify_thread(
+                            session.state.thread_id,
+                            method,
+                            params,
+                            fallback=fallback_ref,
+                        )
+                        continue
                     delta = event.payload.get("delta")
                     if isinstance(delta, str) and delta and _is_agent_message_delta(
                         event.payload,
@@ -928,6 +1053,20 @@ class _RemoteAppServer:
                         tool_arguments_by_call_id[call_id] = event.payload.get("arguments")
                     if str(event.payload.get("name") or "") in {"exec_command", "shell_command", "write_stdin"} and call_id:
                         live_tool_call_ids.add(call_id)
+                    collab_item = _collab_agent_item_from_tool_started(session, event.payload)
+                    if collab_item is not None:
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "item/started",
+                            {
+                                "threadId": session.state.thread_id,
+                                "turnId": session.state.turn_id,
+                                "item": collab_item,
+                                "startedAtMs": _now_ms(),
+                            },
+                            fallback=fallback_ref,
+                        )
+                        continue
                     item = _command_execution_item_from_tool_started(session, event.payload)
                     if item is not None:
                         self._notify_thread(
@@ -959,8 +1098,43 @@ class _RemoteAppServer:
                 elif event.type == "tool.completed":
                     call_id = str(event.payload.get("call_id") or "")
                     arguments = tool_arguments_by_call_id.pop(call_id, {}) if call_id else {}
+                    collab_item = _collab_agent_item_from_tool_completed(session, event.payload, arguments)
+                    if collab_item is not None:
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "item/completed",
+                            {
+                                "threadId": session.state.thread_id,
+                                "turnId": session.state.turn_id,
+                                "item": collab_item,
+                                "completedAtMs": _now_ms(),
+                            },
+                            fallback=fallback_ref,
+                        )
+                        continue
+                    plan_payload = _turn_plan_update_payload(session.state.thread_id, session.state.turn_id, event.payload)
+                    if plan_payload is not None:
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "turn/plan/updated",
+                            plan_payload,
+                            fallback=fallback_ref,
+                        )
+                        continue
                     file_change_item = _file_change_item_from_apply_patch_completed(event.payload)
                     if file_change_item is not None:
+                        patch_payload = _file_change_patch_updated_payload(
+                            session.state.thread_id,
+                            session.state.turn_id,
+                            file_change_item,
+                        )
+                        if patch_payload is not None:
+                            self._notify_thread(
+                                session.state.thread_id,
+                                "item/fileChange/patchUpdated",
+                                patch_payload,
+                                fallback=fallback_ref,
+                            )
                         self._notify_thread(
                             session.state.thread_id,
                             "item/completed",
@@ -1007,13 +1181,86 @@ class _RemoteAppServer:
                             },
                             fallback=fallback_ref,
                         )
+                elif event.type == "turn_diff":
+                    diff = event.payload.get("unified_diff")
+                    if isinstance(diff, str):
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "turn/diff/updated",
+                            {
+                                "threadId": session.state.thread_id,
+                                "turnId": session.state.turn_id,
+                                "diff": diff,
+                            },
+                            fallback=fallback_ref,
+                        )
+                elif event.type == "context_compaction.started":
+                    current_compaction_item_id = f"context_compaction_{uuid.uuid4().hex}"
+                    self._notify_thread(
+                        session.state.thread_id,
+                        "item/started",
+                        {
+                            "threadId": session.state.thread_id,
+                            "turnId": session.state.turn_id,
+                            "item": _context_compaction_item(current_compaction_item_id),
+                            "startedAtMs": _now_ms(),
+                        },
+                        fallback=fallback_ref,
+                    )
+                elif event.type == "context_compaction.completed":
+                    if current_compaction_item_id is None:
+                        current_compaction_item_id = f"context_compaction_{uuid.uuid4().hex}"
+                    self._notify_thread(
+                        session.state.thread_id,
+                        "item/completed",
+                        {
+                            "threadId": session.state.thread_id,
+                            "turnId": session.state.turn_id,
+                            "item": _context_compaction_item(current_compaction_item_id),
+                            "completedAtMs": _now_ms(),
+                        },
+                        fallback=fallback_ref,
+                    )
+                elif event.type == "warning":
+                    message = event.payload.get("message")
+                    if isinstance(message, str) and message:
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "warning",
+                            {"threadId": session.state.thread_id, "message": message},
+                            fallback=fallback_ref,
+                        )
+                elif event.type == "stream_error":
+                    message = str(event.payload.get("message") or event.payload.get("error") or "")
+                    if message:
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "error",
+                            {
+                                "threadId": session.state.thread_id,
+                                "turnId": session.state.turn_id,
+                                "willRetry": True,
+                                "error": {
+                                    "message": message,
+                                    "codexErrorInfo": None,
+                                    "additionalDetails": str(event.payload.get("error") or "") or None,
+                                },
+                            },
+                            fallback=fallback_ref,
+                        )
                 elif event.type == "thread.goal.updated":
                     goal = event.payload.get("goal")
                     if isinstance(goal, dict):
+                        thread_id = str(event.payload.get("thread_id") or goal.get("threadId") or session.state.thread_id)
+                        turn_id = event.payload.get("turn_id")
                         self._notify_thread(
                             session.state.thread_id,
                             "thread/goal/updated",
-                            {"goal": goal},
+                            {
+                                "threadId": thread_id,
+                                "turnId": turn_id if isinstance(turn_id, str) else None,
+                                "goal": goal,
+                            },
                             fallback=fallback_ref,
                         )
                 elif event.type == "thread.goal.cleared":
@@ -1040,6 +1287,17 @@ class _RemoteAppServer:
                         error=str(event.payload.get("error") or event.payload.get("reason") or ""),
                     )
         except Exception as exc:
+            self._notify_thread(
+                session.state.thread_id,
+                "error",
+                {
+                    "threadId": session.state.thread_id,
+                    "turnId": session.state.turn_id,
+                    "willRetry": False,
+                    "error": {"message": str(exc), "codexErrorInfo": None, "additionalDetails": None},
+                },
+                fallback=fallback_ref,
+            )
             final_turn = _turn_payload(
                 session.state.turn_id,
                 status="failed",
@@ -1203,7 +1461,10 @@ class _RemoteAppServer:
 
     def _thread_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         cwd_filter = _cwd_filter(params.get("cwd"))
-        model_providers = _model_providers_filter(params.get("modelProviders") or params.get("model_providers"))
+        model_provider_param = params.get("modelProviders")
+        if model_provider_param is None and "model_providers" in params:
+            model_provider_param = params.get("model_providers")
+        model_providers = _model_providers_filter(model_provider_param)
         source_kinds = _source_kinds_filter(params.get("sourceKinds"))
         archived = bool(params.get("archived"))
         search_term = str(params.get("searchTerm") or params.get("search_term") or "").strip().lower()
@@ -1222,13 +1483,47 @@ class _RemoteAppServer:
         if cwd_filter:
             rows = [row for row in rows if row.get("cwd") in cwd_filter]
         rows = [row for row in rows if _thread_source_matches(row.get("source"), source_kinds)]
+        if model_providers is None and not isinstance(model_provider_param, list):
+            model_providers = {_default_thread_model_provider(self.service.config)}
         if model_providers is not None:
             rows = [row for row in rows if row.get("modelProvider") in model_providers]
         if archived:
             rows = []
         if search_term:
-            rows = [row for row in rows if search_term in str(row.get("preview") or "").lower()]
+            rows = [
+                row
+                for row in rows
+                if search_term in str(row.get("preview") or "").lower()
+                or search_term in str(row.get("name") or "").lower()
+            ]
         return rows
+
+    def _thread_search_response(self, params: dict[str, Any]) -> dict[str, Any]:
+        search_term = str(params.get("searchTerm") or params.get("search_term") or "").strip()
+        if not search_term:
+            raise RemoteControlError("thread/search requires a non-empty searchTerm")
+        rows = self._thread_list({**params, "searchTerm": search_term})
+        sort_key = _thread_list_sort_key_param(params.get("sortKey") or params.get("sort_key"))
+        sort_direction = _sort_direction_param(params.get("sortDirection") or params.get("sort_direction"))
+        _sort_thread_list_rows(rows, sort_key=sort_key, sort_direction=sort_direction)
+        page = _paginate_thread_list_rows(
+            rows,
+            cursor=params.get("cursor"),
+            limit=params.get("limit"),
+            sort_direction=sort_direction,
+        )
+        needle = search_term.lower()
+        return {
+            "data": [
+                {
+                    "thread": row,
+                    "snippet": _thread_search_snippet(row, needle),
+                }
+                for row in page["data"]
+            ],
+            "nextCursor": page.get("nextCursor"),
+            "backwardsCursor": page.get("backwardsCursor"),
+        }
 
     def _thread_loaded_list(self, params: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -1407,20 +1702,128 @@ class _RemoteAppServer:
 
     def _compact_thread(self, ws: Any, client_id: str, stream_id: str, session: CodexSession) -> None:
         fallback_ref = (ws, client_id, stream_id)
+        started_at = int(time.time())
+        turn = _turn_payload(session.state.turn_id, status="inProgress", started_at=started_at)
+        final_turn = turn
+        compaction_item_id: str | None = None
         try:
-            session.compact()
+            for event in session.stream_compact():
+                if event.type == "turn.started":
+                    started_at = int(time.time())
+                    turn = _turn_payload(session.state.turn_id, status="inProgress", started_at=started_at)
+                    final_turn = turn
+                    self._notify_thread(
+                        session.state.thread_id,
+                        "thread/status/changed",
+                        {"threadId": session.state.thread_id, "status": {"type": "active", "activeFlags": []}},
+                        fallback=fallback_ref,
+                    )
+                    self._notify_thread(
+                        session.state.thread_id,
+                        "turn/started",
+                        {"threadId": session.state.thread_id, "turn": turn},
+                        fallback=fallback_ref,
+                    )
+                elif event.type == "context_compaction.started":
+                    compaction_item_id = f"context_compaction_{uuid.uuid4().hex}"
+                    self._notify_thread(
+                        session.state.thread_id,
+                        "item/started",
+                        {
+                            "threadId": session.state.thread_id,
+                            "turnId": session.state.turn_id,
+                            "item": _context_compaction_item(compaction_item_id),
+                            "startedAtMs": _now_ms(),
+                        },
+                        fallback=fallback_ref,
+                    )
+                elif event.type == "context_compaction.completed":
+                    if compaction_item_id is None:
+                        compaction_item_id = f"context_compaction_{uuid.uuid4().hex}"
+                    item = _context_compaction_item(compaction_item_id)
+                    self._notify_thread(
+                        session.state.thread_id,
+                        "item/completed",
+                        {
+                            "threadId": session.state.thread_id,
+                            "turnId": session.state.turn_id,
+                            "item": item,
+                            "completedAtMs": _now_ms(),
+                        },
+                        fallback=fallback_ref,
+                    )
+                    final_turn = _turn_payload(
+                        session.state.turn_id,
+                        status="completed",
+                        started_at=started_at,
+                        completed_at=int(time.time()),
+                        items=[item],
+                    )
+                elif event.type == "warning":
+                    message = event.payload.get("message")
+                    if isinstance(message, str) and message:
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "warning",
+                            {"threadId": session.state.thread_id, "message": message},
+                            fallback=fallback_ref,
+                        )
+                elif event.type == "stream_error":
+                    message = str(event.payload.get("message") or event.payload.get("error") or "")
+                    if message:
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "error",
+                            {
+                                "threadId": session.state.thread_id,
+                                "turnId": session.state.turn_id,
+                                "willRetry": True,
+                                "error": {
+                                    "message": message,
+                                    "codexErrorInfo": None,
+                                    "additionalDetails": str(event.payload.get("error") or "") or None,
+                                },
+                            },
+                            fallback=fallback_ref,
+                        )
+                elif event.type in {"turn.failed", "turn.aborted"}:
+                    status = "interrupted" if event.type == "turn.aborted" else "failed"
+                    final_turn = _turn_payload(
+                        session.state.turn_id,
+                        status=status,
+                        started_at=started_at,
+                        completed_at=int(time.time()),
+                        error=str(event.payload.get("error") or event.payload.get("reason") or ""),
+                    )
         except Exception as exc:
             self._notify_thread(
                 session.state.thread_id,
                 "error",
-                {"message": str(exc)},
+                {
+                    "threadId": session.state.thread_id,
+                    "turnId": session.state.turn_id,
+                    "willRetry": False,
+                    "error": {"message": str(exc), "codexErrorInfo": None, "additionalDetails": None},
+                },
                 fallback=fallback_ref,
             )
-            return
+            final_turn = _turn_payload(
+                session.state.turn_id,
+                status="failed",
+                started_at=started_at,
+                completed_at=int(time.time()),
+                error=str(exc),
+            )
         self._notify_thread(
             session.state.thread_id,
-            "thread/compacted",
-            {"threadId": session.state.thread_id, "turnId": session.state.turn_id},
+            "turn/completed",
+            {"threadId": session.state.thread_id, "turn": final_turn},
+            fallback=fallback_ref,
+        )
+        self._notify_thread(
+            session.state.thread_id,
+            "thread/status/changed",
+            {"threadId": session.state.thread_id, "status": {"type": "idle"}},
             fallback=fallback_ref,
         )
 
@@ -1474,22 +1877,50 @@ class _RemoteAppServer:
         )
         started_at = time.time()
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 command,
                 cwd=str(session.config.resolved_cwd()),
                 shell=True,
-                text=True,
-                capture_output=True,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
             )
-            output = (result.stdout or "") + (result.stderr or "")
+            chunks: list[bytes] = []
+            assert process.stdout is not None
+            stdout_fd = process.stdout.fileno()
+            while True:
+                try:
+                    chunk = os.read(stdout_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                delta = chunk.decode("utf-8", errors="replace")
+                self._notify_thread(
+                    session.state.thread_id,
+                    "item/commandExecution/outputDelta",
+                    {
+                        "threadId": session.state.thread_id,
+                        "turnId": session.state.turn_id,
+                        "itemId": item_id,
+                        "delta": delta,
+                    },
+                    fallback=fallback_ref,
+                )
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+            exit_code = process.wait()
+            output = b"".join(chunks).decode("utf-8", errors="replace")
             item = _command_execution_item(
                 item_id,
                 command=command,
                 cwd=str(session.config.resolved_cwd()),
-                status="completed" if result.returncode == 0 else "failed",
+                status="completed" if exit_code == 0 else "failed",
                 aggregated_output=output,
-                exit_code=result.returncode,
+                exit_code=exit_code,
                 duration_ms=int((time.time() - started_at) * 1000),
             )
             session.state.append_history(
@@ -1497,7 +1928,7 @@ class _RemoteAppServer:
                     "type": "function_call_output",
                     "call_id": item_id,
                     "output": output,
-                    "status": "completed" if result.returncode == 0 else "failed",
+                    "status": "completed" if exit_code == 0 else "failed",
                 }
             )
         except Exception as exc:
@@ -1544,10 +1975,9 @@ class _RemoteAppServer:
         request_id: Any,
         params: dict[str, Any],
     ) -> None:
+        _validate_command_exec_params(params)
         command = _command_exec_argv(params)
         process_id = str(params.get("processId") or "")
-        if not process_id:
-            raise RemoteControlError("streaming command/exec requires processId")
         with self._lock:
             if (client_id, process_id) in self._command_processes:
                 raise RemoteControlError(f"duplicate active command/exec process id: {process_id}")
@@ -1565,6 +1995,7 @@ class _RemoteAppServer:
             stream_stdin=stream_stdin,
             size=params.get("size"),
         )
+        _start_remote_process_timeout(process, _command_exec_timeout_seconds(params))
         with self._lock:
             self._command_processes[(client_id, process_id)] = process
         output_cap = _command_exec_output_bytes_cap(params)
@@ -1601,6 +2032,7 @@ class _RemoteAppServer:
         tty = bool(params.get("tty"))
         if params.get("size") is not None and not tty:
             raise RemoteControlError("process/spawn size requires tty: true")
+        timeout_seconds = _process_spawn_timeout_seconds(params)
         stream_stdin = tty or bool(params.get("streamStdin"))
         stream_output = tty or bool(params.get("streamStdoutStderr"))
         process = _spawn_remote_process(
@@ -1612,6 +2044,7 @@ class _RemoteAppServer:
             stream_stdin=stream_stdin,
             size=params.get("size"),
         )
+        _start_remote_process_timeout(process, timeout_seconds)
         with self._lock:
             self._process_processes[(client_id, process_handle)] = process
         self._start_output_readers(
@@ -1784,6 +2217,7 @@ class _RemoteAppServer:
         process: _RemoteCommandProcess,
     ) -> None:
         exit_code = process.popen.wait()
+        _cancel_remote_process_timeout(process)
         _join_reader_threads(process)
         with self._lock:
             self._command_processes.pop((client_id, process.process_id), None)
@@ -1810,6 +2244,7 @@ class _RemoteAppServer:
         process: _RemoteCommandProcess,
     ) -> None:
         exit_code = process.popen.wait()
+        _cancel_remote_process_timeout(process)
         _join_reader_threads(process)
         with self._lock:
             self._process_processes.pop((client_id, process.process_id), None)
@@ -2187,6 +2622,20 @@ def _thread_list_sort_key_param(raw: Any) -> str:
     return "createdAt"
 
 
+def _thread_search_snippet(row: dict[str, Any], needle: str) -> str:
+    preview = str(row.get("preview") or row.get("name") or "")
+    if not needle:
+        return preview
+    index = preview.lower().find(needle)
+    if index < 0:
+        return preview[:160]
+    start = max(0, index - 60)
+    end = min(len(preview), index + len(needle) + 100)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(preview) else ""
+    return f"{prefix}{preview[start:end]}{suffix}"
+
+
 def _sort_direction_param(raw: Any) -> str:
     if not isinstance(raw, str):
         return "desc"
@@ -2205,9 +2654,21 @@ def _model_providers_filter(raw: Any) -> set[str] | None:
 
 def _sort_thread_list_rows(rows: list[dict[str, Any]], *, sort_key: str, sort_direction: str) -> None:
     timestamp_key = "updatedAt" if sort_key == "updatedAt" else "createdAt"
+    groups: dict[int, list[str]] = {}
+    for row in rows:
+        timestamp = _optional_int(row.get(timestamp_key)) or 0
+        groups.setdefault(timestamp, []).append(str(row.get("id") or ""))
+    ranks: dict[tuple[int, str], int] = {}
+    for timestamp, ids in groups.items():
+        for rank, thread_id in enumerate(sorted(set(ids))):
+            ranks[(timestamp, thread_id)] = rank
 
-    def key(row: dict[str, Any]) -> tuple[int, str]:
-        return (_optional_int(row.get(timestamp_key)) or 0, str(row.get("id") or ""))
+    def key(row: dict[str, Any]) -> int:
+        timestamp = _optional_int(row.get(timestamp_key)) or 0
+        thread_id = str(row.get("id") or "")
+        sort_millis = timestamp * 1000 + ranks.get((timestamp, thread_id), 0)
+        row["_threadListSortMillis"] = sort_millis
+        return sort_millis
 
     rows.sort(key=key, reverse=sort_direction != "asc")
 
@@ -2221,20 +2682,34 @@ def _paginate_thread_list_rows(
 ) -> dict[str, Any]:
     anchor = _parse_thread_list_cursor(cursor)
     if anchor is not None:
-        anchor_id = str(anchor.get("threadId") or anchor.get("thread_id") or "")
-        include_anchor = bool(anchor.get("includeAnchor") or anchor.get("include_anchor"))
-        anchor_index = next((index for index, row in enumerate(rows) if str(row.get("id") or "") == anchor_id), None)
-        if anchor_index is None:
-            raise RemoteControlError("invalid cursor: anchor thread is no longer present")
-        rows = rows[anchor_index if include_anchor else anchor_index + 1 :]
-    page_size = _optional_int(limit) or 50
-    page_size = max(1, min(page_size, 200))
+        if "sortMillis" in anchor:
+            anchor_millis = _optional_int(anchor.get("sortMillis"))
+            if anchor_millis is None:
+                raise RemoteControlError("invalid cursor: missing timestamp")
+            if sort_direction == "asc":
+                rows = [row for row in rows if _thread_list_sort_millis(row) > anchor_millis]
+            else:
+                rows = [row for row in rows if _thread_list_sort_millis(row) < anchor_millis]
+        else:
+            anchor_id = str(anchor.get("threadId") or anchor.get("thread_id") or "")
+            include_anchor = bool(anchor.get("includeAnchor") or anchor.get("include_anchor"))
+            anchor_index = next((index for index, row in enumerate(rows) if str(row.get("id") or "") == anchor_id), None)
+            if anchor_index is None:
+                raise RemoteControlError("invalid cursor: anchor thread is no longer present")
+            rows = rows[anchor_index if include_anchor else anchor_index + 1 :]
+    page_size = _optional_int(limit) or 25
+    page_size = max(1, min(page_size, 100))
     more = len(rows) > page_size
-    page = rows[:page_size]
-    backwards_cursor = (
-        _serialize_thread_list_cursor(str(page[0].get("id") or ""), include_anchor=True) if page else None
-    )
-    next_cursor = _serialize_thread_list_cursor(str(page[-1].get("id") or ""), include_anchor=False) if page and more else None
+    raw_page = rows[:page_size]
+    backwards_cursor = None
+    next_cursor = None
+    if raw_page:
+        first_millis = _thread_list_sort_millis(raw_page[0])
+        backwards_anchor = first_millis + 1 if sort_direction == "asc" else first_millis - 1
+        backwards_cursor = _serialize_thread_list_cursor_millis(backwards_anchor)
+        if more:
+            next_cursor = _serialize_thread_list_cursor_millis(_thread_list_sort_millis(raw_page[-1]))
+    page = [_strip_thread_list_sort_metadata(row) for row in raw_page]
     return {"data": page, "nextCursor": next_cursor, "backwardsCursor": backwards_cursor}
 
 
@@ -2243,6 +2718,9 @@ def _parse_thread_list_cursor(raw: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(raw, str) or not raw:
         raise RemoteControlError(f"invalid cursor: {raw}")
+    timestamp_millis = _parse_thread_list_cursor_millis(raw)
+    if timestamp_millis is not None:
+        return {"sortMillis": timestamp_millis}
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -2256,6 +2734,43 @@ def _serialize_thread_list_cursor(thread_id: str, *, include_anchor: bool) -> st
     return json.dumps({"threadId": thread_id, "includeAnchor": include_anchor}, separators=(",", ":"))
 
 
+def _thread_list_sort_millis(row: dict[str, Any]) -> int:
+    return _optional_int(row.get("_threadListSortMillis")) or 0
+
+
+def _strip_thread_list_sort_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(row)
+    cleaned.pop("_threadListSortMillis", None)
+    return cleaned
+
+
+def _serialize_thread_list_cursor_millis(value: int) -> str:
+    dt = datetime.fromtimestamp(max(0, value) / 1000, tz=timezone.utc)
+    text = dt.isoformat(timespec="milliseconds")
+    return text.replace("+00:00", "Z")
+
+
+def _parse_thread_list_cursor_millis(raw: str) -> int | None:
+    text = raw.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _default_thread_model_provider(config: Any) -> str:
+    codex_config = getattr(config, "codex_config", None)
+    provider = getattr(codex_config, "model_provider_id", None)
+    return str(provider or "openai")
+
+
 def _paginate_thread_turns(
     turns: list[dict[str, Any]],
     *,
@@ -2266,8 +2781,8 @@ def _paginate_thread_turns(
     if not turns:
         return {"data": [], "nextCursor": None, "backwardsCursor": None}
     anchor = _parse_thread_turns_cursor(cursor)
-    page_size = _optional_int(limit) or 50
-    page_size = max(1, min(page_size, 200))
+    page_size = _optional_int(limit) or 25
+    page_size = max(1, min(page_size, 100))
     direction = str(sort_direction or "desc")
     if direction not in {"asc", "desc"}:
         direction = "desc"
