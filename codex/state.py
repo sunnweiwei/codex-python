@@ -1823,14 +1823,17 @@ def _write_stdin_event_payload(state: CodexState, event: CodexEvent) -> list[dic
     state._tool_started_at.pop(call_id, None)
     process_id = args.get("session_id")
     event_call_id = str(metadata.get("event_call_id") or "")
-    records = [
-        {
-            "type": "terminal_interaction",
-            "call_id": event_call_id,
-            "process_id": str(process_id),
-            "stdin": str(args.get("chars") or ""),
-        }
-    ]
+    stdin = str(args.get("chars") or "")
+    records = []
+    if stdin or metadata.get("session_id") is not None or metadata.get("process_id") is not None:
+        records.append(
+            {
+                "type": "terminal_interaction",
+                "call_id": event_call_id,
+                "process_id": str(process_id),
+                "stdin": stdin,
+            }
+        )
     if "exit_code" not in metadata:
         return records
     output = str(metadata.get("output") or "")
@@ -1848,7 +1851,7 @@ def _write_stdin_event_payload(state: CodexState, event: CodexEvent) -> list[dic
             "cwd": str(workdir),
             "parsed_cmd": parse_command_actions(command),
             "source": "agent",
-            "interaction_input": str(args.get("chars") or ""),
+            "interaction_input": stdin,
             "stdout": str(metadata.get("stdout") or output),
             "stderr": str(metadata.get("stderr") or ""),
             "aggregated_output": str(metadata.get("aggregated_output") or output),

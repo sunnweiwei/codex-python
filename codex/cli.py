@@ -683,6 +683,10 @@ class _LocalRemoteControlWs:
             self.messages.put(message)
 
 
+class _SharedRemoteRuntimeUnavailable(RuntimeError):
+    pass
+
+
 class _DaemonAppServerClient:
     def __init__(self, socket_path: Path) -> None:
         self.socket_path = socket_path
@@ -724,32 +728,75 @@ class _DaemonAppServerClient:
     def close(self) -> None:
         if self._closed.is_set():
             return
-        self._closed.set()
         try:
             self._send_envelope({"type": "client_closed"})
         except Exception:
             pass
+        self._mark_closed("app-server client closed")
+
+    def _mark_closed(self, reason: str = "app-server connection closed") -> None:
+        self._closed.set()
         sock = self._sock
         if sock is not None:
             try:
                 sock.close()
             except OSError:
                 pass
+            self._sock = None
+        self._fail_pending_requests(reason)
+        self._fail_turn_waiters(reason)
+
+    def _fail_pending_requests(self, reason: str) -> None:
+        with self._pending_lock:
+            queues = list(self._pending.values())
+            self._pending.clear()
+        failure = {"error": {"message": reason, "code": "connection_closed"}}
+        for response_queue in queues:
+            try:
+                response_queue.put_nowait(failure)
+            except queue.Full:
+                pass
+
+    def _fail_turn_waiters(self, reason: str) -> None:
+        with self._turn_done_lock:
+            waiters = list(self._turn_done.values())
+            self._turn_done.clear()
+        for done, state in waiters:
+            state["status"] = "failed"
+            state["error"] = reason
+            done.set()
 
     def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
         request_id = self._next_request_id_value()
         response_queue: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[request_id] = response_queue
-        self._send_message({"id": request_id, "method": method, "params": params or {}})
+        try:
+            self._send_message({"id": request_id, "method": method, "params": params or {}})
+        except _SharedRemoteRuntimeUnavailable:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise
+        except Exception as exc:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise _SharedRemoteRuntimeUnavailable(
+                f"app-server request `{method}` could not be sent: {_exception_display_message(exc)}"
+            ) from exc
         try:
             response = response_queue.get(timeout=timeout)
         except queue.Empty as exc:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
+            if self._closed.is_set():
+                raise _SharedRemoteRuntimeUnavailable(f"app-server request `{method}` failed: connection closed") from exc
             raise RuntimeError(f"app-server request `{method}` timed out") from exc
         error = response.get("error")
         if isinstance(error, dict):
+            if error.get("code") == "connection_closed":
+                raise _SharedRemoteRuntimeUnavailable(
+                    str(error.get("message") or f"app-server request `{method}` failed: connection closed")
+                )
             raise RuntimeError(str(error.get("message") or f"app-server request `{method}` failed"))
         result = response.get("result")
         return result if isinstance(result, dict) else {}
@@ -785,8 +832,11 @@ class _DaemonAppServerClient:
             raise
         while not done.wait(0.1):
             if self._closed.is_set():
-                return 1
+                self._clear_turn_waiter(session.state.thread_id)
+                raise _SharedRemoteRuntimeUnavailable("app-server connection closed during turn")
         status = str(state.get("status") or "completed")
+        if status == "failed" and state.get("error"):
+            raise _SharedRemoteRuntimeUnavailable(str(state.get("error")))
         return 0 if status == "completed" else 1
 
     def steer(self, session: CodexSession, text: str) -> bool:
@@ -847,9 +897,14 @@ class _DaemonAppServerClient:
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
         sock = self._sock
         if sock is None:
-            raise RuntimeError("app-server client is not connected")
+            raise _SharedRemoteRuntimeUnavailable("app-server client is not connected")
         with self._send_lock:
-            sock.sendall(raw)
+            try:
+                sock.sendall(raw)
+            except OSError as exc:
+                reason = f"app-server connection lost: {_exception_display_message(exc)}"
+                self._mark_closed(reason)
+                raise _SharedRemoteRuntimeUnavailable(reason) from exc
 
     def _send_ack(self, payload: dict[str, Any]) -> None:
         seq_id = _int_value(payload.get("seq_id"))
@@ -885,7 +940,7 @@ class _DaemonAppServerClient:
                     continue
                 self._handle_server_message(message)
         finally:
-            self._closed.set()
+            self._mark_closed("app-server connection closed")
 
     def _message_from_server_envelope(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         event_type = payload.get("type")
@@ -960,6 +1015,7 @@ class _SharedRemoteRuntime:
         self.config = config
         self.socket_path = app_server_control_socket_path(config.codex_home)
         self.client: _DaemonAppServerClient | None = None
+        self._disabled_reason: str | None = None
 
     @classmethod
     def available(cls, config: CodexConfig) -> bool:
@@ -968,32 +1024,64 @@ class _SharedRemoteRuntime:
         return app_server_control_socket_available(config.resolved_codex_home())
 
     def __enter__(self) -> "_SharedRemoteRuntime":
-        if self._start_daemon_if_missing:
-            from .remote_control import ensure_remote_control_daemon
+        try:
+            if self._start_daemon_if_missing:
+                from .remote_control import ensure_remote_control_daemon
 
-            ensure_remote_control_daemon(self.config)
-        client = _DaemonAppServerClient(self.socket_path)
-        client.connect()
-        client.start_thread(self.session)
-        self.client = client
+                ensure_remote_control_daemon(self.config)
+            client = _DaemonAppServerClient(self.socket_path)
+            client.connect()
+            client.start_thread(self.session)
+            self.client = client
+            self._disabled_reason = None
+        except Exception as exc:
+            self._disable(_exception_display_message(exc))
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         if self.client is not None:
             self.client.close()
+        self.client = None
+
+    def _disable(self, reason: str) -> None:
+        self._disabled_reason = reason or "remote-control app-server is unavailable"
+        client = self.client
+        self.client = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def run_turn(self, prompt: str) -> int:
         if self.client is None:
-            return 1
+            raise _SharedRemoteRuntimeUnavailable(self._disabled_reason or "remote-control app-server is unavailable")
         self._local_prompt_echoes.append(prompt.rstrip("\r\n"))
-        return self.client.run_turn(self.session, prompt)
+        try:
+            return self.client.run_turn(self.session, prompt)
+        except _SharedRemoteRuntimeUnavailable as exc:
+            self._disable(str(exc))
+            raise
+        except Exception as exc:
+            reason = _exception_display_message(exc)
+            self._disable(reason)
+            raise _SharedRemoteRuntimeUnavailable(reason) from exc
 
     def steer(self, text: str) -> bool:
-        return bool(self.client and self.client.steer(self.session, text))
+        if self.client is None:
+            return False
+        try:
+            return self.client.steer(self.session, text)
+        except Exception as exc:
+            self._disable(_exception_display_message(exc))
+            return False
 
     def interrupt(self) -> None:
         if self.client is not None:
-            self.client.interrupt(self.session)
+            try:
+                self.client.interrupt(self.session)
+            except Exception as exc:
+                self._disable(_exception_display_message(exc))
 
     def drain(
         self,
@@ -1009,15 +1097,19 @@ class _SharedRemoteRuntime:
                 message = self.client.messages.get_nowait()
             except queue.Empty:
                 return
-            if self._handle_server_request(message, color_mode=color_mode, input_reader=input_reader):
-                continue
-            if self._is_local_user_echo(message):
-                continue
-            if _apply_app_server_token_usage(self.session, message):
-                continue
-            event = _codex_event_from_app_server_message(message)
-            if event is not None:
-                renderer.render(event)
+            try:
+                if self._handle_server_request(message, color_mode=color_mode, input_reader=input_reader):
+                    continue
+                if self._is_local_user_echo(message):
+                    continue
+                if _apply_app_server_token_usage(self.session, message):
+                    continue
+                event = _codex_event_from_app_server_message(message)
+                if event is not None:
+                    renderer.render(event)
+            except Exception as exc:
+                self._disable(_exception_display_message(exc))
+                return
 
     def _is_local_user_echo(self, message: dict[str, Any]) -> bool:
         if message.get("method") != "item/completed":
@@ -1750,17 +1842,28 @@ def _run_session_human_interactive(
     status: dict[str, int] = {"code": 1}
 
     def worker() -> None:
-        if shared_runtime is not None:
-            status["code"] = shared_runtime.run_turn(prompt)
-            return
-        status["code"] = _run_session_human(
-            session,
-            prompt,
-            color_mode=color_mode,
-            print_final_to_stdout=False,
-            renderer=renderer,
-            install_request_user_input_provider=False,
-        )
+        def run_local_turn() -> int:
+            return _run_session_human(
+                session,
+                prompt,
+                color_mode=color_mode,
+                print_final_to_stdout=False,
+                renderer=renderer,
+                install_request_user_input_provider=False,
+            )
+
+        try:
+            if shared_runtime is not None:
+                try:
+                    status["code"] = shared_runtime.run_turn(prompt)
+                    return
+                except _SharedRemoteRuntimeUnavailable:
+                    status["code"] = run_local_turn()
+                    return
+            status["code"] = run_local_turn()
+        except Exception as exc:
+            renderer.render_error(_exception_display_message(exc))
+            status["code"] = 1
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()

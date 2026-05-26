@@ -158,6 +158,56 @@ def _config_collaboration_mode_from_remote(value: Any, fallback: str) -> str:
     return "Default"
 
 
+def _remote_debug_enabled() -> bool:
+    return os.environ.get("PY_CODEX_REMOTE_CONTROL_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _request_param_summary(params: dict[str, Any]) -> dict[str, Any]:
+    visible_keys = (
+        "threadId",
+        "path",
+        "cursor",
+        "limit",
+        "sortKey",
+        "sortDirection",
+        "includeTurns",
+        "excludeTurns",
+        "itemsView",
+        "sourceKinds",
+        "cwd",
+    )
+    summary: dict[str, Any] = {}
+    for key in visible_keys:
+        if key not in params:
+            continue
+        value = params.get(key)
+        if key in {"path", "cwd"} and isinstance(value, str) and len(value) > 160:
+            summary[key] = f"...{value[-157:]}"
+        elif key == "cursor" and isinstance(value, str) and len(value) > 160:
+            summary[key] = f"{value[:157]}..."
+        else:
+            summary[key] = value
+    return summary
+
+
+def _result_metric_summary(result: Any) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    if isinstance(result, dict):
+        if isinstance(result.get("data"), list):
+            metrics["data_len"] = len(result["data"])
+        thread = result.get("thread")
+        if isinstance(thread, dict):
+            turns = thread.get("turns")
+            metrics["thread_id"] = thread.get("id")
+            metrics["turns_len"] = len(turns) if isinstance(turns, list) else None
+            metrics["thread_updated_at"] = thread.get("updatedAt")
+    try:
+        metrics["result_bytes"] = len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except Exception:
+        pass
+    return metrics
+
+
 def _remote_config_override_kwargs(
     template: CodexConfig,
     params: dict[str, Any],
@@ -260,15 +310,37 @@ class _RemoteAppServer:
             return
         if not isinstance(method, str):
             return
+        started_at = time.monotonic()
+        if _remote_debug_enabled():
+            _remote_log(
+                "dispatch_request",
+                method=method,
+                request_id=request_id,
+                params=_request_param_summary(params),
+            )
         try:
             result = self._dispatch(ws, client_id, stream_id, method, params, request_id=request_id)
         except Exception as exc:
-            _remote_log("dispatch_error", method=method, request_id=request_id, error=str(exc))
+            _remote_log(
+                "dispatch_error",
+                method=method,
+                request_id=request_id,
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                error=str(exc),
+            )
             if request_id is not None:
                 self.service.send_message(ws, client_id, stream_id, _jsonrpc_error(request_id, str(exc)))
             return
         if isinstance(result, _DeferredResponse):
             return
+        if _remote_debug_enabled():
+            _remote_log(
+                "dispatch_result",
+                method=method,
+                request_id=request_id,
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                **_result_metric_summary(result),
+            )
         if request_id is not None:
             self.service.send_message(ws, client_id, stream_id, {"id": request_id, "result": result})
             if method == "initialize":

@@ -4610,6 +4610,67 @@ class CodexCoreTests(unittest.TestCase):
         self.assertLess(started_index, delta_indices[0])
         self.assertLess(delta_indices[0], completed_index)
 
+    def test_tool_runtime_output_delta_is_drained_after_fast_future_completion(self) -> None:
+        class ImmediateDeltaRuntime:
+            def __init__(self) -> None:
+                self.events: list[dict[str, Any]] = []
+
+            def specs(self) -> list[dict[str, Any]]:
+                return [{"type": "function", "name": "exec_command"}]
+
+            def supports_parallel(self, name: str) -> bool:
+                return False
+
+            def dispatch(self, name: str, arguments: Any, *, call_id: str | None = None) -> ToolResult:
+                self.events.append(
+                    {
+                        "type": "exec_command.output_delta",
+                        "payload": {"call_id": call_id or "", "delta": "fast output\n", "stream": "stdout"},
+                    }
+                )
+                return ToolResult(
+                    True,
+                    "fast output\n",
+                    {"command": "printf fast", "exit_code": 0, "aggregated_output": "fast output\n"},
+                )
+
+            def drain_runtime_events(self) -> list[dict[str, Any]]:
+                events = list(self.events)
+                self.events.clear()
+                return events
+
+        model = ScriptedResponsesModel(
+            [
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": "call-fast",
+                            "arguments": json.dumps({"cmd": "printf fast"}),
+                        }
+                    ]
+                },
+                message("done"),
+            ]
+        )
+        session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True), model_client=model)
+        session.tools = ImmediateDeltaRuntime()  # type: ignore[assignment]
+
+        events = list(session.stream("run a fast command"))
+        delta_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.type == "exec_command.output_delta" and event.payload.get("call_id") == "call-fast"
+        )
+        completed_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.type == "tool.completed" and event.payload.get("call_id") == "call-fast"
+        )
+        self.assertLess(delta_index, completed_index)
+        self.assertEqual(events[delta_index].payload.get("delta"), "fast output\n")
+
     def test_parallel_tool_calls_dispatch_concurrently_and_drain_in_order(self) -> None:
         class SleepingToolRuntime:
             def __init__(self) -> None:
@@ -4995,6 +5056,44 @@ class CodexCoreTests(unittest.TestCase):
             self.assertEqual(end["interaction_input"], "hello\n")
             self.assertIn("ready", end["aggregated_output"])
             self.assertIn("hello", end["aggregated_output"])
+
+    def test_persistent_rollout_omits_empty_terminal_interaction_when_background_poll_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from codex import state as codex_state_module
+
+            root = Path(tmp)
+            state = codex_state_module.CodexState(
+                CodexConfig(cwd=root, codex_home=root / "codex-home", skip_git_repo_check=True)
+            )
+            state._tool_arguments_by_call["poll-1"] = {"session_id": 1, "chars": ""}
+            records = codex_state_module._write_stdin_event_payload(
+                state,
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "write_stdin",
+                        "call_id": "poll-1",
+                        "ok": True,
+                        "output": "done\n",
+                        "metadata": {
+                            "event_call_id": "exec-1",
+                            "exit_code": 0,
+                            "command": "sleep 0.1 && echo done",
+                            "workdir": str(root),
+                            "aggregated_output": "done\n",
+                        },
+                    },
+                ),
+            )
+            assert records is not None
+            self.assertFalse(
+                [payload for payload in records if payload["type"] == "terminal_interaction"],
+                "empty background polls that observe process completion should not persist TerminalInteraction",
+            )
+            end = [payload for payload in records if payload["type"] == "exec_command_end"][-1]
+            self.assertEqual(end["call_id"], "exec-1")
+            self.assertEqual(end["exit_code"], 0)
+            self.assertIn("done", end["aggregated_output"])
 
     def test_persistent_rollout_records_update_plan_event_msg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6785,6 +6884,47 @@ new file mode 100644
         self.assertEqual(completed.stdout, "")
         self.assertIn("ERROR: scripted model exhausted", completed.stderr)
         self.assertNotIn("Traceback (most recent call last)", completed.stderr)
+
+    def test_cli_interactive_remote_runtime_failure_falls_back_to_local_without_traceback(self) -> None:
+        import codex.cli as cli
+
+        class BrokenSharedRuntime:
+            def __init__(self) -> None:
+                self.runs = 0
+
+            def run_turn(self, prompt: str) -> int:
+                self.runs += 1
+                raise cli._SharedRemoteRuntimeUnavailable("socket closed")
+
+            def drain(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+                return None
+
+            def interrupt(self) -> None:
+                return None
+
+            def steer(self, text: str) -> bool:
+                return False
+
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=ScriptedResponsesModel([message("local fallback ok")]),
+        )
+        stderr = io.StringIO()
+        shared_runtime = BrokenSharedRuntime()
+
+        with redirect_stderr(stderr):
+            status = cli._run_session_human_interactive(
+                session,
+                "hello",
+                color_mode="never",
+                shared_runtime=shared_runtime,
+            )
+
+        self.assertEqual(status, 0, stderr.getvalue())
+        self.assertEqual(shared_runtime.runs, 1)
+        self.assertIn("local fallback ok", stderr.getvalue())
+        self.assertNotIn("Traceback (most recent call last)", stderr.getvalue())
+        self.assertNotIn("socket closed", stderr.getvalue())
 
     def test_cli_human_output_runs_outside_git_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as non_git_dir:

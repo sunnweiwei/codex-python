@@ -511,7 +511,18 @@ class RemoteControlService:
     def _send_event(self, ws: Any, client_id: str, stream_id: str, event: dict[str, Any]) -> None:
         seq_id = self._next_seq_id(client_id, stream_id)
         envelope = ServerEnvelope(client_id=client_id, stream_id=stream_id, seq_id=seq_id, event=event)
-        for outbound in _split_server_envelope_for_transport(envelope):
+        outbounds = _split_server_envelope_for_transport(envelope)
+        if not outbounds:
+            message = event.get("message")
+            _remote_log(
+                "server_message_dropped",
+                client_id=client_id,
+                stream_id=stream_id,
+                seq_id=seq_id,
+                response_id=message.get("id") if isinstance(message, dict) else None,
+            )
+            return
+        for outbound in outbounds:
             self._outbound_buffer.insert(outbound)
             self._send_wire_envelope(ws, outbound)
 

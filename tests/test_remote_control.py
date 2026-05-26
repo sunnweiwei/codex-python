@@ -56,6 +56,7 @@ from codex.remote_control import (
 )
 from codex.remote_control import service as remote_control_service_module
 from codex.remote_control import trace as remote_control_trace
+from codex.remote_control.app_helpers import _thread_payload_from_rollout
 from codex.remote_control.utils import (
     _codex_module_command,
     _codex_module_name_from as _remote_control_module_name_from,
@@ -64,6 +65,7 @@ from codex.remote_control.utils import (
 )
 from codex.cli import (
     _DaemonAppServerClient,
+    _SharedRemoteRuntimeUnavailable,
     _codex_module_name_from as _cli_module_name_from,
     _codex_module_prog,
     _shared_remote_control_server_name,
@@ -78,6 +80,17 @@ class _FakeWebSocket:
 
     def send(self, payload: str) -> None:
         self.sent.append(json.loads(payload))
+
+
+class _BrokenSendSocket:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def sendall(self, raw: bytes) -> None:
+        raise BrokenPipeError("socket closed")
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _FakeStreamingSession:
@@ -136,6 +149,52 @@ class _FakeStreamingSession:
             ),
             CodexEvent("item.completed", {"item": {"type": "function_call_output", "call_id": "call_exec", "output": "tick 1\ntick 2\n"}}),
             CodexEvent("item.completed", {"item": {"type": "message", "role": "assistant", "id": "msg_1", "content": [{"type": "output_text", "text": "测试完成。"}]}}),
+            CodexEvent("turn.completed"),
+        ]
+
+
+class _FakeCompletedBackgroundPollSession:
+    def __init__(self, root: Path) -> None:
+        self.config = CodexConfig(cwd=root, codex_home=root / "codex-home", skip_git_repo_check=True)
+        self.state = type("State", (), {"thread_id": "thread-poll-complete", "turn_id": "turn-poll-complete"})()
+        self.state.config = self.config
+        self.tools = type("Tools", (), {"config": self.config})()
+
+    def stream(self, prompt: str) -> list[CodexEvent]:
+        command = "python3 -u -c 'print(\"boot\"); print(\"done\")'"
+        return [
+            CodexEvent("turn.started"),
+            CodexEvent(
+                "tool.started",
+                {"name": "exec_command", "call_id": "call_exec", "arguments": {"cmd": command, "tty": True}},
+            ),
+            CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "call_exec",
+                    "ok": True,
+                    "output": "Process running with session ID 7",
+                    "metadata": {"session_id": 7, "command": command, "aggregated_output": "boot\n"},
+                },
+            ),
+            CodexEvent("tool.started", {"name": "write_stdin", "call_id": "call_poll", "arguments": {"session_id": 7, "chars": ""}}),
+            CodexEvent("exec_command.output_delta", {"call_id": "call_exec", "delta": "done\n", "stream": "stdout"}),
+            CodexEvent(
+                "tool.completed",
+                {
+                    "name": "write_stdin",
+                    "call_id": "call_poll",
+                    "ok": True,
+                    "output": "done\n",
+                    "metadata": {
+                        "event_call_id": "call_exec",
+                        "exit_code": 0,
+                        "command": command,
+                        "aggregated_output": "boot\ndone\n",
+                    },
+                },
+            ),
             CodexEvent("turn.completed"),
         ]
 
@@ -776,6 +835,18 @@ class CodexRemoteControlTests(unittest.TestCase):
                 second.close()
             finally:
                 service._local_control.stop()
+
+    def test_daemon_app_server_send_failure_closes_and_clears_pending_requests(self) -> None:
+        client = _DaemonAppServerClient(Path("/tmp/nonexistent-codex-app-server.sock"))
+        sock = _BrokenSendSocket()
+        client._sock = sock  # type: ignore[assignment]
+
+        with self.assertRaises(_SharedRemoteRuntimeUnavailable):
+            client.request("turn/start", {"threadId": "thread-broken"}, timeout=0.01)
+
+        self.assertTrue(client._closed.is_set())
+        self.assertTrue(sock.closed)
+        self.assertEqual(client._pending, {})
 
     def test_daemon_status_reads_real_running_service_over_local_socket(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
@@ -1550,6 +1621,37 @@ class CodexRemoteControlTests(unittest.TestCase):
         self.assertEqual(app_server._sessions, {})  # type: ignore[attr-defined]
         self.assertEqual(responses[2]["data"][0]["cwd"], str(root.resolve()))  # type: ignore[index]
 
+    def test_remote_thread_payload_from_rollout_streams_event_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            thread_id = "thread-streaming-history"
+            rollout_dir = codex_home / "sessions" / "2026" / "05" / "25"
+            rollout_dir.mkdir(parents=True)
+            rollout_path = rollout_dir / f"rollout-2026-05-25T00-00-00-{thread_id}.jsonl"
+            records = [
+                {"type": "session_meta", "payload": {"id": thread_id, "session_id": thread_id, "cwd": str(root), "source": "cli"}},
+                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1", "started_at": 1779718400}},
+                {"type": "event_msg", "payload": {"type": "user_message", "message": "请总结这个长会话。"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "message": "这是摘要。"}},
+                {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1", "completed_at": 1779718401}},
+            ]
+            rollout_path.write_text(
+                "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            config = RemoteControlConfig(codex_home=codex_home, auth_codex_home=root / "auth-home", cwd=root)
+
+            with patch("codex.remote_control.app_helpers.load_rollout_records", side_effect=AssertionError("full load not expected")):
+                thread = _thread_payload_from_rollout(rollout_path, config, include_turns=True, items_view="summary")
+
+        self.assertIsNotNone(thread)
+        assert thread is not None
+        self.assertEqual(thread["id"], thread_id)
+        self.assertEqual(thread["preview"], "请总结这个长会话。")
+        self.assertEqual(len(thread["turns"]), 1)
+        self.assertEqual([item["type"] for item in thread["turns"][0]["items"]], ["userMessage", "agentMessage"])
+
     def test_remote_thread_list_defaults_to_upstream_interactive_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2248,6 +2350,39 @@ class CodexRemoteControlTests(unittest.TestCase):
             if message.get("method") == "item/completed"
         ]
         self.assertNotIn("dynamicToolCall", completed_types)
+
+    def test_remote_turn_does_not_emit_empty_terminal_interaction_when_background_poll_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": RemoteControlConfig(codex_home=root / "codex-home", auth_codex_home=root / "auth-home", cwd=root),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+            session = _FakeCompletedBackgroundPollSession(root)
+
+            app_server._run_turn(ws, "client-a", "stream-a", session, "poll background terminal")  # type: ignore[arg-type]
+
+        methods = [message.get("method") for message in ws.sent]
+        self.assertIn("item/commandExecution/outputDelta", methods)
+        self.assertNotIn("item/commandExecution/terminalInteraction", methods)
+        completed_commands = [
+            message["params"]["item"]  # type: ignore[index]
+            for message in ws.sent
+            if message.get("method") == "item/completed"
+            and message["params"]["item"]["type"] == "commandExecution"  # type: ignore[index]
+        ]
+        self.assertEqual(len(completed_commands), 1)
+        self.assertEqual(completed_commands[0]["id"], "call_exec")
+        self.assertEqual(completed_commands[0]["exitCode"], 0)
+        self.assertEqual(completed_commands[0]["aggregatedOutput"], "boot\ndone\n")
 
     def test_remote_turn_settings_overrides_apply_to_session_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

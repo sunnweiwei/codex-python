@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 from ..auth import (
     auth_json_path,
@@ -1269,24 +1269,37 @@ def _thread_payload_from_rollout(
 ) -> dict[str, Any] | None:
     if not include_turns:
         return _thread_metadata_payload_from_rollout(path, config)
+    reconstruction = None
     try:
-        records = load_rollout_records(path)
-        reconstruction = reconstruct_history_from_rollout(records, CodexConfig(codex_home=config.codex_home))
+        meta, preview = _rollout_meta_and_preview(path)
+        if meta is None:
+            records = load_rollout_records(path)
+            reconstruction = reconstruct_history_from_rollout(records, CodexConfig(codex_home=config.codex_home))
+            meta = reconstruction.session_meta or {}
+            preview = _preview_from_history(reconstruction.history)
     except Exception:
         return None
-    meta = reconstruction.session_meta or {}
     thread_id = str(meta.get("id") or _thread_id_from_rollout_path(path) or path.stem)
     cwd = _normalized_thread_cwd(meta.get("cwd"), config.cwd)
     timestamp = _timestamp_to_seconds(meta.get("timestamp")) or int(path.stat().st_mtime)
     updated_at = int(path.stat().st_mtime)
     turns: list[dict[str, Any]] = []
     if include_turns:
-        turns = _turns_from_rollout_records(records)
+        turns = _turns_from_rollout_path(path)
         if not turns:
-            items = _thread_items_from_response_history(reconstruction.history)
+            if reconstruction is None:
+                try:
+                    records = load_rollout_records(path)
+                    reconstruction = reconstruct_history_from_rollout(records, CodexConfig(codex_home=config.codex_home))
+                except Exception:
+                    reconstruction = None
+            history = reconstruction.history if reconstruction is not None else []
+            items = _thread_items_from_response_history(history)
             turns = [_turn_payload("history", status="completed", items=items)] if items else []
         if items_view is not None:
             turns = _apply_turns_items_view(turns, items_view)
+    if not preview and reconstruction is not None:
+        preview = _preview_from_history(reconstruction.history)
     return _thread_payload(
         thread_id=thread_id,
         session_id=str(meta.get("session_id") or thread_id),
@@ -1294,7 +1307,7 @@ def _thread_payload_from_rollout(
         cwd=cwd,
         model_provider=str(meta.get("model_provider") or _fallback_model_provider(config)),
         source=_api_session_source(meta.get("source") or "cli"),
-        preview=_preview_from_history(reconstruction.history),
+        preview=preview,
         path=str(path),
         status={"type": "idle"},
         turns=turns,
@@ -1404,7 +1417,7 @@ def _preview_from_rollout_record(record: dict[str, Any]) -> str:
 def _turns_from_history(session: CodexSession, *, items_view: str | None = None) -> list[dict[str, Any]]:
     rollout_path = getattr(session.state, "_rollout_path", None)
     if isinstance(rollout_path, Path) and rollout_path.exists():
-        turns = _turns_from_rollout_records(load_rollout_records(rollout_path))
+        turns = _turns_from_rollout_path(rollout_path)
         if turns:
             return _apply_turns_items_view(turns, items_view) if items_view is not None else turns
     compact_items = _thread_items_from_response_history(session.state.history)
@@ -1645,6 +1658,11 @@ def _terminal_interaction_from_write_stdin(
     process_id = args.get("session_id")
     if not item_id or process_id is None:
         return None
+    # Match upstream unified exec: empty stdin is a background poll, so it is
+    # surfaced as a terminal interaction only while the process is still live.
+    # If the poll observes process completion, the ExecCommandEnd item is enough.
+    if not str(args.get("chars") or "") and metadata.get("session_id") is None and metadata.get("process_id") is None:
+        return None
     return {
         "threadId": session.state.thread_id,
         "turnId": session.state.turn_id,
@@ -1777,7 +1795,31 @@ def _duration_ms_from_tool_metadata(metadata: dict[str, Any]) -> int | None:
         return None
 
 
+def _iter_rollout_records(path: Path) -> Iterator[dict[str, Any]]:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                if not raw_line.strip():
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+    except OSError:
+        return
+
+
+def _turns_from_rollout_path(path: Path) -> list[dict[str, Any]]:
+    return _turns_from_rollout_record_iter(_iter_rollout_records(path))
+
+
 def _turns_from_rollout_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _turns_from_rollout_record_iter(records)
+
+
+def _turns_from_rollout_record_iter(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
     item_positions: dict[str, int] = {}

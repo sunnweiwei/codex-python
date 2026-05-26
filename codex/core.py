@@ -913,7 +913,7 @@ class CodexSession:
                 for call, future in zip(calls, futures):
                     self._check_interrupted()
                     result = yield from self._await_tool_future(future)
-                    yield from self._drain_tool_runtime_events(include_output_delta=False)
+                    yield from self._drain_tool_runtime_events(include_output_delta=True)
                     yield from self._record_tool_result(call, result)
 
         for call in tool_calls:
@@ -968,7 +968,7 @@ class CodexSession:
                 arguments=call["arguments"],
             )
             result = yield from self._dispatch_tool_call_with_runtime_events(call)
-            yield from self._drain_tool_runtime_events(include_output_delta=False)
+            yield from self._drain_tool_runtime_events(include_output_delta=True)
             self._check_interrupted()
             yield from self._record_tool_result(call, result)
         yield from flush_parallel()
