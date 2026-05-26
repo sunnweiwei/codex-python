@@ -68,6 +68,7 @@ from codex.cli import (
     _SharedRemoteRuntimeUnavailable,
     _codex_module_name_from as _cli_module_name_from,
     _codex_module_prog,
+    _maybe_shared_remote_runtime,
     _shared_remote_control_server_name,
 )
 from codex.core import CodexSession
@@ -847,6 +848,17 @@ class CodexRemoteControlTests(unittest.TestCase):
         self.assertTrue(client._closed.is_set())
         self.assertTrue(sock.closed)
         self.assertEqual(client._pending, {})
+
+    def test_interactive_cli_does_not_auto_delegate_to_remote_daemon_socket(self) -> None:
+        session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True))
+
+        with patch("codex.cli._SharedRemoteRuntime.available", return_value=True):
+            self.assertIsNone(
+                _maybe_shared_remote_runtime(session, start_daemon_if_missing=False)
+            )
+            self.assertIsNotNone(
+                _maybe_shared_remote_runtime(session, start_daemon_if_missing=True)
+            )
 
     def test_daemon_status_reads_real_running_service_over_local_socket(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:

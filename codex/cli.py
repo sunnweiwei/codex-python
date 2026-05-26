@@ -1194,7 +1194,13 @@ def _maybe_shared_remote_runtime(
     *,
     start_daemon_if_missing: bool,
 ) -> "_SharedRemoteRuntime | None":
-    if start_daemon_if_missing or _SharedRemoteRuntime.available(session.config):
+    # Do not silently switch the interactive CLI onto the daemon just because a
+    # remote-control socket exists. Upstream keeps the local UI execution path
+    # stable by starting its app-server path as part of the UI itself; phone
+    # connectivity is only an additional transport. Until the Python embedded
+    # app-server path is complete, explicit --remote-control is the only mode
+    # that may delegate CLI turns to the daemon.
+    if start_daemon_if_missing:
         return _SharedRemoteRuntime(session, start_daemon_if_missing=start_daemon_if_missing)
     return None
 
