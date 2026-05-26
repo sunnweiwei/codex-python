@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import codecs
 import datetime as _dt
 import json
@@ -10,6 +11,7 @@ import re
 import shlex
 import shutil
 import select
+import socket
 import sys
 try:
     import termios
@@ -20,6 +22,7 @@ import threading
 import time
 import tomllib
 import unicodedata
+import uuid
 
 from collections import deque
 from copy import deepcopy
@@ -29,6 +32,7 @@ from typing import Any, Callable
 
 from .core import CodexSession, SteerInputError, TurnInterrupted
 from .goal import GOAL_STATUS_FROM_WIRE, GoalStatus, goal_summary
+from .remote_control.constants import REMOTE_CONTROL_SERVER_NAME_ENV, REQUIRED_REMOTE_CONTROL_SERVER_NAME
 from .state import load_rollout_records, parse_command_actions, reconstruct_history_from_rollout
 from .types import CodexConfig, CodexEvent, _model_catalog_info, normalize_service_tier
 from . import types as _types
@@ -36,6 +40,7 @@ from . import types as _types
 
 _CLI_SYNTAX_THEME = os.environ.get("PY_CODEX_SYNTAX_THEME", "monokai")
 _UPSTREAM_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS = 1000
+_DEFAULT_SHARED_REMOTE_CONTROL_NAME = REQUIRED_REMOTE_CONTROL_SERVER_NAME
 
 
 def _set_raw_keep_opost(fd: int) -> None:
@@ -385,6 +390,20 @@ def _main_resume_chat(argv: list[str], *, fork: bool) -> int:
             session = CodexSession.fork_from_rollout(rollout_path, config)
         else:
             session = CodexSession.resume_from_rollout(rollout_path, config)
+        shared_runtime = _maybe_shared_remote_runtime(
+            session,
+            start_daemon_if_missing=bool(getattr(args, "remote_control", False)),
+        )
+        if shared_runtime is not None:
+            with shared_runtime:
+                return _run_chat(
+                    session,
+                    None,
+                    color_mode=args.color,
+                    replay_history=rollout_path is not None,
+                    history_source_path=rollout_path,
+                    shared_runtime=shared_runtime,
+                )
         return _run_chat(
             session,
             None,
@@ -415,6 +434,13 @@ def _main_chat(argv: list[str], *, prog: str = "python -m agents.codex") -> int:
     try:
         session = CodexSession(config)
         initial_prompt = _normalize_optional_prompt(args.prompt)
+        shared_runtime = _maybe_shared_remote_runtime(
+            session,
+            start_daemon_if_missing=bool(getattr(args, "remote_control", False)),
+        )
+        if shared_runtime is not None:
+            with shared_runtime:
+                return _run_chat(session, initial_prompt, color_mode=args.color, shared_runtime=shared_runtime)
         return _run_chat(session, initial_prompt, color_mode=args.color)
     except Exception as exc:
         _print_cli_error(exc)
@@ -446,6 +472,7 @@ def _add_exec_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-last-message", "-o")
     parser.add_argument("--output-schema")
     parser.add_argument("--image", "-i", action="append", default=[], dest="images")
+    parser.add_argument("--remote-control", action="store_true", help=argparse.SUPPRESS)
 
 
 def _build_exec_config(args: argparse.Namespace) -> CodexConfig:
@@ -599,6 +626,681 @@ def _run_session_human(
     return 0 if final else 1
 
 
+class _LocalRemoteControlWs:
+    def __init__(self) -> None:
+        self.messages: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self._chunks: dict[int, dict[str, Any]] = {}
+
+    def send(self, payload: str) -> None:
+        try:
+            envelope = json.loads(payload)
+        except Exception:
+            return
+        if not isinstance(envelope, dict):
+            return
+        event_type = envelope.get("type")
+        if event_type == "server_message":
+            message = envelope.get("message")
+            if isinstance(message, dict):
+                self.messages.put(message)
+            return
+        if event_type != "server_message_chunk":
+            return
+        seq_id = _int_value(envelope.get("seq_id"))
+        segment_id = _int_value(envelope.get("segment_id"))
+        segment_count = _int_value(envelope.get("segment_count"))
+        chunk_b64 = envelope.get("message_chunk_base64")
+        if seq_id is None or segment_id is None or segment_count is None or not isinstance(chunk_b64, str):
+            return
+        state = self._chunks.setdefault(seq_id, {"count": segment_count, "chunks": {}})
+        chunks = state["chunks"]
+        if isinstance(chunks, dict):
+            chunks[segment_id] = chunk_b64
+        if not isinstance(chunks, dict) or len(chunks) < segment_count:
+            return
+        try:
+            raw = b"".join(base64.b64decode(str(chunks[index])) for index in range(segment_count))
+            message = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._chunks.pop(seq_id, None)
+            return
+        self._chunks.pop(seq_id, None)
+        if isinstance(message, dict):
+            self.messages.put(message)
+
+
+class _DaemonAppServerClient:
+    def __init__(self, socket_path: Path) -> None:
+        self.socket_path = socket_path
+        self.client_id = f"local-cli-{uuid.uuid4()}"
+        self.stream_id = f"stream-{uuid.uuid4()}"
+        self.messages: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self._pending: dict[Any, "queue.Queue[dict[str, Any]]"] = {}
+        self._pending_lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._turn_done: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+        self._turn_done_lock = threading.Lock()
+        self._chunks: dict[int, dict[str, Any]] = {}
+        self._next_request_id = 1
+        self._next_seq_id = 1
+        self._sock: socket.socket | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._closed = threading.Event()
+
+    def connect(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            raise RuntimeError("local app-server control socket requires Unix domain sockets")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(str(self.socket_path))
+        self._sock = sock
+        self._reader_thread = threading.Thread(target=self._read_loop, name="codex-app-server-client", daemon=True)
+        self._reader_thread.start()
+        self.request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "codex-tui",
+                    "version": "0.0.0-python",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+            timeout=5,
+        )
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        try:
+            self._send_envelope({"type": "client_closed"})
+        except Exception:
+            pass
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def request(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
+        request_id = self._next_request_id_value()
+        response_queue: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=1)
+        with self._pending_lock:
+            self._pending[request_id] = response_queue
+        self._send_message({"id": request_id, "method": method, "params": params or {}})
+        try:
+            response = response_queue.get(timeout=timeout)
+        except queue.Empty as exc:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+            raise RuntimeError(f"app-server request `{method}` timed out") from exc
+        error = response.get("error")
+        if isinstance(error, dict):
+            raise RuntimeError(str(error.get("message") or f"app-server request `{method}` failed"))
+        result = response.get("result")
+        return result if isinstance(result, dict) else {}
+
+    def respond(self, request_id: Any, result: dict[str, Any] | None = None) -> None:
+        self._send_message({"id": request_id, "result": result or {}})
+
+    def start_thread(self, session: CodexSession) -> dict[str, Any]:
+        params = _app_server_thread_params_from_session(session)
+        rollout_path = getattr(session.state, "_rollout_path", None)
+        if isinstance(rollout_path, Path) and rollout_path.exists():
+            params = {**params, "threadId": session.state.thread_id, "path": str(rollout_path)}
+            response = self.request("thread/resume", params, timeout=10)
+        else:
+            response = self.request("thread/start", params, timeout=10)
+        thread = response.get("thread") if isinstance(response.get("thread"), dict) else {}
+        _adopt_app_server_thread(session, thread)
+        return response
+
+    def run_turn(self, session: CodexSession, prompt: str) -> int:
+        done, state = self._register_turn_waiter(session.state.thread_id)
+        try:
+            self.request(
+                "turn/start",
+                {
+                    "threadId": session.state.thread_id,
+                    "input": [{"type": "text", "text": prompt}],
+                },
+                timeout=10,
+            )
+        except Exception:
+            self._clear_turn_waiter(session.state.thread_id)
+            raise
+        while not done.wait(0.1):
+            if self._closed.is_set():
+                return 1
+        status = str(state.get("status") or "completed")
+        return 0 if status == "completed" else 1
+
+    def steer(self, session: CodexSession, text: str) -> bool:
+        try:
+            self.request(
+                "turn/steer",
+                {
+                    "threadId": session.state.thread_id,
+                    "expectedTurnId": session.state.turn_id,
+                    "input": [{"type": "text", "text": text}],
+                },
+                timeout=5,
+            )
+            return True
+        except Exception:
+            return False
+
+    def interrupt(self, session: CodexSession) -> None:
+        try:
+            self.request("turn/interrupt", {"threadId": session.state.thread_id}, timeout=2)
+        except Exception:
+            pass
+
+    def _register_turn_waiter(self, thread_id: str) -> tuple[threading.Event, dict[str, Any]]:
+        done = threading.Event()
+        state: dict[str, Any] = {}
+        with self._turn_done_lock:
+            self._turn_done[thread_id] = (done, state)
+        return done, state
+
+    def _clear_turn_waiter(self, thread_id: str) -> None:
+        with self._turn_done_lock:
+            self._turn_done.pop(thread_id, None)
+
+    def _mark_turn_done(self, message: dict[str, Any]) -> None:
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        thread_id = str(params.get("threadId") or "")
+        turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+        status = str(turn.get("status") or "")
+        with self._turn_done_lock:
+            waiter = self._turn_done.pop(thread_id, None)
+        if waiter is None:
+            return
+        done, state = waiter
+        state["status"] = status
+        done.set()
+
+    def _send_message(self, message: dict[str, Any]) -> None:
+        self._send_envelope({"type": "client_message", "message": message})
+
+    def _send_envelope(self, event: dict[str, Any]) -> None:
+        payload = {
+            "client_id": self.client_id,
+            "stream_id": self.stream_id,
+            "seq_id": self._next_seq_id_value(),
+            **event,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+        sock = self._sock
+        if sock is None:
+            raise RuntimeError("app-server client is not connected")
+        with self._send_lock:
+            sock.sendall(raw)
+
+    def _send_ack(self, payload: dict[str, Any]) -> None:
+        seq_id = _int_value(payload.get("seq_id"))
+        if seq_id is None:
+            return
+        ack: dict[str, Any] = {"type": "ack", "seq_id": seq_id}
+        segment_id = _int_value(payload.get("segment_id"))
+        if segment_id is not None:
+            ack["segment_id"] = segment_id
+        try:
+            self._send_envelope(ack)
+        except Exception:
+            pass
+
+    def _read_loop(self) -> None:
+        sock = self._sock
+        if sock is None:
+            return
+        try:
+            reader = sock.makefile("rb")
+            for raw_line in reader:
+                if self._closed.is_set():
+                    return
+                try:
+                    payload = json.loads(raw_line.decode("utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                self._send_ack(payload)
+                message = self._message_from_server_envelope(payload)
+                if message is None:
+                    continue
+                self._handle_server_message(message)
+        finally:
+            self._closed.set()
+
+    def _message_from_server_envelope(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        event_type = payload.get("type")
+        if event_type == "server_message":
+            message = payload.get("message")
+            return message if isinstance(message, dict) else None
+        if event_type != "server_message_chunk":
+            return None
+        seq_id = _int_value(payload.get("seq_id"))
+        segment_id = _int_value(payload.get("segment_id"))
+        segment_count = _int_value(payload.get("segment_count"))
+        chunk_b64 = payload.get("message_chunk_base64")
+        if seq_id is None or segment_id is None or segment_count is None or not isinstance(chunk_b64, str):
+            return None
+        state = self._chunks.setdefault(seq_id, {"count": segment_count, "chunks": {}})
+        chunks = state["chunks"]
+        if isinstance(chunks, dict):
+            chunks[segment_id] = chunk_b64
+        if not isinstance(chunks, dict) or len(chunks) < segment_count:
+            return None
+        try:
+            raw = b"".join(base64.b64decode(str(chunks[index])) for index in range(segment_count))
+            message = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._chunks.pop(seq_id, None)
+            return None
+        self._chunks.pop(seq_id, None)
+        return message if isinstance(message, dict) else None
+
+    def _handle_server_message(self, message: dict[str, Any]) -> None:
+        request_id = message.get("id")
+        if request_id is not None and "method" not in message:
+            with self._pending_lock:
+                response_queue = self._pending.pop(request_id, None)
+            if response_queue is not None:
+                try:
+                    response_queue.put_nowait(message)
+                except queue.Full:
+                    pass
+                return
+        if message.get("method") == "turn/completed":
+            self._mark_turn_done(message)
+        self.messages.put(message)
+
+    def _next_request_id_value(self) -> int:
+        value = self._next_request_id
+        self._next_request_id += 1
+        return value
+
+    def _next_seq_id_value(self) -> int:
+        value = self._next_seq_id
+        self._next_seq_id += 1
+        return value
+
+
+class _SharedRemoteRuntime:
+    def __init__(self, session: CodexSession, *, start_daemon_if_missing: bool = False) -> None:
+        from .remote_control import (
+            RemoteControlConfig,
+            app_server_control_socket_path,
+            ensure_remote_control_daemon,
+        )
+
+        self.session = session
+        self._start_daemon_if_missing = start_daemon_if_missing
+        self._local_prompt_echoes: deque[str] = deque()
+        config = replace(
+            RemoteControlConfig.from_codex_config(session.config),
+            server_name=_shared_remote_control_server_name(),
+            quiet=True,
+        )
+        self.config = config
+        self.socket_path = app_server_control_socket_path(config.codex_home)
+        self.client: _DaemonAppServerClient | None = None
+
+    @classmethod
+    def available(cls, config: CodexConfig) -> bool:
+        from .remote_control import app_server_control_socket_available
+
+        return app_server_control_socket_available(config.resolved_codex_home())
+
+    def __enter__(self) -> "_SharedRemoteRuntime":
+        if self._start_daemon_if_missing:
+            from .remote_control import ensure_remote_control_daemon
+
+            ensure_remote_control_daemon(self.config)
+        client = _DaemonAppServerClient(self.socket_path)
+        client.connect()
+        client.start_thread(self.session)
+        self.client = client
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.client is not None:
+            self.client.close()
+
+    def run_turn(self, prompt: str) -> int:
+        if self.client is None:
+            return 1
+        self._local_prompt_echoes.append(prompt.rstrip("\r\n"))
+        return self.client.run_turn(self.session, prompt)
+
+    def steer(self, text: str) -> bool:
+        return bool(self.client and self.client.steer(self.session, text))
+
+    def interrupt(self) -> None:
+        if self.client is not None:
+            self.client.interrupt(self.session)
+
+    def drain(
+        self,
+        renderer: "_HumanEventRenderer",
+        *,
+        color_mode: str,
+        input_reader: Any | None = None,
+    ) -> None:
+        if self.client is None:
+            return
+        while True:
+            try:
+                message = self.client.messages.get_nowait()
+            except queue.Empty:
+                return
+            if self._handle_server_request(message, color_mode=color_mode, input_reader=input_reader):
+                continue
+            if self._is_local_user_echo(message):
+                continue
+            if _apply_app_server_token_usage(self.session, message):
+                continue
+            event = _codex_event_from_app_server_message(message)
+            if event is not None:
+                renderer.render(event)
+
+    def _is_local_user_echo(self, message: dict[str, Any]) -> bool:
+        if message.get("method") != "item/completed":
+            return False
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        item = params.get("item") if isinstance(params, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            return False
+        text = _app_server_text_content(item.get("content")).rstrip("\r\n")
+        if not self._local_prompt_echoes or text != self._local_prompt_echoes[0]:
+            return False
+        self._local_prompt_echoes.popleft()
+        return True
+
+    def _handle_server_request(
+        self,
+        message: dict[str, Any],
+        *,
+        color_mode: str,
+        input_reader: Any | None,
+    ) -> bool:
+        request_id = message.get("id")
+        method = message.get("method")
+        if request_id is None or not isinstance(method, str):
+            return False
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        result: dict[str, Any]
+        if method == "item/tool/requestUserInput":
+            questions = params.get("questions") if isinstance(params.get("questions"), list) else []
+            if input_reader is not None:
+                input_reader.suspend()
+            try:
+                answer = _prompt_request_user_input(questions, color_mode=color_mode)
+            finally:
+                if input_reader is not None:
+                    input_reader.resume()
+            result = answer if isinstance(answer, dict) else {}
+        elif method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
+            # Keep the local app-server bridge non-blocking for now. The normal
+            # terminal approval UI remains on the direct CLI path; phone clients
+            # can answer this request when they are the active target.
+            result = {"decision": "reject"}
+        else:
+            result = {}
+        if self.client is not None:
+            self.client.respond(request_id, result)
+        return True
+
+
+def _shared_remote_control_server_name() -> str:
+    configured = os.environ.get(REMOTE_CONTROL_SERVER_NAME_ENV)
+    if configured and configured.strip() != REQUIRED_REMOTE_CONTROL_SERVER_NAME:
+        raise RuntimeError(
+            f"{REMOTE_CONTROL_SERVER_NAME_ENV} must be exactly {REQUIRED_REMOTE_CONTROL_SERVER_NAME!r}; "
+            f"got {configured!r}."
+        )
+    return REQUIRED_REMOTE_CONTROL_SERVER_NAME
+
+
+def _app_server_thread_params_from_session(session: CodexSession) -> dict[str, Any]:
+    config = session.config
+    return {
+        "cwd": str(config.resolved_cwd()),
+        "model": config.model,
+        "modelProvider": config.model_provider_id,
+        "approvalPolicy": config.approval_policy,
+        "sandbox": config.sandbox,
+    }
+
+
+def _adopt_app_server_thread(session: CodexSession, thread: dict[str, Any]) -> None:
+    thread_id = thread.get("id")
+    if isinstance(thread_id, str) and thread_id:
+        session.state.thread_id = thread_id
+    path = thread.get("path")
+    if isinstance(path, str) and path:
+        session.state._rollout_path = Path(path)
+
+
+def _maybe_shared_remote_runtime(
+    session: CodexSession,
+    *,
+    start_daemon_if_missing: bool,
+) -> "_SharedRemoteRuntime | None":
+    if start_daemon_if_missing or _SharedRemoteRuntime.available(session.config):
+        return _SharedRemoteRuntime(session, start_daemon_if_missing=start_daemon_if_missing)
+    return None
+
+
+def _codex_event_from_app_server_message(message: dict[str, Any]) -> CodexEvent | None:
+    method = message.get("method")
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    if method == "turn/started":
+        return CodexEvent("turn.started")
+    if method == "turn/completed":
+        turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+        status = turn.get("status") if isinstance(turn, dict) else None
+        if status == "interrupted":
+            return CodexEvent("turn.aborted", {"reason": "interrupted"})
+        if status == "failed":
+            return CodexEvent("turn.failed", {"error": str(turn.get("error") or "turn failed")})
+        return CodexEvent("turn.completed", {"final_message": ""})
+    if method == "item/started":
+        item = params.get("item")
+        if isinstance(item, dict) and item.get("type") == "commandExecution":
+            return CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": str(item.get("id") or ""),
+                    "arguments": {
+                        "cmd": str(item.get("command") or ""),
+                        "workdir": str(item.get("cwd") or ""),
+                    },
+                },
+            )
+        return None
+    if method == "item/commandExecution/outputDelta":
+        return CodexEvent(
+            "exec_command.output_delta",
+            {
+                "call_id": str(params.get("itemId") or ""),
+                "delta": str(params.get("delta") or ""),
+                "stream": "stdout",
+            },
+        )
+    if method == "item/completed":
+        return _codex_event_from_app_server_completed_item(params.get("item"))
+    if method == "thread/goal/updated":
+        goal = params.get("goal")
+        return CodexEvent("thread.goal.updated", {"goal": goal}) if isinstance(goal, dict) else None
+    if method == "thread/goal/cleared":
+        return CodexEvent("thread.goal.cleared", {"threadId": params.get("threadId")})
+    if method == "thread/compacted":
+        return CodexEvent("context_compaction.completed", {"thread_id": params.get("threadId")})
+    if method == "error":
+        return CodexEvent("turn.failed", {"error": str(params.get("message") or "remote app-server error")})
+    return None
+
+
+def _apply_app_server_token_usage(session: CodexSession, message: dict[str, Any]) -> bool:
+    if message.get("method") != "thread/tokenUsage/updated":
+        return False
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    usage = params.get("tokenUsage") if isinstance(params, dict) else None
+    if not isinstance(usage, dict):
+        return True
+    last_usage = _snake_token_breakdown(usage.get("last") if isinstance(usage.get("last"), dict) else usage)
+    total_usage = _snake_token_breakdown(usage.get("total") if isinstance(usage.get("total"), dict) else usage)
+    if last_usage:
+        session.state.last_token_usage = last_usage
+    total_tokens = total_usage.get("total_tokens")
+    if isinstance(total_tokens, int) and total_tokens >= 0:
+        session.state.total_token_usage = total_tokens
+    reasoning_tokens = total_usage.get("reasoning_output_tokens")
+    if isinstance(reasoning_tokens, int) and reasoning_tokens >= 0:
+        session.state.session_reasoning_tokens = reasoning_tokens
+    return True
+
+
+def _snake_token_breakdown(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, int] = {}
+    mapping = {
+        "total_tokens": ("total_tokens", "totalTokens", "total"),
+        "input_tokens": ("input_tokens", "inputTokens"),
+        "cached_input_tokens": ("cached_input_tokens", "cachedInputTokens"),
+        "output_tokens": ("output_tokens", "outputTokens"),
+        "reasoning_output_tokens": ("reasoning_output_tokens", "reasoningOutputTokens", "reasoning_tokens"),
+    }
+    for target, keys in mapping.items():
+        for key in keys:
+            raw = value.get(key)
+            if isinstance(raw, bool):
+                continue
+            if isinstance(raw, int):
+                out[target] = max(0, raw)
+                break
+            if isinstance(raw, float):
+                out[target] = max(0, int(raw))
+                break
+    if "total_tokens" not in out and ("input_tokens" in out or "output_tokens" in out):
+        out["total_tokens"] = out.get("input_tokens", 0) + out.get("output_tokens", 0)
+    return out
+
+
+def _codex_event_from_app_server_completed_item(item: Any) -> CodexEvent | None:
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    if item_type == "agentMessage":
+        return CodexEvent(
+            "item.completed",
+            {
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": str(item.get("id") or f"msg_{uuid.uuid4()}"),
+                    "content": [{"type": "output_text", "text": str(item.get("text") or "")}],
+                }
+            },
+        )
+    if item_type == "userMessage":
+        text = _app_server_text_content(item.get("content"))
+        return CodexEvent(
+            "item.completed",
+            {
+                "pending_input": True,
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "id": str(item.get("id") or f"user_{uuid.uuid4()}"),
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+        )
+    if item_type == "commandExecution":
+        exit_code = _int_value(item.get("exitCode"))
+        status = str(item.get("status") or "")
+        ok = status != "failed" and (exit_code is None or exit_code == 0)
+        output = _strip_unified_exec_response_metadata(str(item.get("aggregatedOutput") or ""))
+        return CodexEvent(
+            "tool.completed",
+            {
+                "name": "exec_command",
+                "call_id": str(item.get("id") or ""),
+                "ok": ok,
+                "output": output,
+                "metadata": {
+                    "command": str(item.get("command") or ""),
+                    "cwd": str(item.get("cwd") or ""),
+                    "aggregated_output": output,
+                    "exit_code": exit_code,
+                    "duration_ms": _int_value(item.get("durationMs")),
+                    "session_id": item.get("processId"),
+                },
+            },
+        )
+    if item_type == "fileChange":
+        return CodexEvent(
+            "tool.completed",
+            {
+                "name": "apply_patch",
+                "call_id": str(item.get("id") or ""),
+                "ok": str(item.get("status") or "") == "completed",
+                "output": "",
+                "metadata": {"changes": _metadata_changes_from_app_server_file_change(item.get("changes"))},
+            },
+        )
+    return None
+
+
+def _app_server_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    chunks: list[str] = []
+    for part in content:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            chunks.append(part["text"])
+    return "\n".join(chunks)
+
+
+def _metadata_changes_from_app_server_file_change(changes: Any) -> list[dict[str, Any]]:
+    if not isinstance(changes, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        path = str(change.get("path") or "")
+        if not path:
+            continue
+        kind = change.get("kind")
+        kind_type = str(kind.get("type") or "update") if isinstance(kind, dict) else str(kind or "update")
+        diff = str(change.get("diff") or "")
+        if kind_type == "add":
+            out.append({"path": path, "type": "add", "content": diff})
+        elif kind_type == "delete":
+            out.append({"path": path, "type": "delete", "content": diff})
+        else:
+            move_path = kind.get("movePath") if isinstance(kind, dict) else None
+            if move_path and "\n\nMoved to:" in diff:
+                diff = diff.split("\n\nMoved to:", 1)[0]
+            out.append(
+                {
+                    "path": path,
+                    "type": "update",
+                    "move_path": str(move_path) if move_path else None,
+                    "unified_diff": diff,
+                }
+            )
+    return out
+
+
 def _run_goal_continuations_human(
     session: CodexSession,
     *,
@@ -644,6 +1346,7 @@ def _run_chat(
     color_mode: str = "auto",
     replay_history: bool = False,
     history_source_path: Path | None = None,
+    shared_runtime: "_SharedRemoteRuntime | None" = None,
 ) -> int:
     prompt = initial_prompt
     printed_transcript = _render_resumed_transcript(
@@ -661,7 +1364,14 @@ def _run_chat(
         if prompt is None:
             if printed_transcript:
                 print(file=sys.stderr, flush=True)
-            prompt = _read_interactive_prompt(color_mode=color_mode)
+            if shared_runtime is not None:
+                prompt = _read_interactive_prompt_with_shared_runtime(
+                    session,
+                    shared_runtime,
+                    color_mode=color_mode,
+                )
+            else:
+                prompt = _read_interactive_prompt(color_mode=color_mode)
         if prompt is None:
             return exit_status
         slash_result = _handle_interactive_slash_command(
@@ -693,6 +1403,7 @@ def _run_chat(
                     prompt,
                     color_mode=color_mode,
                     queued_prompts=queued_prompts,
+                    shared_runtime=shared_runtime,
                 )
             else:
                 renderer = _HumanEventRenderer(color_mode=color_mode)
@@ -1007,6 +1718,7 @@ def _run_session_human_interactive(
     *,
     color_mode: str = "auto",
     queued_prompts: deque[str] | None = None,
+    shared_runtime: "_SharedRemoteRuntime | None" = None,
 ) -> int:
     output: "queue.Queue[str]" = queue.Queue()
     status_tracker = _LiveTurnStatus()
@@ -1024,6 +1736,9 @@ def _run_session_human_interactive(
     status: dict[str, int] = {"code": 1}
 
     def worker() -> None:
+        if shared_runtime is not None:
+            status["code"] = shared_runtime.run_turn(prompt)
+            return
         status["code"] = _run_session_human(
             session,
             prompt,
@@ -1035,11 +1750,15 @@ def _run_session_human_interactive(
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
+    if shared_runtime is not None:
+        shared_runtime.drain(renderer, color_mode=color_mode)
     _drain_output_queue(output)
     interrupted = False
     with _TurnInputReader(enabled=sys.stdin.isatty() and sys.stderr.isatty(), color_mode=color_mode) as reader:
         reader.set_status(status_tracker.snapshot(session))
         while thread.is_alive():
+            if shared_runtime is not None:
+                shared_runtime.drain(renderer, color_mode=color_mode, input_reader=reader)
             _drain_output_queue(output, input_reader=reader)
             if not reader.output_partial_line_open:
                 reader.set_status(status_tracker.snapshot(session))
@@ -1055,15 +1774,25 @@ def _run_session_human_interactive(
                 if action.kind == "interrupt" and not interrupted:
                     interrupted = True
                     reader.clear()
-                    session.interrupt()
+                    if shared_runtime is not None:
+                        shared_runtime.interrupt()
+                    else:
+                        session.interrupt()
                     renderer.render_interrupted()
                     _drain_output_queue(output, input_reader=reader)
                 elif action.kind == "submit" and action.text.strip():
-                    accepted = _submit_turn_input(session, action.text, queued_prompts=queued_prompts)
+                    if shared_runtime is not None:
+                        accepted = shared_runtime.steer(action.text)
+                        if not accepted:
+                            queued_prompts.append(action.text) if queued_prompts is not None else session.queue_input_for_next_turn(action.text)
+                    else:
+                        accepted = _submit_turn_input(session, action.text, queued_prompts=queued_prompts)
                     renderer.render_pending_input_preview(action.text, active=accepted)
                     _drain_output_queue(output, input_reader=reader)
             thread.join(timeout=0.03)
     thread.join(timeout=0.1)
+    if shared_runtime is not None:
+        shared_runtime.drain(renderer, color_mode=color_mode)
     _drain_output_queue(output)
     outcome = "interrupted" if interrupted else "completed" if status["code"] == 0 else "failed"
     _print_finished_turn_status(
@@ -2219,6 +2948,36 @@ def _read_interactive_prompt(*, color_mode: str = "auto") -> str | None:
     if sys.stdin.isatty() and sys.stderr.isatty():
         print("\033[1A\033[2K", end="", file=sys.stderr, flush=True)
     return line.rstrip("\n").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _read_interactive_prompt_with_shared_runtime(
+    session: CodexSession,
+    shared_runtime: "_SharedRemoteRuntime",
+    *,
+    color_mode: str = "auto",
+) -> str | None:
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return _read_interactive_prompt(color_mode=color_mode)
+    output: "queue.Queue[str]" = queue.Queue()
+    renderer = _HumanEventRenderer(color_mode=color_mode, line_sink=output.put)
+    with _TurnInputReader(enabled=True, color_mode=color_mode) as reader:
+        reader.render()
+        while True:
+            shared_runtime.drain(renderer, color_mode=color_mode, input_reader=reader)
+            _drain_output_queue(output, input_reader=reader)
+            if not reader.output_partial_line_open:
+                reader.set_status(None)
+            for action in reader.poll():
+                if action.kind == "interrupt":
+                    reader.clear()
+                    session.interrupt()
+                    renderer.render_interrupted()
+                    _drain_output_queue(output, input_reader=reader)
+                elif action.kind == "submit":
+                    shared_runtime.drain(renderer, color_mode=color_mode, input_reader=reader)
+                    _drain_output_queue(output, input_reader=reader)
+                    return action.text
+            time.sleep(0.03)
 
 
 def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
@@ -4921,7 +5680,8 @@ class _HumanEventRenderer:
         self._live_exec_rendered: set[str] = set()
         self._live_exec_output_seen: set[str] = set()
         self._live_exec_output_text: dict[str, str] = {}
-        self._live_exec_output_line_state: dict[str, _LiveOutputLineState] = {}
+        self._live_exec_regions: dict[str, _LiveExecRegion] = {}
+        self._live_exec_panel_rows = 0
         self._exploration_calls: list[_ExecDisplayCall] = []
         self._final_message: str = ""
         self._final_message_rendered = False
@@ -5469,12 +6229,20 @@ class _HumanEventRenderer:
                     meta,
                     command=command,
                     session_id=session_id,
+                    stdin=str(args.get("chars") or ""),
                 )
             else:
-                self._flush_exploration()
-                self._begin_work_cell()
-                self._line(f"{self._style.bold('write_stdin:')} {self._style.red('failed')}")
+                # Mirror the success path: surface the interaction header (which
+                # terminal + the input we sent) followed by the error rendered as a
+                # dim output block, instead of a bare unrendered "write_stdin: failed".
+                chars = str(args.get("chars") or "")
                 output = str(payload.get("output") or "")
+                should_render_interaction = bool(chars.strip()) or bool(output.strip())
+                if should_render_interaction and event_call_id not in self._rendered_background_terminal_interactions:
+                    self.render_terminal_interaction(session_id, chars, command=command)
+                else:
+                    self._flush_exploration()
+                    self._begin_work_cell()
                 if output.strip():
                     self._render_output_block(output)
             self._active_background_terminal_interactions.pop(event_call_id, None)
@@ -5493,18 +6261,27 @@ class _HumanEventRenderer:
             self._background_terminal_session_call_ids[str(session_id)] = call_id
         live_output_seen = call_id in self._live_exec_output_seen
         output = _visible_command_output(meta, payload)
-        call.output = self._remaining_live_exec_output(call_id, output) if live_output_seen else output
+        if live_output_seen and self._live_exec_has_other_regions(call_id):
+            call.output = self._live_exec_final_output(call_id, output)
+            self._detach_live_exec_region(call_id, commit_if_last=False)
+            suppress_empty_output = False
+        elif live_output_seen:
+            call.output = self._remaining_live_exec_output(call_id, output)
+            self._detach_live_exec_region(call_id, commit_if_last=True)
+            suppress_empty_output = True
+        else:
+            call.output = output
+            suppress_empty_output = False
         call.exit_code = exit_value
         call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
         if exit_value is None and not live_output_seen and not call.output.strip():
             self._clear_live_exec(call_id)
             return
         if live_output_seen and exit_value is None:
-            if call.output.strip():
-                combined_output = self._live_exec_output_text.get(call_id, "") + call.output
-                self._live_exec_output_text[call_id] = combined_output
-                self._render_output_delta_block(call_id, combined_output, first=False)
-            self._clear_live_exec(call_id)
+            if self._live_exec_has_other_regions(call_id):
+                self._render_exec_call(call, running=True, ok=True)
+                self._render_live_exec_panel()
+            self._clear_live_exec_metadata(call_id)
             return
         if exit_value is not None and call.is_exploration and not live_output_seen:
             self._exploration_calls.append(call)
@@ -5515,11 +6292,12 @@ class _HumanEventRenderer:
             call,
             running=exit_value is None,
             ok=ok,
-            suppress_empty_output=live_output_seen,
+            suppress_empty_output=suppress_empty_output,
         )
         if exit_value is not None:
             self._background_terminal_call_commands.pop(call_id, None)
-        self._clear_live_exec(call_id)
+        self._clear_live_exec_metadata(call_id)
+        self._render_live_exec_panel()
 
     def _render_exec_output_delta(self, payload: dict[str, Any]) -> None:
         call_id = str(payload.get("call_id") or "")
@@ -5541,18 +6319,18 @@ class _HumanEventRenderer:
         first_output = call_id not in self._live_exec_output_seen
         if call_id not in self._live_exec_rendered:
             if interaction is not None:
-                self.render_terminal_interaction(
-                    interaction.get("session_id", ""),
-                    interaction.get("stdin", ""),
+                self._ensure_live_exec_region(
+                    call_id,
+                    kind="background",
                     command=interaction.get("command", ""),
+                    stdin=interaction.get("stdin", ""),
                 )
                 self._rendered_background_terminal_interactions.add(call_id)
             else:
                 if call is None:
                     command = self._background_terminal_call_commands.get(call_id, "")
                     call = _ExecDisplayCall(call_id=call_id, command=command, parsed=parse_command_actions(command))
-                self._flush_exploration()
-                self._render_exec_call(call, running=True, ok=True, suppress_empty_output=True)
+                self._ensure_live_exec_region(call_id, kind="exec", command=call.command)
         self._live_exec_rendered.add(call_id)
         self._live_exec_output_seen.add(call_id)
         self._live_exec_output_text[call_id] = self._live_exec_output_text.get(call_id, "") + delta
@@ -5594,35 +6372,58 @@ class _HumanEventRenderer:
         *,
         command: str,
         session_id: str,
+        stdin: str = "",
     ) -> None:
         exit_value = _int_value(meta.get("exit_code"))
         output = _visible_command_output(meta, payload)
+        event_call_id = str(meta.get("event_call_id") or call_id)
+        live_output_seen = event_call_id in self._live_exec_output_seen
         if exit_value is None:
-            event_call_id = str(meta.get("event_call_id") or call_id)
-            if output.strip() and event_call_id not in self._live_exec_output_seen:
+            if live_output_seen:
+                final_output = self._live_exec_final_output(event_call_id, output)
+                if self._live_exec_has_other_regions(event_call_id):
+                    self._detach_live_exec_region(event_call_id, commit_if_last=False)
+                    self.render_terminal_interaction(session_id, stdin, command=command)
+                    if final_output.strip():
+                        self._render_output_block(final_output)
+                    self._render_live_exec_panel()
+                else:
+                    self._detach_live_exec_region(event_call_id, commit_if_last=True)
+                self._clear_live_exec_metadata(event_call_id)
+                return
+            if output.strip():
                 self._render_output_block(output)
             return
         if session_id:
             self._background_terminal_commands.pop(session_id, None)
             self._background_terminal_session_call_ids.pop(session_id, None)
-        event_call_id = str(meta.get("event_call_id") or call_id)
         call = _ExecDisplayCall(
             call_id=event_call_id,
             command=command,
             parsed=parse_command_actions(command),
         )
-        live_output_seen = event_call_id in self._live_exec_output_seen
-        call.output = self._remaining_live_exec_output(event_call_id, output) if live_output_seen else output
+        if live_output_seen and self._live_exec_has_other_regions(event_call_id):
+            call.output = self._live_exec_final_output(event_call_id, output)
+            self._detach_live_exec_region(event_call_id, commit_if_last=False)
+            suppress_empty_output = False
+        elif live_output_seen:
+            call.output = self._remaining_live_exec_output(event_call_id, output)
+            self._detach_live_exec_region(event_call_id, commit_if_last=True)
+            suppress_empty_output = True
+        else:
+            call.output = output
+            suppress_empty_output = False
         call.exit_code = exit_value
         call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
         self._render_exec_call(
             call,
             running=False,
             ok=ok and exit_value == 0,
-            suppress_empty_output=live_output_seen,
+            suppress_empty_output=suppress_empty_output,
         )
         self._background_terminal_call_commands.pop(event_call_id, None)
-        self._clear_live_exec(event_call_id)
+        self._clear_live_exec_metadata(event_call_id)
+        self._render_live_exec_panel()
 
     def _render_apply_patch_completed(
         self,
@@ -5640,14 +6441,14 @@ class _HumanEventRenderer:
             if changes:
                 self._render_file_changes(changes)
                 return
-        self._line(
-            f"{self._style.bold('patch:')} {self._style.green('completed')}"
-            if ok
-            else f"{self._style.bold('patch:')} {self._style.red('failed')}"
-        )
+            self._line(f"{self._style.bold('patch:')} {self._style.green('completed')}")
+            return
+        # Failure: mirror upstream new_patch_apply_failure (history_cell/patches.rs):
+        # a magenta+bold title followed by the stderr rendered as a dim output block.
+        self._line(self._style.magenta(self._style.bold("✘ Failed to apply patch")))
         output = str(payload.get("output") or "")
         if output.strip():
-            self._line(output)
+            self._render_output_block(output)
 
     def _render_file_changes(self, changes: list["_FileChangeDisplay"]) -> None:
         total_added = sum(change.additions for change in changes)
@@ -5793,18 +6594,154 @@ class _HumanEventRenderer:
                 transform=self._style.dim,
             )
 
-    def _render_output_delta_block(self, call_id: str, output: str, *, first: bool) -> None:
-        if not output:
+    def _ensure_live_exec_region(
+        self,
+        call_id: str,
+        *,
+        kind: str,
+        command: str = "",
+        stdin: str = "",
+    ) -> None:
+        region = self._live_exec_regions.get(call_id)
+        if region is not None:
+            if command and not region.command:
+                region.command = command
+            if stdin and not region.stdin:
+                region.stdin = stdin
             return
-        state = self._live_exec_output_line_state.setdefault(call_id, _LiveOutputLineState(started=not first))
-        rows = _live_output_display_rows(output, self._style, shutil.get_terminal_size((100, 24)).columns)
+        if not self._live_exec_regions:
+            self._flush_exploration()
+            self._begin_work_cell()
+        self._live_exec_regions[call_id] = _LiveExecRegion(
+            call_id=call_id,
+            kind=kind,
+            command=command,
+            stdin=stdin,
+        )
+
+    def _render_output_delta_block(self, call_id: str, output: str, *, first: bool) -> None:
+        if not output or call_id not in self._live_exec_regions:
+            return
+        self._render_live_exec_panel()
+
+    def _render_live_exec_panel(self) -> None:
+        if not self._live_exec_regions:
+            self._clear_live_exec_panel()
+            return
+        rows = self._live_exec_panel_display_rows()
+        self._clear_live_exec_panel()
         if not rows:
             return
-        clear = _clear_rendered_block_sequence(state.rendered_rows)
-        rendered = "\n".join(rows)
-        self._write(f"{clear}{rendered}\n", partial_line_open=False)
-        state.started = True
-        state.rendered_rows = len(rows)
+        self._write("\n".join(rows) + "\n", partial_line_open=False)
+        self._live_exec_panel_rows = len(rows)
+
+    def _live_exec_panel_display_rows(self) -> list[str]:
+        terminal_width = shutil.get_terminal_size((100, 24)).columns
+        rows: list[str] = []
+        for region in self._live_exec_regions.values():
+            rows.extend(self._live_exec_region_rows(region, terminal_width))
+        return rows
+
+    def _live_exec_region_rows(self, region: "_LiveExecRegion", terminal_width: int) -> list[str]:
+        rows: list[str] = []
+        if region.kind == "background":
+            marker = "↳" if region.stdin else "•"
+            label = "Interacted with background terminal" if region.stdin else "Waited for background terminal"
+            rows.extend(self._live_exec_background_header_rows(marker, label, region.command, terminal_width))
+            if region.stdin:
+                rows.extend(
+                    self._prefixed_wrapped_rows(
+                        region.stdin.rstrip("\n").splitlines(),
+                        first_prefix=self._style.dim("  └ "),
+                        rest_prefix=self._style.dim("    "),
+                        terminal_width=terminal_width,
+                    )
+                )
+        else:
+            rows.extend(self._live_exec_command_header_rows(region.command, terminal_width))
+        output = self._live_exec_output_text.get(region.call_id, "")
+        rows.extend(_live_output_display_rows(output, self._style, terminal_width))
+        return rows
+
+    def _live_exec_command_header_rows(self, command: str, terminal_width: int) -> list[str]:
+        return self._prefixed_wrapped_rows(
+            _command_display_lines(command, self._style),
+            first_prefix=f"{self._style.cyan('•')} {self._style.bold('Running')} ",
+            rest_prefix=self._style.dim("  │ "),
+            max_lines=5,
+            ellipsis_prefix=self._style.dim("  │ "),
+            terminal_width=terminal_width,
+        )
+
+    def _live_exec_background_header_rows(
+        self,
+        marker: str,
+        label: str,
+        command_display: str,
+        terminal_width: int,
+    ) -> list[str]:
+        prefix = f"{self._style.dim(marker)} "
+        line = self._style.bold(label)
+        command_snapshot = _terminal_interaction_command_snapshot(
+            command_display,
+            terminal_width - _visible_len(prefix) - _visible_len(label) - 3,
+        )
+        if command_snapshot:
+            line += f" {self._style.dim('·')} {self._style.dim(command_snapshot)}"
+        return self._prefixed_wrapped_rows(
+            [line],
+            first_prefix=prefix,
+            rest_prefix="  ",
+            terminal_width=terminal_width,
+        )
+
+    def _prefixed_wrapped_rows(
+        self,
+        lines: list[str],
+        *,
+        first_prefix: str,
+        rest_prefix: str,
+        terminal_width: int,
+        max_lines: int | None = None,
+        ellipsis_prefix: str | None = None,
+    ) -> list[str]:
+        rendered: list[tuple[str, str]] = []
+        first_physical_line = True
+        for logical_line in lines:
+            if logical_line == "":
+                rendered.append((rest_prefix if rendered else first_prefix, ""))
+                first_physical_line = False
+                continue
+            line_first = first_physical_line
+            prefix = first_prefix if line_first else rest_prefix
+            available_width = max(10, terminal_width - _visible_len(prefix))
+            for segment in _wrap_ansi_line(logical_line, available_width):
+                rendered.append((first_prefix if line_first else rest_prefix, segment))
+                line_first = False
+                first_physical_line = False
+        if max_lines is not None and len(rendered) > max_lines:
+            keep = max(1, max_lines - 1)
+            rows = [f"{prefix}{segment}" for prefix, segment in rendered[:keep]]
+            rows.append(f"{ellipsis_prefix or rest_prefix}{self._style.dim(_ellipsis_text(len(rendered) - keep))}")
+            return rows
+        return [f"{prefix}{segment}" for prefix, segment in rendered]
+
+    def _clear_live_exec_panel(self) -> None:
+        if self._live_exec_panel_rows <= 0:
+            self._live_exec_panel_rows = 0
+            return
+        self._write(_clear_rendered_block_sequence(self._live_exec_panel_rows), partial_line_open=False)
+        self._live_exec_panel_rows = 0
+
+    def _live_exec_has_other_regions(self, call_id: str) -> bool:
+        return any(active_call_id != call_id for active_call_id in self._live_exec_regions)
+
+    def _live_exec_final_output(self, call_id: str, output: str) -> str:
+        rendered = self._live_exec_output_text.get(call_id, "")
+        if not rendered:
+            return output
+        remaining = self._remaining_live_exec_output(call_id, output)
+        return rendered + remaining
 
     def _remaining_live_exec_output(self, call_id: str, output: str) -> str:
         if not output:
@@ -5818,20 +6755,32 @@ class _HumanEventRenderer:
             return ""
         return output
 
-    def _clear_live_exec(self, call_id: str) -> None:
-        self._finish_live_output_line(call_id)
+    def _detach_live_exec_region(self, call_id: str, *, commit_if_last: bool) -> None:
+        if call_id not in self._live_exec_regions:
+            return
+        other_regions = any(active_call_id != call_id for active_call_id in self._live_exec_regions)
+        if self._live_exec_panel_rows > 0:
+            if commit_if_last and not other_regions:
+                self._live_exec_panel_rows = 0
+            else:
+                self._clear_live_exec_panel()
+        self._live_exec_regions.pop(call_id, None)
+
+    def _clear_live_exec_metadata(self, call_id: str) -> None:
         self._live_exec_rendered.discard(call_id)
         self._live_exec_output_seen.discard(call_id)
         self._live_exec_output_text.pop(call_id, None)
 
+    def _clear_live_exec(self, call_id: str) -> None:
+        self._detach_live_exec_region(call_id, commit_if_last=True)
+        self._clear_live_exec_metadata(call_id)
+
     def _finish_live_output_line(self, call_id: str) -> None:
-        state = self._live_exec_output_line_state.pop(call_id, None)
-        if state is not None:
-            self._live_exec_rendered.discard(call_id)
+        self._detach_live_exec_region(call_id, commit_if_last=True)
 
     def _finish_all_live_output_lines(self) -> None:
-        for call_id in list(self._live_exec_output_line_state):
-            self._finish_live_output_line(call_id)
+        if self._live_exec_regions:
+            self._clear_live_exec_panel()
 
     def _render_plan(self, meta: dict[str, Any]) -> None:
         self._line(f"{self._style.dim('•')} {self._style.bold('Updated Plan')}")
@@ -6048,9 +6997,11 @@ class _HumanEventRenderer:
 
 
 @dataclass
-class _LiveOutputLineState:
-    started: bool = False
-    rendered_rows: int = 0
+class _LiveExecRegion:
+    call_id: str
+    kind: str
+    command: str = ""
+    stdin: str = ""
 
 
 @dataclass
