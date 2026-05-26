@@ -15,6 +15,19 @@ REMOTE_CONTROL_DESKTOP_COMPAT_CLIENT_NAME = "Codex Desktop"
 REMOTE_CONTROL_DESKTOP_COMPAT_CLIENT_VERSION = "dumb"
 
 
+def _codex_module_name_from(module_name: str) -> str:
+    module_name = module_name.split(".remote_control", 1)[0]
+    return module_name or "codex"
+
+
+def _codex_module_name() -> str:
+    return _codex_module_name_from(__name__)
+
+
+def _codex_module_command(*args: str) -> list[str]:
+    return [sys.executable, "-m", _codex_module_name(), *args]
+
+
 def _env_truthy(name: str) -> bool:
     value = os.environ.get(name)
     return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}

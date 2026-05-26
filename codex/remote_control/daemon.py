@@ -18,7 +18,7 @@ from .local import app_server_control_socket_available, app_server_control_socke
 from .pid import _clear_pid_file, _process_is_running, _read_pid_file, _remote_control_log_path, _write_pid_file
 from .protocol import RemoteClientEvent, RemoteServerEvent
 from .types import RemoteControlConfig, RemoteControlError, RemoteControlReadyStatus
-from .utils import _optional_int
+from .utils import _codex_module_command, _optional_int
 
 def run_native_remote_control(
     subcommand: str | None = None,
@@ -73,7 +73,7 @@ def _start_remote_control_daemon(config: RemoteControlConfig, *, quiet: bool = F
     env[REMOTE_CONTROL_SERVER_NAME_ENV] = config.server_name
     if config.auth_codex_home is not None:
         env["CODEX_AUTH_HOME"] = str(config.auth_codex_home)
-    command = [sys.executable, "-m", "agents.codex", "remote-control"]
+    command = _codex_module_command("remote-control")
     with log_path.open("ab") as log_file:
         process = subprocess.Popen(
             command,

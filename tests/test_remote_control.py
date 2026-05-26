@@ -56,8 +56,18 @@ from codex.remote_control import (
 )
 from codex.remote_control import service as remote_control_service_module
 from codex.remote_control import trace as remote_control_trace
-from codex.remote_control.utils import _effective_app_server_client_name, _remote_control_client_identity
-from codex.cli import _DaemonAppServerClient, _shared_remote_control_server_name
+from codex.remote_control.utils import (
+    _codex_module_command,
+    _codex_module_name_from as _remote_control_module_name_from,
+    _effective_app_server_client_name,
+    _remote_control_client_identity,
+)
+from codex.cli import (
+    _DaemonAppServerClient,
+    _codex_module_name_from as _cli_module_name_from,
+    _codex_module_prog,
+    _shared_remote_control_server_name,
+)
 from codex.core import CodexSession
 from codex.types import CodexConfig, CodexEvent
 
@@ -490,6 +500,14 @@ class CodexRemoteControlTests(unittest.TestCase):
         self.assertEqual(generated_headers["x-codex-name"], expected_name_header)
         self.assertEqual(generated_headers["x-codex-protocol-version"], REMOTE_CONTROL_PROTOCOL_VERSION)
         self.assertEqual(generated_headers[REMOTE_CONTROL_ACCOUNT_ID_HEADER], "account-success")
+
+    def test_remote_control_daemon_uses_current_package_module_not_hardcoded_agents_path(self) -> None:
+        self.assertEqual(_remote_control_module_name_from("codex.remote_control.utils"), "codex")
+        self.assertEqual(_remote_control_module_name_from("codex.remote_control.utils"), "codex")
+        self.assertEqual(_cli_module_name_from("codex.cli"), "codex")
+        self.assertEqual(_cli_module_name_from("codex.cli"), "codex")
+        self.assertEqual(_codex_module_command("remote-control"), [sys.executable, "-m", "codex", "remote-control"])
+        self.assertEqual(_codex_module_prog("remote-control"), "python -m codex remote-control")
 
     def test_remote_control_known_good_ios_bootstrap_trace_is_locked(self) -> None:
         records = _load_success_trace_fixture()

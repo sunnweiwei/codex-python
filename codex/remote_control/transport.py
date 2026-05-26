@@ -32,6 +32,7 @@ from .types import (
 )
 from .utils import (
     _codex_user_agent,
+    _codex_module_name,
     _ensure_trailing_path_slash,
     _invalid_remote_control_url_message,
     _is_allowed_chatgpt_host,
@@ -280,7 +281,7 @@ def _load_remote_control_auth(config: RemoteControlConfig) -> RemoteControlAuth:
             snapshot = refresh_chatgpt_auth(snapshot)
     except Exception as exc:
         raise RemoteControlUnavailable(
-            "remote control requires ChatGPT login credentials; run `python -m agents.codex login` first"
+            f"remote control requires ChatGPT login credentials; run `python -m {_codex_module_name()} login` first"
         ) from exc
     if snapshot is None or not snapshot.access_token or not snapshot.account_id:
         raise RemoteControlUnavailable(

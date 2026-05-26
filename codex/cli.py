@@ -43,6 +43,19 @@ _UPSTREAM_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS = 1000
 _DEFAULT_SHARED_REMOTE_CONTROL_NAME = REQUIRED_REMOTE_CONTROL_SERVER_NAME
 
 
+def _codex_module_name_from(module_name: str) -> str:
+    module_name = module_name.split(".cli", 1)[0]
+    return module_name or "codex"
+
+
+def _codex_module_name() -> str:
+    return _codex_module_name_from(__name__)
+
+
+def _codex_module_prog(*args: str) -> str:
+    return " ".join(["python", "-m", _codex_module_name(), *args])
+
+
 def _set_raw_keep_opost(fd: int) -> None:
     """Like tty.setraw, but keep OPOST so output \\n is still translated to \\r\\n.
 
@@ -92,11 +105,11 @@ def _main(argv: list[str] | None = None) -> int:
     if raw_argv and raw_argv[0] == "fork":
         return _main_resume_chat(raw_argv[1:], fork=True)
     if raw_argv and raw_argv[0] == "chat":
-        return _main_chat(raw_argv[1:], prog="python -m agents.codex chat")
+        return _main_chat(raw_argv[1:], prog=_codex_module_prog("chat"))
     if _should_route_to_chat(raw_argv):
         return _main_chat(raw_argv)
 
-    parser = argparse.ArgumentParser(prog="python -m agents.codex")
+    parser = argparse.ArgumentParser(prog=_codex_module_prog())
     subparsers = parser.add_subparsers(dest="command")
     chat_parser = subparsers.add_parser("chat")
     chat_parser.add_argument("prompt", nargs="?")
@@ -154,7 +167,7 @@ def _main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "chat":
-        return _main_chat(raw_argv[1:], prog="python -m agents.codex chat")
+        return _main_chat(raw_argv[1:], prog=_codex_module_prog("chat"))
 
     if args.command == "login":
         return _main_login(args)
@@ -228,7 +241,7 @@ def _main_login(args: argparse.Namespace) -> int:
         elif status.get("has_api_key"):
             print("API key: available")
         else:
-            print("Not logged in. Run `python -m agents.codex login` once, or set OPENAI_API_KEY.")
+            print(f"Not logged in. Run `{_codex_module_prog('login')}` once, or set OPENAI_API_KEY.")
             return 1
         if status.get("last_refresh"):
             print(f"Last refresh: {status['last_refresh']}")
@@ -295,7 +308,7 @@ def _run_parity_trace(args: argparse.Namespace) -> int:
 
 
 def _main_exec_resume(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="python -m agents.codex exec resume")
+    parser = argparse.ArgumentParser(prog=_codex_module_prog("exec", "resume"))
     parser.add_argument("session_id", nargs="?")
     parser.add_argument("prompt", nargs="?")
     parser.add_argument("--last", action="store_true")
@@ -325,7 +338,7 @@ def _main_exec_resume(argv: list[str]) -> int:
 
 
 def _main_exec_fork(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="python -m agents.codex exec fork")
+    parser = argparse.ArgumentParser(prog=_codex_module_prog("exec", "fork"))
     parser.add_argument("session_id", nargs="?")
     parser.add_argument("prompt", nargs="?")
     parser.add_argument("--last", action="store_true")
@@ -354,7 +367,7 @@ def _main_exec_fork(argv: list[str]) -> int:
 
 def _main_resume_chat(argv: list[str], *, fork: bool) -> int:
     name = "fork" if fork else "resume"
-    parser = argparse.ArgumentParser(prog=f"python -m agents.codex {name}")
+    parser = argparse.ArgumentParser(prog=_codex_module_prog(name))
     parser.add_argument("session_id", nargs="?")
     parser.add_argument("--last", action="store_true")
     parser.add_argument("--all", action="store_true", dest="all_cwds")
@@ -416,7 +429,8 @@ def _main_resume_chat(argv: list[str], *, fork: bool) -> int:
         return 1
 
 
-def _main_chat(argv: list[str], *, prog: str = "python -m agents.codex") -> int:
+def _main_chat(argv: list[str], *, prog: str | None = None) -> int:
+    prog = prog or _codex_module_prog()
     parser = argparse.ArgumentParser(prog=prog)
     parser.add_argument("prompt", nargs="?")
     _add_exec_options(parser)
