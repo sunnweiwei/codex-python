@@ -6147,6 +6147,9 @@ class _HumanEventRenderer:
         self._background_terminal_call_commands: dict[str, str] = {}
         self._background_terminal_session_call_ids: dict[str, str] = {}
         self._active_background_terminal_interactions: dict[str, dict[str, str]] = {}
+        self._pending_background_terminal_waits: dict[str, dict[str, str]] = {}
+        self._flushing_background_terminal_wait = False
+        self._idle_background_terminal_call_ids: set[str] = set()
         self._rendered_background_terminal_interactions: set[str] = set()
         self._live_exec_rendered: set[str] = set()
         self._live_exec_output_seen: set[str] = set()
@@ -6154,8 +6157,10 @@ class _HumanEventRenderer:
         self._live_exec_incremental_rendered: set[str] = set()
         self._live_exec_incremental_obscured: set[str] = set()
         self._live_exec_incremental_segment_output: dict[str, str] = {}
+        self._live_exec_incremental_header_start: dict[str, int] = {}
         self._live_exec_incremental_header_rows: dict[str, int] = {}
         self._live_exec_incremental_total_rows: dict[str, int] = {}
+        self._live_exec_incremental_visible_rows = 0
         self._live_exec_regions: dict[str, _LiveExecRegion] = {}
         self._live_exec_panel_rows = 0
         self._live_exec_panel_needs_leading_gap = False
@@ -6361,9 +6366,22 @@ class _HumanEventRenderer:
             session_id = str(args.get("session_id") or "")
             event_call_id = self._background_terminal_session_call_ids.get(session_id, "")
             if event_call_id:
+                stdin = str(args.get("chars") or "")
+                if stdin:
+                    self._flush_pending_background_terminal_wait(event_call_id)
+                else:
+                    existing_wait = self._pending_background_terminal_waits.get(event_call_id, {})
+                    self._pending_background_terminal_waits[event_call_id] = {
+                        "session_id": session_id,
+                        "command": self._background_terminal_commands.get(session_id, ""),
+                        "confirmed_running": existing_wait.get("confirmed_running", ""),
+                    }
+                self._idle_background_terminal_call_ids.discard(event_call_id)
+                self._detach_live_exec_region(event_call_id, commit_if_last=True)
+                self._clear_live_exec_metadata(event_call_id)
                 self._active_background_terminal_interactions[event_call_id] = {
                     "session_id": session_id,
-                    "stdin": str(args.get("chars") or ""),
+                    "stdin": stdin,
                     "command": self._background_terminal_commands.get(session_id, ""),
                 }
                 if event_call_id in self._live_exec_regions:
@@ -6371,7 +6389,7 @@ class _HumanEventRenderer:
                         event_call_id,
                         kind="background",
                         command=self._background_terminal_commands.get(session_id, ""),
-                        stdin=str(args.get("chars") or ""),
+                        stdin=stdin,
                     )
             return
         elif name == "apply_patch":
@@ -6784,6 +6802,7 @@ class _HumanEventRenderer:
         output = _visible_command_output(meta, payload)
         incremental_live_output = call_id in self._live_exec_incremental_rendered
         if live_output_seen and exit_value is None:
+            self._mark_background_terminal_idle(call_id)
             return
         if live_output_seen and incremental_live_output and exit_value is not None:
             call.output = self._remaining_live_exec_output(call_id, output)
@@ -6792,9 +6811,10 @@ class _HumanEventRenderer:
             self._rewrite_incremental_live_exec_header(call, running=False, ok=ok)
             if exit_value is not None:
                 self._background_terminal_call_commands.pop(call_id, None)
+                self._idle_background_terminal_call_ids.discard(call_id)
             self._detach_live_exec_region(call_id, commit_if_last=True)
             self._clear_live_exec_metadata(call_id)
-            self._render_live_exec_panel()
+            self._render_live_exec_panel_if_needed()
             return
         elif live_output_seen and self._live_exec_has_other_regions(call_id):
             call.output = self._live_exec_final_output(call_id, output)
@@ -6810,12 +6830,14 @@ class _HumanEventRenderer:
         call.exit_code = exit_value
         call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
         if exit_value is None and not live_output_seen and not call.output.strip():
-            self._clear_live_exec(call_id)
+            self._mark_background_terminal_idle(call_id)
             return
         if exit_value is not None and call.is_exploration and not live_output_seen:
             self._exploration_calls.append(call)
             self._clear_live_exec(call_id)
             return
+        if exit_value is not None:
+            self._flush_pending_background_terminal_wait(call_id)
         self._flush_exploration()
         self._render_exec_call(
             call,
@@ -6825,7 +6847,11 @@ class _HumanEventRenderer:
         )
         if exit_value is not None:
             self._background_terminal_call_commands.pop(call_id, None)
-        self._clear_live_exec_metadata(call_id)
+            self._idle_background_terminal_call_ids.discard(call_id)
+            self._pending_background_terminal_waits.pop(call_id, None)
+            self._clear_live_exec_metadata(call_id)
+        else:
+            self._mark_background_terminal_idle(call_id)
         self._render_live_exec_panel_if_needed()
 
     def _render_exec_output_delta(self, payload: dict[str, Any]) -> None:
@@ -6834,6 +6860,8 @@ class _HumanEventRenderer:
         if not call_id or not delta:
             return
         interaction = self._active_background_terminal_interactions.get(call_id)
+        if interaction is None and call_id in self._idle_background_terminal_call_ids:
+            return
         call = self._exec_calls.get(call_id)
         if interaction is None and call is not None and call.is_exploration:
             return
@@ -6848,6 +6876,7 @@ class _HumanEventRenderer:
         first_output = call_id not in self._live_exec_output_seen
         if call_id not in self._live_exec_rendered:
             if interaction is not None:
+                self._pending_background_terminal_waits.pop(call_id, None)
                 self._ensure_live_exec_region(
                     call_id,
                     kind="background",
@@ -6871,6 +6900,9 @@ class _HumanEventRenderer:
         self._live_exec_output_seen.add(call_id)
         previous_output = self._live_exec_output_text.get(call_id, "")
         self._live_exec_output_text[call_id] = previous_output + delta
+        if not self._is_live_exec_tail_region(call_id):
+            self._freeze_live_exec_region(call_id)
+            return
         self._render_output_delta_block(call_id, previous_output, self._live_exec_output_text[call_id], first=first_output)
 
     def render_terminal_interaction(self, session_id: str, stdin: str, *, command: str | None = None) -> None:
@@ -6888,6 +6920,28 @@ class _HumanEventRenderer:
                 first_prefix=self._style.dim("  └ "),
                 rest_prefix=self._style.dim("    "),
             )
+
+    def _flush_pending_background_terminal_wait(self, call_id: str | None = None) -> None:
+        if self._flushing_background_terminal_wait:
+            return
+        if call_id is None:
+            call_ids = list(self._pending_background_terminal_waits)
+        else:
+            call_ids = [call_id]
+        self._flushing_background_terminal_wait = True
+        try:
+            for pending_call_id in call_ids:
+                pending = self._pending_background_terminal_waits.pop(pending_call_id, None)
+                if not pending:
+                    continue
+                command = pending.get("command", "")
+                if not command:
+                    session_id = pending.get("session_id", "")
+                    command = self._background_terminal_commands.get(session_id, "")
+                self.render_terminal_interaction(pending.get("session_id", ""), "", command=command)
+                self._rendered_background_terminal_interactions.add(pending_call_id)
+        finally:
+            self._flushing_background_terminal_wait = False
 
     def _render_terminal_interaction_header(self, marker: str, label: str, command_display: str) -> None:
         prefix = f"{self._style.dim(marker)} "
@@ -6917,22 +6971,36 @@ class _HumanEventRenderer:
         live_output_seen = event_call_id in self._live_exec_output_seen
         if exit_value is None:
             if live_output_seen:
+                self._mark_background_terminal_idle(event_call_id)
                 return
             if output.strip():
+                self._pending_background_terminal_waits.pop(event_call_id, None)
                 self._ensure_live_exec_region(event_call_id, kind="background", command=command, stdin=stdin)
                 self._live_exec_rendered.add(event_call_id)
                 self._live_exec_output_seen.add(event_call_id)
                 self._live_exec_output_text[event_call_id] = self._live_exec_output_text.get(event_call_id, "") + output
                 self._render_live_exec_panel()
+                self._mark_background_terminal_idle(event_call_id)
                 return
             if stdin.strip():
                 self._ensure_live_exec_region(event_call_id, kind="background", command=command, stdin=stdin)
                 self._live_exec_rendered.add(event_call_id)
                 self._render_live_exec_panel()
+                self._mark_background_terminal_idle(event_call_id)
+                return
+            pending_wait = self._pending_background_terminal_waits.get(event_call_id)
+            if pending_wait is not None:
+                pending_wait["confirmed_running"] = "1"
+            self._mark_background_terminal_idle(event_call_id)
             return
         if session_id:
             self._background_terminal_commands.pop(session_id, None)
             self._background_terminal_session_call_ids.pop(session_id, None)
+        pending_wait = self._pending_background_terminal_waits.get(event_call_id)
+        if pending_wait is not None and pending_wait.get("confirmed_running") == "1":
+            self._flush_pending_background_terminal_wait(event_call_id)
+        else:
+            self._pending_background_terminal_waits.pop(event_call_id, None)
         call = _ExecDisplayCall(
             call_id=event_call_id,
             command=command,
@@ -6945,9 +7013,10 @@ class _HumanEventRenderer:
             call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
             self._rewrite_incremental_live_exec_header(call, running=False, ok=ok and exit_value == 0)
             self._background_terminal_call_commands.pop(event_call_id, None)
+            self._idle_background_terminal_call_ids.discard(event_call_id)
             self._detach_live_exec_region(event_call_id, commit_if_last=True)
             self._clear_live_exec_metadata(event_call_id)
-            self._render_live_exec_panel()
+            self._render_live_exec_panel_if_needed()
             return
         elif live_output_seen and self._live_exec_has_other_regions(event_call_id):
             call.output = self._live_exec_final_output(event_call_id, output)
@@ -6969,6 +7038,8 @@ class _HumanEventRenderer:
             suppress_empty_output=suppress_empty_output,
         )
         self._background_terminal_call_commands.pop(event_call_id, None)
+        self._idle_background_terminal_call_ids.discard(event_call_id)
+        self._pending_background_terminal_waits.pop(event_call_id, None)
         self._clear_live_exec_metadata(event_call_id)
         self._render_live_exec_panel_if_needed()
 
@@ -7189,7 +7260,7 @@ class _HumanEventRenderer:
             rows = [*header_rows, *output_rows]
             if obscured:
                 self._begin_work_cell()
-            self._emit_live_incremental_rows(rows)
+            self._emit_live_incremental_rows(rows, call_id=call_id, header_rows=len(header_rows))
             self._live_exec_incremental_rendered.add(call_id)
             self._live_exec_incremental_obscured.discard(call_id)
             self._live_exec_incremental_segment_output[call_id] = segment_output
@@ -7201,7 +7272,7 @@ class _HumanEventRenderer:
         old_rows = _live_output_display_rows(previous_segment_output, self._style, terminal_width)
         new_rows = _live_output_display_rows(segment_output, self._style, terminal_width)
         if _rows_have_prefix(new_rows, old_rows):
-            self._emit_live_incremental_rows(new_rows[len(old_rows) :])
+            self._emit_live_incremental_rows(new_rows[len(old_rows) :], call_id=call_id)
             self._live_exec_incremental_segment_output[call_id] = segment_output
             self._live_exec_incremental_total_rows[call_id] = (
                 self._live_exec_incremental_total_rows.get(call_id, 0) + max(0, len(new_rows) - len(old_rows))
@@ -7211,24 +7282,30 @@ class _HumanEventRenderer:
             self._write(f"\r\033[1A\r\033[2K{new_rows[-1]}\n", partial_line_open=False)
             self._live_exec_incremental_segment_output[call_id] = segment_output
             return
-        self._emit_live_incremental_rows(new_rows[-max(1, min(3, len(new_rows))) :])
+        self._emit_live_incremental_rows(new_rows[-max(1, min(3, len(new_rows))) :], call_id=call_id)
         self._live_exec_incremental_segment_output[call_id] = segment_output
         self._live_exec_incremental_total_rows[call_id] = (
             self._live_exec_incremental_header_rows.get(call_id, 0) + len(new_rows)
         )
 
-    def _emit_live_incremental_rows(self, rows: list[str]) -> None:
+    def _emit_live_incremental_rows(self, rows: list[str], *, call_id: str, header_rows: int = 0) -> None:
+        if not rows:
+            return
+        if header_rows > 0:
+            self._live_exec_incremental_header_start[call_id] = self._live_exec_incremental_visible_rows
+            self._live_exec_incremental_header_rows[call_id] = header_rows
         self._suspend_live_finish += 1
         try:
             for row in rows:
                 self._line(row)
         finally:
             self._suspend_live_finish -= 1
+        self._live_exec_incremental_visible_rows += len(rows)
 
     def _rewrite_incremental_live_exec_header(self, call: "_ExecDisplayCall", *, running: bool, ok: bool) -> None:
-        total_rows = self._live_exec_incremental_total_rows.get(call.call_id, 0)
+        header_start = self._live_exec_incremental_header_start.get(call.call_id)
         header_rows = self._live_exec_incremental_header_rows.get(call.call_id, 0)
-        if total_rows <= 0 or header_rows <= 0:
+        if header_start is None or header_rows <= 0:
             return
         rows = self._exec_call_header_rows(
             call,
@@ -7239,10 +7316,13 @@ class _HumanEventRenderer:
         rows = rows[:header_rows]
         if not rows:
             return
-        parts = [f"\r\033[{total_rows}A"]
+        rows_from_cursor_to_header = max(0, self._live_exec_incremental_visible_rows - header_start)
+        if rows_from_cursor_to_header <= 0:
+            return
+        parts = [f"\r\033[{rows_from_cursor_to_header}A"]
         for row in rows:
             parts.append(f"\r\033[2K{row}\n")
-        remaining_rows = max(0, total_rows - len(rows))
+        remaining_rows = max(0, rows_from_cursor_to_header - len(rows))
         if remaining_rows:
             parts.append(f"\033[{remaining_rows}B")
         parts.append("\r")
@@ -7403,6 +7483,11 @@ class _HumanEventRenderer:
     def _live_exec_has_other_regions(self, call_id: str) -> bool:
         return any(active_call_id != call_id for active_call_id in self._live_exec_regions)
 
+    def _is_live_exec_tail_region(self, call_id: str) -> bool:
+        if call_id not in self._live_exec_regions:
+            return False
+        return next(reversed(self._live_exec_regions), None) == call_id
+
     def _live_exec_final_output(self, call_id: str, output: str) -> str:
         rendered = self._live_exec_output_text.get(call_id, "")
         if not rendered:
@@ -7433,6 +7518,15 @@ class _HumanEventRenderer:
                 self._clear_live_exec_panel()
         self._live_exec_regions.pop(call_id, None)
 
+    def _freeze_live_exec_region(self, call_id: str) -> None:
+        self._detach_live_exec_region(call_id, commit_if_last=False)
+        self._live_exec_incremental_rendered.discard(call_id)
+        self._live_exec_incremental_obscured.discard(call_id)
+        self._live_exec_incremental_segment_output.pop(call_id, None)
+        self._live_exec_incremental_header_start.pop(call_id, None)
+        self._live_exec_incremental_header_rows.pop(call_id, None)
+        self._live_exec_incremental_total_rows.pop(call_id, None)
+
     def _clear_live_exec_metadata(self, call_id: str) -> None:
         self._live_exec_rendered.discard(call_id)
         self._live_exec_output_seen.discard(call_id)
@@ -7440,8 +7534,16 @@ class _HumanEventRenderer:
         self._live_exec_incremental_rendered.discard(call_id)
         self._live_exec_incremental_obscured.discard(call_id)
         self._live_exec_incremental_segment_output.pop(call_id, None)
+        self._live_exec_incremental_header_start.pop(call_id, None)
         self._live_exec_incremental_header_rows.pop(call_id, None)
         self._live_exec_incremental_total_rows.pop(call_id, None)
+
+    def _mark_background_terminal_idle(self, call_id: str) -> None:
+        if not call_id:
+            return
+        self._idle_background_terminal_call_ids.add(call_id)
+        self._detach_live_exec_region(call_id, commit_if_last=True)
+        self._clear_live_exec_metadata(call_id)
 
     def _clear_live_exec(self, call_id: str) -> None:
         self._detach_live_exec_region(call_id, commit_if_last=True)
@@ -7454,12 +7556,10 @@ class _HumanEventRenderer:
         if self._suspend_live_finish > 0:
             return
         if self._live_exec_regions:
-            self._live_exec_incremental_obscured.update(
-                call_id
-                for call_id in self._live_exec_regions
-                if call_id in self._live_exec_incremental_rendered
-            )
-            self._clear_live_exec_panel(leading_gap_after_clear=True)
+            self._clear_live_exec_panel()
+            for call_id in list(self._live_exec_regions):
+                self._freeze_live_exec_region(call_id)
+            self._live_exec_incremental_visible_rows = 0
 
     def _render_plan(self, meta: dict[str, Any]) -> None:
         self._line(f"{self._style.marker()} {self._style.bold('Updated Plan')}")
@@ -7604,6 +7704,11 @@ class _HumanEventRenderer:
         self._begin_cell()
 
     def _begin_cell(self) -> None:
+        if (
+            self._pending_background_terminal_waits
+            and not self._flushing_background_terminal_wait
+        ):
+            self._flush_pending_background_terminal_wait()
         if self._printed_any_cell:
             self._line("")
         self._printed_any_cell = True

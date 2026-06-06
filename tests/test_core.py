@@ -4714,6 +4714,154 @@ class CodexCoreTests(unittest.TestCase):
         started_before_completion = [event for event in result.events[:first_completed] if event.type == "tool.started"]
         self.assertEqual([event.payload["call_id"] for event in started_before_completion[-2:]], ["call-a", "call-b"])
 
+    def test_parallel_background_exec_sessions_keep_agent_loop_state_isolated(self) -> None:
+        command_a = "printf 'A-start\\n'; sleep 0.7; printf 'A-end\\n'"
+        command_b = "printf 'B-start\\n'; sleep 0.7; printf 'B-end\\n'"
+
+        class ParallelBackgroundModel:
+            def __init__(self) -> None:
+                self.requests: list[PromptRequest] = []
+                self.session_ids: dict[str, int] = {}
+                self.poll_outputs: dict[str, str] = {}
+
+            def create(self, request: PromptRequest):
+                self.requests.append(request)
+                outputs = {
+                    str(item.get("call_id")): str(item.get("output") or "")
+                    for item in request.input
+                    if item.get("type") == "function_call_output"
+                }
+                if len(self.requests) == 1:
+                    return _model_response(
+                        {
+                            "output": [
+                                {
+                                    "type": "function_call",
+                                    "name": "exec_command",
+                                    "call_id": "exec-a",
+                                    "arguments": json.dumps(
+                                        {
+                                            "cmd": command_a,
+                                            "yield_time_ms": 250,
+                                            "shell": "/bin/sh",
+                                            "login": False,
+                                        }
+                                    ),
+                                },
+                                {
+                                    "type": "function_call",
+                                    "name": "exec_command",
+                                    "call_id": "exec-b",
+                                    "arguments": json.dumps(
+                                        {
+                                            "cmd": command_b,
+                                            "yield_time_ms": 250,
+                                            "shell": "/bin/sh",
+                                            "login": False,
+                                        }
+                                    ),
+                                },
+                            ]
+                        }
+                    )
+                if len(self.requests) == 2:
+                    for call_id in ("exec-a", "exec-b"):
+                        match = re.search(r"Process running with session ID (\d+)", outputs.get(call_id, ""))
+                        if match is None:
+                            raise AssertionError(f"{call_id} did not return a background session: {outputs!r}")
+                        self.session_ids[call_id] = int(match.group(1))
+                    if self.session_ids["exec-a"] == self.session_ids["exec-b"]:
+                        raise AssertionError(f"parallel exec sessions were aliased: {self.session_ids!r}")
+                    return _model_response(
+                        {
+                            "output": [
+                                {
+                                    "type": "function_call",
+                                    "name": "write_stdin",
+                                    "call_id": "poll-b",
+                                    "arguments": json.dumps(
+                                        {"session_id": self.session_ids["exec-b"], "yield_time_ms": 2000}
+                                    ),
+                                },
+                                {
+                                    "type": "function_call",
+                                    "name": "write_stdin",
+                                    "call_id": "poll-a",
+                                    "arguments": json.dumps(
+                                        {"session_id": self.session_ids["exec-a"], "yield_time_ms": 2000}
+                                    ),
+                                },
+                            ]
+                        }
+                    )
+                if len(self.requests) == 3:
+                    self.poll_outputs = outputs
+                    return _model_response(message("done"))
+                raise AssertionError("unexpected extra model request")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            model = ParallelBackgroundModel()
+            result = CodexSession(
+                CodexConfig(
+                    cwd=root,
+                    codex_home=codex_home,
+                    skip_git_repo_check=True,
+                    ephemeral=False,
+                ),
+                model_client=model,
+            ).run("run parallel background commands")
+
+            self.assertEqual(result.final_message, "done")
+            self.assertIn("A-end", model.poll_outputs["poll-a"])
+            self.assertNotIn("B-end", model.poll_outputs["poll-a"])
+            self.assertIn("B-end", model.poll_outputs["poll-b"])
+            self.assertNotIn("A-end", model.poll_outputs["poll-b"])
+
+            completed = {
+                event.payload["call_id"]: event.payload
+                for event in result.events
+                if event.type == "tool.completed"
+            }
+            self.assertEqual(completed["poll-a"]["metadata"]["event_call_id"], "exec-a")
+            self.assertEqual(completed["poll-b"]["metadata"]["event_call_id"], "exec-b")
+            self.assertEqual(completed["poll-a"]["metadata"]["command"], command_a)
+            self.assertEqual(completed["poll-b"]["metadata"]["command"], command_b)
+
+            deltas = [event.payload for event in result.events if event.type == "exec_command.output_delta"]
+            self.assertTrue(any("A-start" in str(delta.get("delta") or "") for delta in deltas))
+            self.assertTrue(any("B-start" in str(delta.get("delta") or "") for delta in deltas))
+            for delta in deltas:
+                text = str(delta.get("delta") or "")
+                if "A-" in text:
+                    self.assertEqual(delta.get("call_id"), "exec-a")
+                if "B-" in text:
+                    self.assertEqual(delta.get("call_id"), "exec-b")
+
+            rollout_path = next((codex_home / "sessions").glob(f"????/??/??/rollout-*-{result.thread_id}.jsonl"))
+            records = [json.loads(line) for line in rollout_path.read_text(encoding="utf-8").splitlines()]
+            event_msgs = [record["payload"] for record in records if record["type"] == "event_msg"]
+            begin_call_ids = [payload["call_id"] for payload in event_msgs if payload["type"] == "exec_command_begin"]
+            self.assertEqual(begin_call_ids[-2:], ["exec-a", "exec-b"])
+            end_by_call = {
+                payload["call_id"]: payload
+                for payload in event_msgs
+                if payload["type"] == "exec_command_end"
+            }
+            self.assertIn("exec-a", end_by_call)
+            self.assertIn("exec-b", end_by_call)
+            self.assertNotIn("poll-a", end_by_call)
+            self.assertNotIn("poll-b", end_by_call)
+            self.assertEqual(end_by_call["exec-a"]["process_id"], str(model.session_ids["exec-a"]))
+            self.assertEqual(end_by_call["exec-b"]["process_id"], str(model.session_ids["exec-b"]))
+            self.assertIn("A-start", end_by_call["exec-a"]["aggregated_output"])
+            self.assertIn("A-end", end_by_call["exec-a"]["aggregated_output"])
+            self.assertNotIn("B-end", end_by_call["exec-a"]["aggregated_output"])
+            self.assertIn("B-start", end_by_call["exec-b"]["aggregated_output"])
+            self.assertIn("B-end", end_by_call["exec-b"]["aggregated_output"])
+            self.assertNotIn("A-end", end_by_call["exec-b"]["aggregated_output"])
+
     def test_session_interrupt_notifies_tools_before_slow_model_cancel(self) -> None:
         class SlowCancelModel(ScriptedResponsesModel):
             def cancel(self, *_args: Any) -> None:
@@ -5858,6 +6006,56 @@ new file mode 100644
         self.assertIn("hello", second.output)
         self.assertIn("ready", second.metadata["aggregated_output"])
 
+    @unittest.skipIf(sys.platform == "win32", "PTY semantics are not used by the Windows shell_command path")
+    def test_tool_runtime_interactive_background_sessions_keep_stdin_and_output_isolated(self) -> None:
+        runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True))
+        command_a = "printf 'A-ready\\n'; read line; printf 'A-got:%s\\n' \"$line\""
+        command_b = "printf 'B-ready\\n'; read line; printf 'B-got:%s\\n' \"$line\""
+
+        first = runtime.dispatch(
+            "exec_command",
+            {"cmd": command_a, "tty": True, "yield_time_ms": 250, "shell": "/bin/sh", "login": False},
+            call_id="exec-a",
+        )
+        second = runtime.dispatch(
+            "exec_command",
+            {"cmd": command_b, "tty": True, "yield_time_ms": 250, "shell": "/bin/sh", "login": False},
+            call_id="exec-b",
+        )
+        self.assertIn("session_id", first.metadata)
+        self.assertIn("session_id", second.metadata)
+        self.assertNotEqual(first.metadata["session_id"], second.metadata["session_id"])
+        runtime.drain_runtime_events()
+
+        b_result = runtime.dispatch(
+            "write_stdin",
+            {"session_id": second.metadata["session_id"], "chars": "B-input\n", "yield_time_ms": 1500},
+            call_id="stdin-b",
+        )
+        a_result = runtime.dispatch(
+            "write_stdin",
+            {"session_id": first.metadata["session_id"], "chars": "A-input\n", "yield_time_ms": 1500},
+            call_id="stdin-a",
+        )
+
+        self.assertTrue(a_result.ok, a_result.output)
+        self.assertTrue(b_result.ok, b_result.output)
+        self.assertEqual(a_result.metadata["event_call_id"], "exec-a")
+        self.assertEqual(b_result.metadata["event_call_id"], "exec-b")
+        self.assertIn("A-got:A-input", a_result.metadata["aggregated_output"])
+        self.assertNotIn("B-got:B-input", a_result.metadata["aggregated_output"])
+        self.assertIn("B-got:B-input", b_result.metadata["aggregated_output"])
+        self.assertNotIn("A-got:A-input", b_result.metadata["aggregated_output"])
+
+        deltas = runtime.drain_runtime_events()
+        for event in deltas:
+            payload = event.get("payload", {})
+            text = str(payload.get("delta") or "")
+            if "A-got" in text:
+                self.assertEqual(payload.get("call_id"), "exec-a")
+            if "B-got" in text:
+                self.assertEqual(payload.get("call_id"), "exec-b")
+
     def test_shell_command_interrupts_running_process(self) -> None:
         runtime = ToolRuntime(CodexConfig(skip_git_repo_check=True, ephemeral=True, include_shell_command_tool=True))
         result_holder: dict[str, ToolResult] = {}
@@ -6709,7 +6907,7 @@ new file mode 100644
         self.assertIn("• Ran sleep 0.1", rendered_io.getvalue())
         self.assertIn("draft while tool runs", rendered_io.getvalue())
 
-    def test_cli_live_background_terminal_region_survives_model_interleave_and_wait(self) -> None:
+    def test_cli_live_background_terminal_idles_between_explicit_waits(self) -> None:
         from codex.cli import _HumanEventRenderer
 
         rendered: list[Any] = []
@@ -6744,6 +6942,12 @@ new file mode 100644
                         "aggregated_output": "first\n",
                     },
                 },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "exec_command.output_delta",
+                {"call_id": "exec-1", "delta": "idle tick\n", "stream": "stdout"},
             )
         )
         renderer.render(
@@ -6792,9 +6996,13 @@ new file mode 100644
             )
         )
 
-        self.assertEqual(set(renderer._live_exec_regions), {"exec-1"})
+        transcript = "\n".join(str(line) for line in rendered)
+        self.assertNotIn("idle tick", transcript)
+        self.assertIn("• Waited for background terminal · python long.py", transcript)
+        self.assertIn("  └ second", transcript)
+        self.assertEqual(set(renderer._live_exec_regions), set())
         self.assertNotIn("poll-1", renderer._live_exec_regions)
-        self.assertEqual(renderer._live_exec_output_text.get("exec-1"), "first\nsecond\n")
+        self.assertNotIn("exec-1", renderer._live_exec_output_text)
 
     def test_turn_input_reader_initializes_from_preserved_draft(self) -> None:
         from codex.cli import _TurnInputReader
@@ -8440,7 +8648,7 @@ new file mode 100644
         self.assertIn("  └ done\n", rendered)
         self.assertEqual(rendered.count("• Running python slow.py"), 1)
 
-    def test_cli_human_renderer_keeps_gap_when_live_output_moves_below_agent_message(self) -> None:
+    def test_cli_human_renderer_freezes_live_output_after_agent_message_until_completion(self) -> None:
         from codex.cli import _HumanEventRenderer
 
         rendered_io = io.StringIO()
@@ -8480,12 +8688,26 @@ new file mode 100644
                     {"call_id": "cmd-1", "delta": "done\n", "stream": "stdout"},
                 )
             )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "ok": True,
+                        "metadata": {"command": "python slow.py", "exit_code": 0, "output": "booting\ndone\n"},
+                    },
+                )
+            )
 
         lines = _ansi_terminal_lines(rendered_io.getvalue())
         message_index = lines.index("• Still running; I will check again.")
         self.assertEqual(lines[message_index + 1], "")
-        self.assertEqual(lines[message_index + 2], "• Running python slow.py")
-        self.assertEqual(lines[message_index + 3], "  └ done")
+        self.assertEqual(lines[message_index + 2], "• Ran python slow.py")
+        self.assertEqual(lines[message_index + 3], "  └ booting")
+        self.assertEqual(lines[message_index + 4], "    done")
+        self.assertEqual(rendered_io.getvalue().count("• Running python slow.py"), 1)
+        self.assertEqual(rendered_io.getvalue().count("• Ran python slow.py"), 1)
 
     def test_cli_human_renderer_hides_running_cells_for_silent_background_command(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -8612,7 +8834,339 @@ new file mode 100644
         self.assertIn("  └ prompt ready", rendered)
         self.assertEqual(rendered.count("prompt ready"), 1)
 
-    def test_cli_human_renderer_keeps_parallel_live_exec_outputs_in_one_panel(self) -> None:
+    def test_cli_human_renderer_flushes_empty_background_wait_once_before_agent_message(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "arguments": {"cmd": "sleep 10", "yield_time_ms": 30000},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "ok": True,
+                    "metadata": {"session_id": 7, "command": "sleep 10", "output": ""},
+                },
+            )
+        )
+        for poll_id in ("poll-1", "poll-2", "poll-3"):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "write_stdin",
+                        "call_id": poll_id,
+                        "arguments": {"session_id": 7, "chars": ""},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "write_stdin",
+                        "call_id": poll_id,
+                        "ok": True,
+                        "metadata": {
+                            "session_id": 7,
+                            "event_call_id": "cmd-1",
+                            "command": "sleep 10",
+                            "output": "",
+                        },
+                    },
+                )
+            )
+        renderer.render(
+            codex_types.CodexEvent(
+                "item.completed",
+                {
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Still running; I will check again."}],
+                    }
+                },
+            )
+        )
+
+        rendered = "\n".join(lines)
+        self.assertEqual(rendered.count("• Waited for background terminal · sleep 10"), 1)
+        self.assertIn("• Still running; I will check again.", rendered)
+        self.assertLess(
+            rendered.index("• Waited for background terminal · sleep 10"),
+            rendered.index("• Still running; I will check again."),
+        )
+        self.assertNotIn("• Running sleep 10", rendered)
+
+    def test_cli_human_renderer_empty_wait_then_interaction_renders_each_block_once(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "arguments": {"cmd": "python3 -i", "tty": True},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "ok": True,
+                    "metadata": {"session_id": 7, "command": "python3 -i", "output": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "arguments": {"session_id": 7, "chars": ""},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "ok": True,
+                    "metadata": {
+                        "session_id": 7,
+                        "event_call_id": "cmd-1",
+                        "command": "python3 -i",
+                        "output": "",
+                    },
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "write_stdin",
+                    "call_id": "stdin-1",
+                    "arguments": {"session_id": 7, "chars": "print('hi')\n"},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "exec_command.output_delta",
+                {"call_id": "cmd-1", "delta": "hi\n>>> ", "stream": "stdout"},
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "write_stdin",
+                    "call_id": "stdin-1",
+                    "ok": True,
+                    "metadata": {
+                        "session_id": 7,
+                        "event_call_id": "cmd-1",
+                        "command": "python3 -i",
+                        "output": "hi\n>>> ",
+                    },
+                },
+            )
+        )
+
+        rendered = "\n".join(lines)
+        self.assertEqual(rendered.count("• Waited for background terminal · python3 -i"), 1)
+        self.assertEqual(rendered.count("↳ Interacted with background terminal · python3 -i"), 1)
+        self.assertIn("  └ print('hi')", rendered)
+        self.assertIn("  └ hi", rendered)
+        self.assertLess(
+            rendered.index("• Waited for background terminal · python3 -i"),
+            rendered.index("↳ Interacted with background terminal · python3 -i"),
+        )
+
+    def test_cli_human_renderer_suppresses_idle_background_terminal_delta_during_other_command(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "bg",
+                        "arguments": {"cmd": "python server.py", "yield_time_ms": 1000},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg", "delta": "server boot\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "bg",
+                        "ok": True,
+                        "metadata": {"session_id": 7, "command": "python server.py", "output": "server boot\n"},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {"name": "exec_command", "call_id": "fg", "arguments": {"cmd": "pytest -q"}},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "fg", "delta": "test tick\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg", "delta": "idle server tick\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "fg",
+                        "ok": True,
+                        "metadata": {"command": "pytest -q", "exit_code": 0, "output": "test tick\n"},
+                    },
+                )
+            )
+
+        rendered = rendered_io.getvalue()
+        self.assertIn("server boot", rendered)
+        self.assertIn("• Ran pytest -q", rendered)
+        self.assertIn("test tick", rendered)
+        self.assertNotIn("idle server tick", rendered)
+        self.assertEqual(rendered.count("python server.py"), 1)
+        self.assertEqual(rendered.count("pytest -q"), 2)
+
+    def test_cli_human_renderer_only_explicitly_waited_background_terminal_streams_with_multiple_backgrounds(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            for call_id, session_id, command, boot in [
+                ("bg-a", 11, "python server_a.py", "a boot\n"),
+                ("bg-b", 12, "python server_b.py", "b boot\n"),
+            ]:
+                renderer.render(
+                    codex_types.CodexEvent(
+                        "tool.started",
+                        {
+                            "name": "exec_command",
+                            "call_id": call_id,
+                            "arguments": {"cmd": command, "yield_time_ms": 1000},
+                        },
+                    )
+                )
+                renderer.render(
+                    codex_types.CodexEvent(
+                        "exec_command.output_delta",
+                        {"call_id": call_id, "delta": boot, "stream": "stdout"},
+                    )
+                )
+                renderer.render(
+                    codex_types.CodexEvent(
+                        "tool.completed",
+                        {
+                            "name": "exec_command",
+                            "call_id": call_id,
+                            "ok": True,
+                            "metadata": {"session_id": session_id, "command": command, "output": boot},
+                        },
+                    )
+                )
+
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg-a", "delta": "a idle tick\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg-b", "delta": "b idle tick\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {"name": "exec_command", "call_id": "fg", "arguments": {"cmd": "pytest -q"}},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "fg", "delta": "fg tick\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {"name": "write_stdin", "call_id": "wait-a", "arguments": {"session_id": 11, "chars": ""}},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg-a", "delta": "a waited tick\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg-b", "delta": "b still idle tick\n", "stream": "stdout"},
+                )
+            )
+
+        rendered = rendered_io.getvalue()
+        self.assertIn("• Running python server_a.py", rendered)
+        self.assertIn("• Running python server_b.py", rendered)
+        self.assertIn("• Running pytest -q", rendered)
+        self.assertIn("• Waited for background terminal · python server_a.py", rendered)
+        self.assertIn("a waited tick", rendered)
+        self.assertNotIn("a idle tick", rendered)
+        self.assertNotIn("b idle tick", rendered)
+        self.assertNotIn("b still idle tick", rendered)
+
+    def test_cli_human_renderer_freezes_non_tail_parallel_exec_delta_until_completion(self) -> None:
         from codex.cli import _HumanEventRenderer
 
         rendered_io = io.StringIO()
@@ -8648,6 +9202,17 @@ new file mode 100644
                     {"call_id": "cmd-1", "delta": "one-2\n", "stream": "stdout"},
                 )
             )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "ok": True,
+                        "metadata": {"command": "one", "exit_code": 0, "output": "one-1\none-2\n"},
+                    },
+                )
+            )
 
         self.assertEqual(
             _ansi_terminal_lines(rendered_io.getvalue()),
@@ -8656,13 +9221,127 @@ new file mode 100644
                 "  └ one-1",
                 "• Running two",
                 "  └ two-1",
+                "",
+                "• Ran one",
+                "  └ one-1",
                 "    one-2",
             ],
         )
         self.assertEqual(rendered_io.getvalue().count("• Running one"), 1)
         self.assertEqual(rendered_io.getvalue().count("• Running two"), 1)
+        self.assertEqual(rendered_io.getvalue().count("• Ran one"), 1)
 
-    def test_cli_human_renderer_keeps_many_parallel_live_exec_outputs_in_one_panel(self) -> None:
+    def test_cli_human_renderer_rewrites_parallel_exec_completion_without_corrupting_siblings(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {"name": "exec_command", "call_id": "one", "arguments": {"cmd": "cmd-one", "yield_time_ms": 1000}},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {"name": "exec_command", "call_id": "two", "arguments": {"cmd": "cmd-two", "yield_time_ms": 1000}},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "one", "delta": "one-out\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "two", "delta": "two-out\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "one",
+                        "ok": True,
+                        "metadata": {"command": "cmd-one", "exit_code": 0, "output": "one-out\n"},
+                    },
+                )
+            )
+
+        self.assertEqual(
+            _ansi_terminal_lines(rendered_io.getvalue()),
+            [
+                "• Ran cmd-one",
+                "  └ one-out",
+                "• Running cmd-two",
+                "  └ two-out",
+            ],
+        )
+        rendered = rendered_io.getvalue()
+        self.assertEqual(rendered.count("• Running cmd-one"), 1)
+        self.assertEqual(rendered.count("• Running cmd-two"), 1)
+        self.assertEqual(rendered.count("• Ran cmd-one"), 1)
+
+    def test_cli_human_renderer_rewrites_both_parallel_exec_completions_once(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            for call_id, command in [("one", "cmd-one"), ("two", "cmd-two")]:
+                renderer.render(
+                    codex_types.CodexEvent(
+                        "tool.started",
+                        {
+                            "name": "exec_command",
+                            "call_id": call_id,
+                            "arguments": {"cmd": command, "yield_time_ms": 1000},
+                        },
+                    )
+                )
+            for call_id, output in [("one", "one-out\n"), ("two", "two-out\n")]:
+                renderer.render(
+                    codex_types.CodexEvent(
+                        "exec_command.output_delta",
+                        {"call_id": call_id, "delta": output, "stream": "stdout"},
+                    )
+                )
+            for call_id, command, output in [
+                ("one", "cmd-one", "one-out\n"),
+                ("two", "cmd-two", "two-out\n"),
+            ]:
+                renderer.render(
+                    codex_types.CodexEvent(
+                        "tool.completed",
+                        {
+                            "name": "exec_command",
+                            "call_id": call_id,
+                            "ok": True,
+                            "metadata": {"command": command, "exit_code": 0, "output": output},
+                        },
+                    )
+                )
+
+        self.assertEqual(
+            _ansi_terminal_lines(rendered_io.getvalue()),
+            [
+                "• Ran cmd-one",
+                "  └ one-out",
+                "• Ran cmd-two",
+                "  └ two-out",
+            ],
+        )
+        rendered = rendered_io.getvalue()
+        for command in ["cmd-one", "cmd-two"]:
+            self.assertEqual(rendered.count(f"• Running {command}"), 1)
+            self.assertEqual(rendered.count(f"• Ran {command}"), 1)
+
+    def test_cli_human_renderer_suppresses_non_tail_delta_in_many_parallel_exec_outputs(self) -> None:
         from codex.cli import _HumanEventRenderer
 
         rendered_io = io.StringIO()
@@ -8696,6 +9375,17 @@ new file mode 100644
                     {"call_id": "cmd-2", "delta": "line-2b\n", "stream": "stdout"},
                 )
             )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-2",
+                        "ok": True,
+                        "metadata": {"command": "job-2", "exit_code": 0, "output": "line-2\nline-2b\n"},
+                    },
+                )
+            )
 
         self.assertEqual(
             _ansi_terminal_lines(rendered_io.getvalue()),
@@ -8710,6 +9400,9 @@ new file mode 100644
                 "  └ line-3",
                 "• Running job-4",
                 "  └ line-4",
+                "",
+                "• Ran job-2",
+                "  └ line-2",
                 "    line-2b",
             ],
         )
@@ -8717,7 +9410,7 @@ new file mode 100644
         for index in range(5):
             self.assertEqual(rendered.count(f"• Running job-{index}"), 1)
 
-    def test_cli_human_renderer_keeps_background_wait_and_parallel_exec_in_one_panel(self) -> None:
+    def test_cli_human_renderer_suppresses_background_wait_delta_after_parallel_exec_takes_foreground(self) -> None:
         from codex.cli import _HumanEventRenderer
 
         rendered_io = io.StringIO()
@@ -8790,12 +9483,12 @@ new file mode 100644
                 "  └ prompt",
                 "• Running npm test",
                 "  └ tick",
-                "    ready",
             ],
         )
         rendered = rendered_io.getvalue()
         self.assertEqual(rendered.count("• Waited for background terminal · python3 -i"), 1)
         self.assertEqual(rendered.count("• Running npm test"), 1)
+        self.assertNotIn("ready", rendered)
 
     def test_cli_human_renderer_terminal_interaction_uses_command_snapshot(self) -> None:
         from unittest.mock import patch
