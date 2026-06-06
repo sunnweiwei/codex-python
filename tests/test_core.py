@@ -9235,6 +9235,80 @@ new file mode 100644
         )
         self.assertNotIn("• Running sleep 10", rendered)
 
+    def test_cli_human_renderer_deduplicates_empty_background_waits_across_agent_messages(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "arguments": {"cmd": "sleep 10", "yield_time_ms": 30000},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd-1",
+                    "ok": True,
+                    "metadata": {"session_id": 7, "command": "sleep 10", "output": ""},
+                },
+            )
+        )
+        for poll_id, text in (
+            ("poll-1", "Still running; I will wait."),
+            ("poll-2", "Still no output; I will continue."),
+        ):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "write_stdin",
+                        "call_id": poll_id,
+                        "arguments": {"session_id": 7, "chars": ""},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "write_stdin",
+                        "call_id": poll_id,
+                        "ok": True,
+                        "metadata": {
+                            "session_id": 7,
+                            "event_call_id": "cmd-1",
+                            "command": "sleep 10",
+                            "output": "",
+                        },
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "item.completed",
+                    {
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }
+                    },
+                )
+            )
+
+        rendered = "\n".join(lines)
+        self.assertEqual(rendered.count("• Waited for background terminal · sleep 10"), 1)
+        self.assertIn("• Still running; I will wait.", rendered)
+        self.assertIn("• Still no output; I will continue.", rendered)
+
     def test_cli_human_renderer_empty_wait_then_interaction_renders_each_block_once(self) -> None:
         from codex.cli import _HumanEventRenderer
 
@@ -11584,6 +11658,7 @@ model_reasoning_effort = "low"
 
             self.assertTrue(resumed.handled)
             self.assertIsNotNone(resumed.session)
+            self.assertTrue(resumed.printed_transcript)
             assert resumed.session is not None
             self.assertEqual(resumed.session.state.thread_id, first.thread_id)
             self.assertEqual(
@@ -11599,6 +11674,7 @@ model_reasoning_effort = "low"
                 forked = cli._handle_interactive_slash_command(resumed.session, "/fork")
 
             self.assertTrue(forked.handled)
+            self.assertTrue(forked.printed_transcript)
             self.assertIsNotNone(forked.session)
             assert forked.session is not None
             self.assertNotEqual(forked.session.state.thread_id, first.thread_id)
@@ -11847,6 +11923,53 @@ model_reasoning_effort = "low"
             self.assertIn("Filter:[Cwd]", plain)
             self.assertIn("Sort:[Updated]", plain)
             self.assertNotIn("Select a chat number", plain)
+
+    def test_cli_tty_slash_resume_leaves_gap_before_next_prompt(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            config = CodexConfig(
+                cwd=root,
+                codex_home=codex_home,
+                skip_git_repo_check=True,
+                ephemeral=False,
+            )
+            CodexSession(
+                config,
+                model_client=ScriptedResponsesModel([message("saved answer")]),
+            ).run("saved prompt")
+            env = {
+                **os.environ,
+                "TERM": "xterm-256color",
+                "CODEX_HOME": str(codex_home),
+                "PYTHONPATH": os.getcwd(),
+            }
+
+            output = self._run_cli_pty(
+                [
+                    sys.executable,
+                    "-m",
+                    "codex",
+                    "-C",
+                    str(root),
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                ],
+                env=env,
+                interactions=[
+                    ("/resume --last\r", "saved answer"),
+                    ("", "› "),
+                    ("/exit\r", None),
+                ],
+                timeout=10.0,
+            )
+            plain = _plain_terminal_output(output)
+
+            self.assertIn("saved answer", plain)
+            self.assertRegex(plain, r"saved answer(?:\r?\n\s*){2,}› Ask Codex")
 
     def test_cli_tty_top_level_fork_uses_same_picker_surface(self) -> None:
         if sys.platform == "win32":

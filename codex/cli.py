@@ -1519,6 +1519,8 @@ def _run_chat(
         if slash_result.handled:
             if slash_result.session is not None:
                 session = slash_result.session
+            if slash_result.printed_transcript:
+                printed_transcript = True
             if slash_result.exit:
                 return slash_result.status
             if slash_result.run_goal_continuation and slash_result.prompt is None:
@@ -4247,6 +4249,7 @@ class _InteractiveSlashResult:
     prompt: str | None = None
     session: CodexSession | None = None
     run_goal_continuation: bool = False
+    printed_transcript: bool = False
 
 
 @dataclass(frozen=True)
@@ -4658,10 +4661,10 @@ def _handle_interactive_slash_command(
         return _InteractiveSlashResult(True, prompt=slash.rest.strip() or None)
     if command == "resume":
         resumed = _interactive_resume_session(session, slash.rest.strip(), color_mode=color_mode)
-        return _InteractiveSlashResult(True, session=resumed)
+        return _InteractiveSlashResult(True, session=resumed, printed_transcript=resumed is not None)
     if command == "fork":
         forked = _interactive_fork_session(session, slash.rest.strip(), color_mode=color_mode)
-        return _InteractiveSlashResult(True, session=forked)
+        return _InteractiveSlashResult(True, session=forked, printed_transcript=forked is not None)
     if command == "goal":
         should_continue = _handle_goal_slash(session, slash.rest.strip(), color_mode=color_mode)
         return _InteractiveSlashResult(True, run_goal_continuation=should_continue)
@@ -6151,6 +6154,7 @@ class _HumanEventRenderer:
         self._flushing_background_terminal_wait = False
         self._idle_background_terminal_call_ids: set[str] = set()
         self._rendered_background_terminal_interactions: set[str] = set()
+        self._rendered_empty_background_waits: set[str] = set()
         self._live_exec_rendered: set[str] = set()
         self._live_exec_output_seen: set[str] = set()
         self._live_exec_output_text: dict[str, str] = {}
@@ -6369,6 +6373,7 @@ class _HumanEventRenderer:
                 stdin = str(args.get("chars") or "")
                 if stdin:
                     self._flush_pending_background_terminal_wait(event_call_id)
+                    self._rendered_empty_background_waits.discard(event_call_id)
                 else:
                     existing_wait = self._pending_background_terminal_waits.get(event_call_id, {})
                     self._pending_background_terminal_waits[event_call_id] = {
@@ -6849,6 +6854,7 @@ class _HumanEventRenderer:
             self._background_terminal_call_commands.pop(call_id, None)
             self._idle_background_terminal_call_ids.discard(call_id)
             self._pending_background_terminal_waits.pop(call_id, None)
+            self._rendered_empty_background_waits.discard(call_id)
             self._clear_live_exec_metadata(call_id)
         else:
             self._mark_background_terminal_idle(call_id)
@@ -6877,6 +6883,7 @@ class _HumanEventRenderer:
         if call_id not in self._live_exec_rendered:
             if interaction is not None:
                 self._pending_background_terminal_waits.pop(call_id, None)
+                self._rendered_empty_background_waits.discard(call_id)
                 self._ensure_live_exec_region(
                     call_id,
                     kind="background",
@@ -6900,6 +6907,7 @@ class _HumanEventRenderer:
         self._live_exec_output_seen.add(call_id)
         previous_output = self._live_exec_output_text.get(call_id, "")
         self._live_exec_output_text[call_id] = previous_output + delta
+        self._rendered_empty_background_waits.discard(call_id)
         if not self._is_live_exec_tail_region(call_id):
             self._freeze_live_exec_region(call_id)
             return
@@ -6938,8 +6946,11 @@ class _HumanEventRenderer:
                 if not command:
                     session_id = pending.get("session_id", "")
                     command = self._background_terminal_commands.get(session_id, "")
+                if pending_call_id in self._rendered_empty_background_waits:
+                    continue
                 self.render_terminal_interaction(pending.get("session_id", ""), "", command=command)
                 self._rendered_background_terminal_interactions.add(pending_call_id)
+                self._rendered_empty_background_waits.add(pending_call_id)
         finally:
             self._flushing_background_terminal_wait = False
 
@@ -7040,6 +7051,7 @@ class _HumanEventRenderer:
         self._background_terminal_call_commands.pop(event_call_id, None)
         self._idle_background_terminal_call_ids.discard(event_call_id)
         self._pending_background_terminal_waits.pop(event_call_id, None)
+        self._rendered_empty_background_waits.discard(event_call_id)
         self._clear_live_exec_metadata(event_call_id)
         self._render_live_exec_panel_if_needed()
 
