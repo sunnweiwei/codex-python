@@ -8709,6 +8709,207 @@ new file mode 100644
         self.assertEqual(rendered_io.getvalue().count("• Running python slow.py"), 1)
         self.assertEqual(rendered_io.getvalue().count("• Ran python slow.py"), 1)
 
+    def test_cli_human_renderer_background_wait_after_agent_message_shows_only_new_delta(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "bg",
+                        "arguments": {"cmd": "python long.py", "yield_time_ms": 1000},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg", "delta": "boot\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "bg",
+                        "ok": True,
+                        "metadata": {"session_id": 7, "command": "python long.py", "output": "boot\n"},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "write_stdin",
+                        "call_id": "poll-1",
+                        "arguments": {"session_id": 7, "chars": ""},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg", "delta": "tick1\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "item.completed",
+                    {
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "I am checking progress."}],
+                        }
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg", "delta": "tick2\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "write_stdin",
+                        "call_id": "poll-1",
+                        "ok": True,
+                        "metadata": {
+                            "session_id": 7,
+                            "event_call_id": "bg",
+                            "command": "python long.py",
+                            "output": "boot\ntick1\ntick2\n",
+                        },
+                    },
+                )
+            )
+
+        lines = _ansi_terminal_lines(rendered_io.getvalue())
+        message_index = lines.index("• I am checking progress.")
+        self.assertEqual(lines[message_index + 1], "")
+        self.assertEqual(lines[message_index + 2], "• Waited for background terminal · python long.py")
+        self.assertEqual(lines[message_index + 3], "  └ tick2")
+        self.assertEqual(lines.count("  └ tick1"), 1)
+        self.assertEqual(lines.count("  └ tick2"), 1)
+        self.assertNotIn("tick1\n    tick2", rendered_io.getvalue())
+
+    def test_cli_human_renderer_background_delta_after_new_action_does_not_cover_action(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "bg",
+                        "arguments": {"cmd": "python server.py", "yield_time_ms": 1000},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg", "delta": "boot\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "bg",
+                        "ok": True,
+                        "metadata": {"session_id": 7, "command": "python server.py", "output": "boot\n"},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "write_stdin",
+                        "call_id": "poll",
+                        "arguments": {"session_id": 7, "chars": ""},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg", "delta": "tick1\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "item.completed",
+                    {
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "I will run a foreground check while the server continues.",
+                                }
+                            ],
+                        }
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "fg",
+                        "arguments": {"cmd": "pytest -q", "yield_time_ms": 1000},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "fg", "delta": "test-start\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "bg", "delta": "tick2\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.completed",
+                    {
+                        "name": "exec_command",
+                        "call_id": "fg",
+                        "ok": True,
+                        "metadata": {"command": "pytest -q", "exit_code": 0, "output": "test-start\n"},
+                    },
+                )
+            )
+
+        lines = _ansi_terminal_lines(rendered_io.getvalue())
+        foreground_index = lines.index("• Ran pytest -q")
+        self.assertEqual(lines[foreground_index + 1], "  └ test-start")
+        self.assertEqual(lines[foreground_index + 2], "• Waited for background terminal · python server.py")
+        self.assertEqual(lines[foreground_index + 3], "  └ tick2")
+        self.assertEqual(rendered_io.getvalue().count("• Running pytest -q"), 1)
+        self.assertEqual(rendered_io.getvalue().count("• Ran pytest -q"), 1)
+
     def test_cli_human_renderer_hides_running_cells_for_silent_background_command(self) -> None:
         from codex.cli import _HumanEventRenderer
 

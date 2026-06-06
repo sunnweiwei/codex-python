@@ -7258,8 +7258,6 @@ class _HumanEventRenderer:
             segment_output = output if not obscured else _output_delta_since(previous_output, output)
             output_rows = _live_output_display_rows(segment_output, self._style, terminal_width)
             rows = [*header_rows, *output_rows]
-            if obscured:
-                self._begin_work_cell()
             self._emit_live_incremental_rows(rows, call_id=call_id, header_rows=len(header_rows))
             self._live_exec_incremental_rendered.add(call_id)
             self._live_exec_incremental_obscured.discard(call_id)
@@ -7518,10 +7516,13 @@ class _HumanEventRenderer:
                 self._clear_live_exec_panel()
         self._live_exec_regions.pop(call_id, None)
 
-    def _freeze_live_exec_region(self, call_id: str) -> None:
+    def _freeze_live_exec_region(self, call_id: str, *, obscure_for_future_delta: bool = False) -> None:
         self._detach_live_exec_region(call_id, commit_if_last=False)
         self._live_exec_incremental_rendered.discard(call_id)
-        self._live_exec_incremental_obscured.discard(call_id)
+        if obscure_for_future_delta and call_id in self._live_exec_output_seen:
+            self._live_exec_incremental_obscured.add(call_id)
+        else:
+            self._live_exec_incremental_obscured.discard(call_id)
         self._live_exec_incremental_segment_output.pop(call_id, None)
         self._live_exec_incremental_header_start.pop(call_id, None)
         self._live_exec_incremental_header_rows.pop(call_id, None)
@@ -7558,7 +7559,7 @@ class _HumanEventRenderer:
         if self._live_exec_regions:
             self._clear_live_exec_panel()
             for call_id in list(self._live_exec_regions):
-                self._freeze_live_exec_region(call_id)
+                self._freeze_live_exec_region(call_id, obscure_for_future_delta=True)
             self._live_exec_incremental_visible_rows = 0
 
     def _render_plan(self, meta: dict[str, Any]) -> None:
