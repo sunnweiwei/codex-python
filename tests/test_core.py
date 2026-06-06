@@ -6669,7 +6669,7 @@ new file mode 100644
         self.assertIn("\033[33m-m\033[0m", rendered)
         self.assertRegex(rendered, r"\x1b\[[0-9;]*mdraw_person\.py\x1b\[0m")
 
-    def test_cli_exec_output_preserves_existing_ansi_colors(self) -> None:
+    def test_cli_exec_output_dims_tool_results_without_preserving_ansi_colors(self) -> None:
         from codex.cli import _HumanEventRenderer
 
         lines: list[str] = []
@@ -6688,7 +6688,8 @@ new file mode 100644
         )
         rendered = "\n".join(lines)
 
-        self.assertIn("\033[31mred\033[0m", rendered)
+        self.assertNotIn("\033[31mred\033[0m", rendered)
+        self.assertIn("\033[2mred\033[0m", rendered)
         self.assertIn("\033[2mplain\033[0m", rendered)
 
     def test_turn_input_reader_rerenders_draft_after_tool_output(self) -> None:
@@ -7699,6 +7700,7 @@ new file mode 100644
         from codex.cli import _AnsiStyle
         from codex.cli import _composer_status_block
         from codex.cli import _prompt_display_lines
+        from codex.cli import _prompt_visible_text_window
         from codex.cli import _visible_len
 
         self.assertEqual(
@@ -7739,6 +7741,34 @@ new file mode 100644
             _composer_status_block(["• Working (0s • esc to interrupt)"]),
             ["", "• Working (0s • esc to interrupt)", ""],
         )
+
+        long_text = "\n".join(f"line {index}" for index in range(1, 21))
+        display_text, display_cursor = _prompt_visible_text_window(long_text, len(long_text), max_lines=6)
+        display_lines = display_text.split("\n")
+        self.assertEqual(len(display_lines), 6)
+        self.assertEqual(display_lines[0], "... 15 lines above ...")
+        self.assertEqual(display_lines[-1], "line 20")
+        self.assertEqual(display_cursor, len(display_text))
+
+    def test_turn_input_reader_bounds_long_multiline_composer_render(self) -> None:
+        from codex.cli import _TurnInputReader
+        from unittest.mock import patch
+
+        long_text = "\n".join(f"line {index:02d}" for index in range(1, 61))
+        reader = _TurnInputReader(enabled=True, color_mode="never")
+        reader._buffer = long_text
+        reader._cursor = len(long_text)
+
+        captured = io.StringIO()
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((80, 24))):
+            with redirect_stderr(captured):
+                reader.render()
+
+        plain = _plain_terminal_output(captured.getvalue())
+        self.assertIn("... 49 lines above ...", plain)
+        self.assertIn("line 60", plain)
+        self.assertNotIn("line 01", plain)
+        self.assertLessEqual(reader._rendered_lines, 14)
 
     def test_user_message_history_uses_same_light_background_as_composer(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -8407,7 +8437,8 @@ new file mode 100644
         self.assertIn("  └ booting\n", rendered)
         self.assertIn("• Still running; I will check again.", rendered)
         self.assertIn("• Waited for background terminal", rendered)
-        self.assertIn("    done\n", rendered)
+        self.assertIn("  └ done\n", rendered)
+        self.assertEqual(rendered.count("• Running python slow.py"), 1)
 
     def test_cli_human_renderer_keeps_gap_when_live_output_moves_below_agent_message(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -8443,11 +8474,18 @@ new file mode 100644
                     },
                 )
             )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "cmd-1", "delta": "done\n", "stream": "stdout"},
+                )
+            )
 
         lines = _ansi_terminal_lines(rendered_io.getvalue())
         message_index = lines.index("• Still running; I will check again.")
         self.assertEqual(lines[message_index + 1], "")
         self.assertEqual(lines[message_index + 2], "• Running python slow.py")
+        self.assertEqual(lines[message_index + 3], "  └ done")
 
     def test_cli_human_renderer_hides_running_cells_for_silent_background_command(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -8616,11 +8654,13 @@ new file mode 100644
             [
                 "• Running one",
                 "  └ one-1",
-                "    one-2",
                 "• Running two",
                 "  └ two-1",
+                "    one-2",
             ],
         )
+        self.assertEqual(rendered_io.getvalue().count("• Running one"), 1)
+        self.assertEqual(rendered_io.getvalue().count("• Running two"), 1)
 
     def test_cli_human_renderer_keeps_many_parallel_live_exec_outputs_in_one_panel(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -8666,13 +8706,16 @@ new file mode 100644
                 "  └ line-1",
                 "• Running job-2",
                 "  └ line-2",
-                "    line-2b",
                 "• Running job-3",
                 "  └ line-3",
                 "• Running job-4",
                 "  └ line-4",
+                "    line-2b",
             ],
         )
+        rendered = rendered_io.getvalue()
+        for index in range(5):
+            self.assertEqual(rendered.count(f"• Running job-{index}"), 1)
 
     def test_cli_human_renderer_keeps_background_wait_and_parallel_exec_in_one_panel(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -8745,11 +8788,14 @@ new file mode 100644
             [
                 "• Waited for background terminal · python3 -i",
                 "  └ prompt",
-                "    ready",
                 "• Running npm test",
                 "  └ tick",
+                "    ready",
             ],
         )
+        rendered = rendered_io.getvalue()
+        self.assertEqual(rendered.count("• Waited for background terminal · python3 -i"), 1)
+        self.assertEqual(rendered.count("• Running npm test"), 1)
 
     def test_cli_human_renderer_terminal_interaction_uses_command_snapshot(self) -> None:
         from unittest.mock import patch

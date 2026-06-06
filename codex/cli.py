@@ -2925,7 +2925,12 @@ class _TurnInputReader:
         if not self.enabled:
             return
         cols = _terminal_columns()
-        prompt_lines = _prompt_display_lines(self._buffer, self._style, width=cols, boxed=True)
+        display_buffer, display_cursor = _prompt_visible_text_window(
+            self._buffer,
+            self._cursor,
+            max_lines=_composer_visible_body_line_limit(),
+        )
+        prompt_lines = _prompt_display_lines(display_buffer, self._style, width=cols, boxed=True)
         slash_lines = _slash_palette_display_lines(
             self._buffer,
             self._cursor,
@@ -2940,18 +2945,18 @@ class _TurnInputReader:
         print("\n".join(lines), end="", file=sys.stderr, flush=True)
         self._rendered_lines = _prompt_screen_rows(lines, cols)
         status_rows = _prompt_screen_rows(status_block, cols)
-        prompt_top_rows = _composer_prompt_top_rows(self._buffer, boxed=True)
+        prompt_top_rows = _composer_prompt_top_rows(display_buffer, boxed=True)
         cursor_row = _prompt_cursor_screen_row(
-            self._buffer,
-            self._cursor,
+            display_buffer,
+            display_cursor,
             self._rendered_lines,
             cols,
             prefix_rows=status_rows + prompt_top_rows,
         )
         self._rendered_rows_below_cursor = max(0, self._rendered_lines - 1 - cursor_row)
         _move_prompt_cursor(
-            self._buffer,
-            self._cursor,
+            display_buffer,
+            display_cursor,
             self._rendered_lines,
             cols,
             prefix_rows=status_rows + prompt_top_rows,
@@ -3328,7 +3333,12 @@ def _read_tty_prompt(
     def render() -> None:
         nonlocal rendered_lines, rendered_rows_below_cursor
         cols = _terminal_columns()
-        lines = _prompt_display_lines(buffer, style, width=cols, boxed=True)
+        display_buffer, display_cursor = _prompt_visible_text_window(
+            buffer,
+            cursor,
+            max_lines=_composer_visible_body_line_limit(),
+        )
+        lines = _prompt_display_lines(display_buffer, style, width=cols, boxed=True)
         lines.extend(
             _slash_palette_display_lines(
                 buffer,
@@ -3342,10 +3352,16 @@ def _read_tty_prompt(
         _clear_prompt_lines(rendered_lines, rows_below_cursor=rendered_rows_below_cursor)
         print("\n".join(lines), end="", file=sys.stderr, flush=True)
         rendered_lines = _prompt_screen_rows(lines, cols)
-        prompt_top_rows = _composer_prompt_top_rows(buffer, boxed=True)
-        cursor_row = _prompt_cursor_screen_row(buffer, cursor, rendered_lines, cols, prefix_rows=prompt_top_rows)
+        prompt_top_rows = _composer_prompt_top_rows(display_buffer, boxed=True)
+        cursor_row = _prompt_cursor_screen_row(
+            display_buffer,
+            display_cursor,
+            rendered_lines,
+            cols,
+            prefix_rows=prompt_top_rows,
+        )
         rendered_rows_below_cursor = max(0, rendered_lines - 1 - cursor_row)
-        _move_prompt_cursor(buffer, cursor, rendered_lines, cols, prefix_rows=prompt_top_rows)
+        _move_prompt_cursor(display_buffer, display_cursor, rendered_lines, cols, prefix_rows=prompt_top_rows)
         state["dirty"] = False
 
     def request_render() -> None:
@@ -3490,6 +3506,67 @@ def _read_tty_prompt(
 _COMPOSER_PLACEHOLDER = "Ask Codex to do anything"
 _USER_MESSAGE_BG_RGB = (244, 244, 244)
 _USER_MESSAGE_FG_RGB = (28, 28, 28)
+_COMPOSER_MAX_VISIBLE_BODY_LINES = 12
+_COMPOSER_MIN_VISIBLE_BODY_LINES = 4
+
+
+def _composer_visible_body_line_limit() -> int:
+    rows = shutil.get_terminal_size((100, 24)).lines
+    available = max(_COMPOSER_MIN_VISIBLE_BODY_LINES, rows - 8)
+    return max(_COMPOSER_MIN_VISIBLE_BODY_LINES, min(_COMPOSER_MAX_VISIBLE_BODY_LINES, available))
+
+
+def _prompt_visible_text_window(text: str, cursor: int, *, max_lines: int) -> tuple[str, int]:
+    cursor = max(0, min(cursor, len(text)))
+    lines = text.split("\n")
+    max_lines = max(1, max_lines)
+    if len(lines) <= max_lines:
+        return text, cursor
+
+    before_cursor = text[:cursor]
+    cursor_line = before_cursor.count("\n")
+    cursor_col = len(before_cursor.rsplit("\n", 1)[-1])
+    marker_slots = 0
+    data_slots = max_lines
+    start = 0
+    end = len(lines)
+
+    for _ in range(3):
+        data_slots = max(1, max_lines - marker_slots)
+        start = min(
+            max(0, cursor_line - data_slots + 1),
+            max(0, len(lines) - data_slots),
+        )
+        end = min(len(lines), start + data_slots)
+        next_marker_slots = (1 if start > 0 else 0) + (1 if end < len(lines) else 0)
+        if next_marker_slots == marker_slots:
+            break
+        marker_slots = next_marker_slots
+
+    display_lines: list[str] = []
+    if start > 0:
+        display_lines.append(_prompt_omitted_lines_marker(start, "above"))
+    display_line_index = len(display_lines) + cursor_line - start
+    display_lines.extend(lines[start:end])
+    if end < len(lines):
+        display_lines.append(_prompt_omitted_lines_marker(len(lines) - end, "below"))
+
+    if not 0 <= display_line_index < len(display_lines):
+        display_line_index = max(0, min(display_line_index, len(display_lines) - 1))
+        cursor_col = len(display_lines[display_line_index])
+    else:
+        cursor_col = min(cursor_col, len(display_lines[display_line_index]))
+
+    display_cursor = 0
+    for line in display_lines[:display_line_index]:
+        display_cursor += len(line) + 1
+    display_cursor += cursor_col
+    return "\n".join(display_lines), display_cursor
+
+
+def _prompt_omitted_lines_marker(count: int, direction: str) -> str:
+    noun = "line" if count == 1 else "lines"
+    return f"... {count} {noun} {direction} ..."
 
 
 def _prompt_display_lines(
@@ -6074,6 +6151,11 @@ class _HumanEventRenderer:
         self._live_exec_rendered: set[str] = set()
         self._live_exec_output_seen: set[str] = set()
         self._live_exec_output_text: dict[str, str] = {}
+        self._live_exec_incremental_rendered: set[str] = set()
+        self._live_exec_incremental_obscured: set[str] = set()
+        self._live_exec_incremental_segment_output: dict[str, str] = {}
+        self._live_exec_incremental_header_rows: dict[str, int] = {}
+        self._live_exec_incremental_total_rows: dict[str, int] = {}
         self._live_exec_regions: dict[str, _LiveExecRegion] = {}
         self._live_exec_panel_rows = 0
         self._live_exec_panel_needs_leading_gap = False
@@ -6083,6 +6165,7 @@ class _HumanEventRenderer:
         self._interrupted_rendered = False
         self._printed_any_cell = False
         self._had_work_activity = False
+        self._suspend_live_finish = 0
         self._style = _AnsiStyle(_should_use_color(color_mode))
         self._line_sink = line_sink
         self._status_tracker = status_tracker
@@ -6699,7 +6782,21 @@ class _HumanEventRenderer:
             self._background_terminal_session_call_ids[str(session_id)] = call_id
         live_output_seen = call_id in self._live_exec_output_seen
         output = _visible_command_output(meta, payload)
-        if live_output_seen and self._live_exec_has_other_regions(call_id):
+        incremental_live_output = call_id in self._live_exec_incremental_rendered
+        if live_output_seen and exit_value is None:
+            return
+        if live_output_seen and incremental_live_output and exit_value is not None:
+            call.output = self._remaining_live_exec_output(call_id, output)
+            call.exit_code = exit_value
+            call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
+            self._rewrite_incremental_live_exec_header(call, running=False, ok=ok)
+            if exit_value is not None:
+                self._background_terminal_call_commands.pop(call_id, None)
+            self._detach_live_exec_region(call_id, commit_if_last=True)
+            self._clear_live_exec_metadata(call_id)
+            self._render_live_exec_panel()
+            return
+        elif live_output_seen and self._live_exec_has_other_regions(call_id):
             call.output = self._live_exec_final_output(call_id, output)
             self._detach_live_exec_region(call_id, commit_if_last=False)
             suppress_empty_output = False
@@ -6715,8 +6812,6 @@ class _HumanEventRenderer:
         if exit_value is None and not live_output_seen and not call.output.strip():
             self._clear_live_exec(call_id)
             return
-        if live_output_seen and exit_value is None:
-            return
         if exit_value is not None and call.is_exploration and not live_output_seen:
             self._exploration_calls.append(call)
             self._clear_live_exec(call_id)
@@ -6731,7 +6826,7 @@ class _HumanEventRenderer:
         if exit_value is not None:
             self._background_terminal_call_commands.pop(call_id, None)
         self._clear_live_exec_metadata(call_id)
-        self._render_live_exec_panel()
+        self._render_live_exec_panel_if_needed()
 
     def _render_exec_output_delta(self, payload: dict[str, Any]) -> None:
         call_id = str(payload.get("call_id") or "")
@@ -6774,8 +6869,9 @@ class _HumanEventRenderer:
             )
         self._live_exec_rendered.add(call_id)
         self._live_exec_output_seen.add(call_id)
-        self._live_exec_output_text[call_id] = self._live_exec_output_text.get(call_id, "") + delta
-        self._render_output_delta_block(call_id, self._live_exec_output_text[call_id], first=first_output)
+        previous_output = self._live_exec_output_text.get(call_id, "")
+        self._live_exec_output_text[call_id] = previous_output + delta
+        self._render_output_delta_block(call_id, previous_output, self._live_exec_output_text[call_id], first=first_output)
 
     def render_terminal_interaction(self, session_id: str, stdin: str, *, command: str | None = None) -> None:
         self._flush_exploration()
@@ -6842,7 +6938,18 @@ class _HumanEventRenderer:
             command=command,
             parsed=parse_command_actions(command),
         )
-        if live_output_seen and self._live_exec_has_other_regions(event_call_id):
+        incremental_live_output = event_call_id in self._live_exec_incremental_rendered
+        if live_output_seen and incremental_live_output:
+            call.output = self._remaining_live_exec_output(event_call_id, output)
+            call.exit_code = exit_value
+            call.duration_ms = _duration_ms(meta.get("wall_time_seconds"))
+            self._rewrite_incremental_live_exec_header(call, running=False, ok=ok and exit_value == 0)
+            self._background_terminal_call_commands.pop(event_call_id, None)
+            self._detach_live_exec_region(event_call_id, commit_if_last=True)
+            self._clear_live_exec_metadata(event_call_id)
+            self._render_live_exec_panel()
+            return
+        elif live_output_seen and self._live_exec_has_other_regions(event_call_id):
             call.output = self._live_exec_final_output(event_call_id, output)
             self._detach_live_exec_region(event_call_id, commit_if_last=False)
             suppress_empty_output = False
@@ -6863,7 +6970,7 @@ class _HumanEventRenderer:
         )
         self._background_terminal_call_commands.pop(event_call_id, None)
         self._clear_live_exec_metadata(event_call_id)
-        self._render_live_exec_panel()
+        self._render_live_exec_panel_if_needed()
 
     def _render_apply_patch_completed(
         self,
@@ -6941,24 +7048,8 @@ class _HumanEventRenderer:
         suppress_empty_output: bool = False,
     ) -> None:
         self._begin_work_cell()
-        command_lines = _command_display_lines(call.command, self._style)
-        if running:
-            title = "Running"
-            bullet = self._style.marker("cyan")
-        elif call.exit_code == 0 and ok:
-            title = "Ran"
-            bullet = self._style.marker("green")
-        else:
-            title = "Ran"
-            bullet = self._style.marker("red")
-        header_prefix = f"{bullet} {self._style.bold(title)} "
-        self._emit_limited_prefixed_lines(
-            command_lines,
-            first_prefix=header_prefix,
-            rest_prefix=self._style.dim("  │ "),
-            max_lines=5,
-            ellipsis_prefix=self._style.dim("  │ "),
-        )
+        for row in self._exec_call_header_rows(call, running=running, ok=ok, terminal_width=_terminal_columns()):
+            self._line(row)
         if call.output.strip():
             self._render_output_block(call.output)
         elif not running and not suppress_empty_output:
@@ -7073,10 +7164,89 @@ class _HumanEventRenderer:
             stdin=stdin,
         )
 
-    def _render_output_delta_block(self, call_id: str, output: str, *, first: bool) -> None:
+    def _render_output_delta_block(self, call_id: str, previous_output: str, output: str, *, first: bool) -> None:
         if not output or call_id not in self._live_exec_regions:
             return
-        self._render_live_exec_panel()
+        self._render_incremental_live_exec_region(call_id, previous_output, output, first=first)
+
+    def _render_incremental_live_exec_region(
+        self,
+        call_id: str,
+        previous_output: str,
+        output: str,
+        *,
+        first: bool,
+    ) -> None:
+        region = self._live_exec_regions.get(call_id)
+        if region is None:
+            return
+        terminal_width = shutil.get_terminal_size((100, 24)).columns
+        obscured = call_id in self._live_exec_incremental_obscured
+        if first or call_id not in self._live_exec_incremental_rendered or obscured:
+            header_rows = self._live_exec_region_header_rows(region, terminal_width)
+            segment_output = output if not obscured else _output_delta_since(previous_output, output)
+            output_rows = _live_output_display_rows(segment_output, self._style, terminal_width)
+            rows = [*header_rows, *output_rows]
+            if obscured:
+                self._begin_work_cell()
+            self._emit_live_incremental_rows(rows)
+            self._live_exec_incremental_rendered.add(call_id)
+            self._live_exec_incremental_obscured.discard(call_id)
+            self._live_exec_incremental_segment_output[call_id] = segment_output
+            self._live_exec_incremental_header_rows[call_id] = len(header_rows)
+            self._live_exec_incremental_total_rows[call_id] = len(rows)
+            return
+        previous_segment_output = self._live_exec_incremental_segment_output.get(call_id, previous_output)
+        segment_output = previous_segment_output + _output_delta_since(previous_output, output)
+        old_rows = _live_output_display_rows(previous_segment_output, self._style, terminal_width)
+        new_rows = _live_output_display_rows(segment_output, self._style, terminal_width)
+        if _rows_have_prefix(new_rows, old_rows):
+            self._emit_live_incremental_rows(new_rows[len(old_rows) :])
+            self._live_exec_incremental_segment_output[call_id] = segment_output
+            self._live_exec_incremental_total_rows[call_id] = (
+                self._live_exec_incremental_total_rows.get(call_id, 0) + max(0, len(new_rows) - len(old_rows))
+            )
+            return
+        if old_rows and new_rows and len(old_rows) == len(new_rows):
+            self._write(f"\r\033[1A\r\033[2K{new_rows[-1]}\n", partial_line_open=False)
+            self._live_exec_incremental_segment_output[call_id] = segment_output
+            return
+        self._emit_live_incremental_rows(new_rows[-max(1, min(3, len(new_rows))) :])
+        self._live_exec_incremental_segment_output[call_id] = segment_output
+        self._live_exec_incremental_total_rows[call_id] = (
+            self._live_exec_incremental_header_rows.get(call_id, 0) + len(new_rows)
+        )
+
+    def _emit_live_incremental_rows(self, rows: list[str]) -> None:
+        self._suspend_live_finish += 1
+        try:
+            for row in rows:
+                self._line(row)
+        finally:
+            self._suspend_live_finish -= 1
+
+    def _rewrite_incremental_live_exec_header(self, call: "_ExecDisplayCall", *, running: bool, ok: bool) -> None:
+        total_rows = self._live_exec_incremental_total_rows.get(call.call_id, 0)
+        header_rows = self._live_exec_incremental_header_rows.get(call.call_id, 0)
+        if total_rows <= 0 or header_rows <= 0:
+            return
+        rows = self._exec_call_header_rows(
+            call,
+            running=running,
+            ok=ok,
+            terminal_width=shutil.get_terminal_size((100, 24)).columns,
+        )
+        rows = rows[:header_rows]
+        if not rows:
+            return
+        parts = [f"\r\033[{total_rows}A"]
+        for row in rows:
+            parts.append(f"\r\033[2K{row}\n")
+        remaining_rows = max(0, total_rows - len(rows))
+        if remaining_rows:
+            parts.append(f"\033[{remaining_rows}B")
+        parts.append("\r")
+        self._write("".join(parts), partial_line_open=False)
 
     def _render_live_exec_panel(self) -> None:
         if not self._live_exec_regions:
@@ -7092,6 +7262,10 @@ class _HumanEventRenderer:
         self._write(text, partial_line_open=False, live_op="live_panel")
         self._live_exec_panel_rows = len(rows) + (1 if leading_gap else 0)
 
+    def _render_live_exec_panel_if_needed(self) -> None:
+        if any(call_id not in self._live_exec_incremental_rendered for call_id in self._live_exec_regions):
+            self._render_live_exec_panel()
+
     def _live_exec_panel_display_rows(self) -> list[str]:
         terminal_width = shutil.get_terminal_size((100, 24)).columns
         rows: list[str] = []
@@ -7100,6 +7274,12 @@ class _HumanEventRenderer:
         return rows
 
     def _live_exec_region_rows(self, region: "_LiveExecRegion", terminal_width: int) -> list[str]:
+        rows = self._live_exec_region_header_rows(region, terminal_width)
+        output = self._live_exec_output_text.get(region.call_id, "")
+        rows.extend(_live_output_display_rows(output, self._style, terminal_width))
+        return rows
+
+    def _live_exec_region_header_rows(self, region: "_LiveExecRegion", terminal_width: int) -> list[str]:
         rows: list[str] = []
         if region.kind == "background":
             marker = "↳" if region.stdin else "•"
@@ -7116,14 +7296,38 @@ class _HumanEventRenderer:
                 )
         else:
             rows.extend(self._live_exec_command_header_rows(region.command, terminal_width))
-        output = self._live_exec_output_text.get(region.call_id, "")
-        rows.extend(_live_output_display_rows(output, self._style, terminal_width))
         return rows
 
     def _live_exec_command_header_rows(self, command: str, terminal_width: int) -> list[str]:
+        call = _ExecDisplayCall(call_id="", command=command, parsed=parse_command_actions(command))
+        return self._exec_call_header_rows(
+            call,
+            running=True,
+            ok=True,
+            terminal_width=terminal_width,
+        )
+
+    def _exec_call_header_rows(
+        self,
+        call: "_ExecDisplayCall",
+        *,
+        running: bool,
+        ok: bool,
+        terminal_width: int,
+    ) -> list[str]:
+        command_lines = _command_display_lines(call.command, self._style)
+        if running:
+            title = "Running"
+            bullet = self._style.marker("cyan")
+        elif call.exit_code == 0 and ok:
+            title = "Ran"
+            bullet = self._style.marker("green")
+        else:
+            title = "Ran"
+            bullet = self._style.marker("red")
         return self._prefixed_wrapped_rows(
-            _command_display_lines(command, self._style),
-            first_prefix=f"{self._style.marker('cyan')} {self._style.bold('Running')} ",
+            command_lines,
+            first_prefix=f"{bullet} {self._style.bold(title)} ",
             rest_prefix=self._style.dim("  │ "),
             max_lines=5,
             ellipsis_prefix=self._style.dim("  │ "),
@@ -7233,6 +7437,11 @@ class _HumanEventRenderer:
         self._live_exec_rendered.discard(call_id)
         self._live_exec_output_seen.discard(call_id)
         self._live_exec_output_text.pop(call_id, None)
+        self._live_exec_incremental_rendered.discard(call_id)
+        self._live_exec_incremental_obscured.discard(call_id)
+        self._live_exec_incremental_segment_output.pop(call_id, None)
+        self._live_exec_incremental_header_rows.pop(call_id, None)
+        self._live_exec_incremental_total_rows.pop(call_id, None)
 
     def _clear_live_exec(self, call_id: str) -> None:
         self._detach_live_exec_region(call_id, commit_if_last=True)
@@ -7242,7 +7451,14 @@ class _HumanEventRenderer:
         self._detach_live_exec_region(call_id, commit_if_last=True)
 
     def _finish_all_live_output_lines(self) -> None:
+        if self._suspend_live_finish > 0:
+            return
         if self._live_exec_regions:
+            self._live_exec_incremental_obscured.update(
+                call_id
+                for call_id in self._live_exec_regions
+                if call_id in self._live_exec_incremental_rendered
+            )
             self._clear_live_exec_panel(leading_gap_after_clear=True)
 
     def _render_plan(self, meta: dict[str, Any]) -> None:
@@ -7362,7 +7578,7 @@ class _HumanEventRenderer:
             return
         self._begin_cell()
         self._emit_prefixed_lines(lines, first_prefix=f"{self._style.marker('magenta')} ", rest_prefix="  ")
-        self._render_live_exec_panel()
+        self._render_live_exec_panel_if_needed()
 
     def _render_reasoning_message(self, text: str) -> None:
         terminal_width = shutil.get_terminal_size((100, 24)).columns
@@ -7376,7 +7592,7 @@ class _HumanEventRenderer:
             rest_prefix="  ",
             transform=self._style.dim,
         )
-        self._render_live_exec_panel()
+        self._render_live_exec_panel_if_needed()
 
     def _render_final_separator(self) -> None:
         self._begin_cell()
@@ -8040,9 +8256,23 @@ def _ellipsis_text(omitted: int, *, transcript_hint: bool = False) -> str:
 def _dim_command_output_segment(segment: str, style: "_AnsiStyle") -> str:
     if not segment:
         return segment
-    if _ANSI_RE.search(segment):
-        return segment
-    return style.dim(segment)
+    return style.dim(_ANSI_RE.sub("", segment))
+
+
+def _rows_have_prefix(rows: list[str], prefix: list[str]) -> bool:
+    if len(prefix) > len(rows):
+        return False
+    return rows[: len(prefix)] == prefix
+
+
+def _output_delta_since(previous_output: str, output: str) -> str:
+    if not previous_output:
+        return output
+    if output.startswith(previous_output):
+        return output[len(previous_output) :]
+    if output.strip() in previous_output.strip():
+        return ""
+    return output
 
 
 def _truncate_middle_parts(lines: list[str], max_lines: int) -> tuple[list[str], list[str], int]:
