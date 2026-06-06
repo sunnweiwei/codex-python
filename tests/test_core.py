@@ -4,6 +4,7 @@ import json
 import base64
 import io
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -4713,6 +4714,28 @@ class CodexCoreTests(unittest.TestCase):
         started_before_completion = [event for event in result.events[:first_completed] if event.type == "tool.started"]
         self.assertEqual([event.payload["call_id"] for event in started_before_completion[-2:]], ["call-a", "call-b"])
 
+    def test_session_interrupt_notifies_tools_before_slow_model_cancel(self) -> None:
+        class SlowCancelModel(ScriptedResponsesModel):
+            def cancel(self, *_args: Any) -> None:
+                time.sleep(1.0)
+
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=SlowCancelModel([]),
+        )
+        called = threading.Event()
+
+        def request_interrupt() -> None:
+            called.set()
+
+        session.tools.request_interrupt = request_interrupt  # type: ignore[method-assign]
+
+        started = time.monotonic()
+        session.interrupt()
+
+        self.assertTrue(called.wait(timeout=0.1), "tool interrupt was blocked behind model cancellation")
+        self.assertLess(time.monotonic() - started, 0.2)
+
     def test_stream_events_are_covered_by_lifecycle_catalog(self) -> None:
         model = ScriptedResponsesModel(
             [
@@ -6446,7 +6469,7 @@ new file mode 100644
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("\033[32m•\033[0m \033[1mRan\033[0m", completed.stderr)
+        self.assertIn("\033[1;32m•\033[0m \033[1mRan\033[0m", completed.stderr)
         self.assertIn("• Ran printf hello", _plain_terminal_output(completed.stderr))
         self.assertEqual(completed.stdout.strip(), "color done")
 
@@ -6634,6 +6657,222 @@ new file mode 100644
         self.assertTrue(all(line.startswith("\033[31m") for line in wrapped))
         self.assertTrue(all(line.endswith("\033[0m") for line in wrapped))
         self.assertEqual(_ANSI_RE.sub("", "".join(wrapped)), "x" * 24)
+
+    def test_cli_exec_command_display_uses_visible_shell_colors(self) -> None:
+        from codex.cli import _ANSI_RE, _AnsiStyle, _command_display_lines
+
+        lines = _command_display_lines("python3 -m py_compile draw_person.py", _AnsiStyle(True))
+        rendered = "\n".join(lines)
+
+        self.assertEqual(_ANSI_RE.sub("", rendered), "python3 -m py_compile draw_person.py")
+        self.assertIn("\033[36mpython3\033[0m", rendered)
+        self.assertIn("\033[33m-m\033[0m", rendered)
+        self.assertRegex(rendered, r"\x1b\[[0-9;]*mdraw_person\.py\x1b\[0m")
+
+    def test_cli_exec_output_preserves_existing_ansi_colors(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[str] = []
+        renderer = _HumanEventRenderer(color_mode="always", line_sink=lines.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd",
+                    "ok": True,
+                    "arguments": {"cmd": "printf color"},
+                    "metadata": {"exit_code": 0, "output": "\033[31mred\033[0m\nplain\n"},
+                },
+            )
+        )
+        rendered = "\n".join(lines)
+
+        self.assertIn("\033[31mred\033[0m", rendered)
+        self.assertIn("\033[2mplain\033[0m", rendered)
+
+    def test_turn_input_reader_rerenders_draft_after_tool_output(self) -> None:
+        from codex.cli import _TurnInputReader, _drain_output_queue
+
+        output: "queue.Queue[str]" = queue.Queue()
+        output.put("• Ran sleep 0.1")
+        reader = _TurnInputReader(enabled=True, color_mode="never")
+        reader._buffer = "draft while tool runs"
+        reader._cursor = len(reader._buffer)
+
+        rendered_io = io.StringIO()
+        with redirect_stderr(rendered_io):
+            _drain_output_queue(output, input_reader=reader)
+
+        self.assertEqual(reader._buffer, "draft while tool runs")
+        self.assertIn("• Ran sleep 0.1", rendered_io.getvalue())
+        self.assertIn("draft while tool runs", rendered_io.getvalue())
+
+    def test_cli_live_background_terminal_region_survives_model_interleave_and_wait(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered: list[Any] = []
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=rendered.append)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "exec_command",
+                    "call_id": "exec-1",
+                    "arguments": {"cmd": "python long.py", "yield_time_ms": 1000},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "exec_command.output_delta",
+                {"call_id": "exec-1", "delta": "first\n", "stream": "stdout"},
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "exec-1",
+                    "ok": True,
+                    "output": "first\n",
+                    "metadata": {
+                        "command": "python long.py",
+                        "session_id": 1,
+                        "aggregated_output": "first\n",
+                    },
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "item.completed",
+                {
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "我继续观察这个后台进程。"}],
+                    }
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.started",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "arguments": {"session_id": 1, "chars": "", "yield_time_ms": 1000},
+                },
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "exec_command.output_delta",
+                {"call_id": "exec-1", "delta": "second\n", "stream": "stdout"},
+            )
+        )
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "write_stdin",
+                    "call_id": "poll-1",
+                    "ok": True,
+                    "output": "second\n",
+                    "metadata": {
+                        "event_call_id": "exec-1",
+                        "session_id": 1,
+                        "command": "python long.py",
+                        "aggregated_output": "first\nsecond\n",
+                    },
+                },
+            )
+        )
+
+        self.assertEqual(set(renderer._live_exec_regions), {"exec-1"})
+        self.assertNotIn("poll-1", renderer._live_exec_regions)
+        self.assertEqual(renderer._live_exec_output_text.get("exec-1"), "first\nsecond\n")
+
+    def test_turn_input_reader_initializes_from_preserved_draft(self) -> None:
+        from codex.cli import _TurnInputReader
+
+        reader = _TurnInputReader(enabled=True, color_mode="never", initial_text="kept draft", initial_cursor=4)
+
+        self.assertEqual(reader.draft_text(), "kept draft")
+        self.assertEqual(reader.draft_cursor(), 4)
+
+    def test_interactive_turn_preserves_unsubmitted_draft_after_completion(self) -> None:
+        from codex import cli
+
+        class FakeTurnInputReader:
+            def __init__(
+                self,
+                *,
+                enabled: bool,
+                color_mode: str = "auto",
+                initial_text: str = "",
+                initial_cursor: int | None = None,
+            ) -> None:
+                self.enabled = enabled
+                self.color_mode = color_mode
+                self.initial_text = initial_text
+                self.initial_cursor = initial_cursor
+                self.output_partial_line_open = False
+                self._buffer = "typed while agent finishes"
+                self._cursor = 5
+
+            def __enter__(self) -> "FakeTurnInputReader":
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                pass
+
+            def set_status(self, snapshot: Any) -> None:
+                pass
+
+            def poll(self) -> list[Any]:
+                return []
+
+            def render(self) -> None:
+                pass
+
+            def clear(self) -> None:
+                pass
+
+            def draft_text(self) -> str:
+                return self._buffer
+
+            def draft_cursor(self) -> int:
+                return self._cursor
+
+        def fake_run_session_human(*args: Any, **kwargs: Any) -> int:
+            time.sleep(0.05)
+            return 0
+
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=ScriptedResponsesModel([]),
+        )
+        draft = cli._ComposerDraft()
+        original_reader = cli._TurnInputReader
+        original_run_session_human = cli._run_session_human
+        original_print_finished = cli._print_finished_turn_status
+        try:
+            cli._TurnInputReader = FakeTurnInputReader
+            cli._run_session_human = fake_run_session_human
+            cli._print_finished_turn_status = lambda *args, **kwargs: None
+            with redirect_stderr(io.StringIO()):
+                status = cli._run_session_human_interactive(session, "start", composer_draft=draft)
+        finally:
+            cli._TurnInputReader = original_reader
+            cli._run_session_human = original_run_session_human
+            cli._print_finished_turn_status = original_print_finished
+
+        self.assertEqual(status, 0)
+        self.assertEqual(draft.text, "typed while agent finishes")
+        self.assertEqual(draft.cursor, 5)
 
     def test_cli_human_output_preserves_intraword_underscores(self) -> None:
         env = {
@@ -7456,6 +7695,65 @@ new file mode 100644
         self.assertEqual(_slash_palette_rows_for_buffer("/ren", 4), [])
         self.assertEqual(_slash_palette_rows_for_buffer("/app", 4), [])
 
+    def test_tty_prompt_empty_state_matches_upstream_composer_placeholder(self) -> None:
+        from codex.cli import _AnsiStyle
+        from codex.cli import _composer_status_block
+        from codex.cli import _prompt_display_lines
+        from codex.cli import _visible_len
+
+        self.assertEqual(
+            _prompt_display_lines("", _AnsiStyle(False)),
+            ["› Ask Codex to do anything"],
+        )
+        self.assertEqual(
+            _prompt_display_lines("short", _AnsiStyle(False)),
+            ["› short"],
+        )
+        self.assertEqual(
+            _prompt_display_lines("one\ntwo", _AnsiStyle(False)),
+            ["› one", "  two"],
+        )
+
+        colored = _prompt_display_lines("", _AnsiStyle(True))[0]
+        self.assertIn("\x1b[1m›\x1b[0m", colored)
+        self.assertIn("\x1b[2mAsk Codex to do anything\x1b[0m", colored)
+
+        boxed_lines = _prompt_display_lines("", _AnsiStyle(True), width=40, boxed=True)
+        self.assertEqual(len(boxed_lines), 3)
+        self.assertTrue(all(_visible_len(line) == 39 for line in boxed_lines))
+        self.assertIn("\x1b[38;2;28;28;28;48;2;244;244;244m", boxed_lines[0])
+        self.assertIn("\x1b[1;38;2;28;28;28;48;2;244;244;244m›\x1b[0m", boxed_lines[1])
+        self.assertIn("\x1b[38;2;28;28;28;48;2;244;244;244m \x1b[0m", boxed_lines[1])
+        self.assertNotIn("\x1b[0m \x1b[", boxed_lines[1])
+        self.assertIn(
+            "\x1b[2;38;2;28;28;28;48;2;244;244;244mAsk Codex to do anything\x1b[0m",
+            boxed_lines[1],
+        )
+        self.assertIn("\x1b[38;2;28;28;28;48;2;244;244;244m", boxed_lines[2])
+
+        boxed_input = _prompt_display_lines("abc", _AnsiStyle(True), width=40, boxed=True)[1]
+        self.assertNotIn("\x1b[0m \x1b[", boxed_input)
+        self.assertIn("\x1b[38;2;28;28;28;48;2;244;244;244m \x1b[0m", boxed_input)
+
+        self.assertEqual(
+            _composer_status_block(["• Working (0s • esc to interrupt)"]),
+            ["", "• Working (0s • esc to interrupt)", ""],
+        )
+
+    def test_user_message_history_uses_same_light_background_as_composer(self) -> None:
+        from codex.cli import _HumanEventRenderer
+        from unittest.mock import patch
+
+        captured = io.StringIO()
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((40, 24))):
+            with redirect_stderr(captured):
+                _HumanEventRenderer(color_mode="always").render_user_message("hello")
+
+        rendered = captured.getvalue()
+        self.assertIn("\x1b[38;2;28;28;28;48;2;244;244;244m", rendered)
+        self.assertIn("\x1b[1;2;38;2;28;28;28;48;2;244;244;244m› \x1b[0m", rendered)
+        self.assertIn("\x1b[38;2;28;28;28;48;2;244;244;244mhello\x1b[0m", rendered)
+
     def test_slash_palette_redraw_clears_menu_rows_below_prompt_cursor(self) -> None:
         from codex.cli import _TurnInputReader
 
@@ -7543,7 +7841,8 @@ new file mode 100644
         )
 
         rendered = "\n".join(lines)
-        self.assertIn("• Working (2s • esc to interrupt)", rendered)
+        self.assertIn("Working (2s • esc to interrupt)", rendered)
+        self.assertNotIn("• Working", rendered)
         self.assertIn("auth ChatGPT", rendered)
         self.assertIn("ctx 12.7K/400K", rendered)
         self.assertIn("session 18.2K", rendered)
@@ -7597,10 +7896,76 @@ new file mode 100644
         )
         self.assertRegex(colored_finished, r"\x1b\[[0-9;]*2m  Worked for 1s")
 
+    def test_live_status_blinks_activity_indicator_and_keeps_header_static(self) -> None:
+        from codex.cli import _ANSI_RE
+        from codex.cli import _AnsiStyle
+        from codex.cli import _LiveTurnStatusSnapshot
+        from codex.cli import _live_status_display_lines
+
+        first = "\n".join(
+            _live_status_display_lines(
+                _LiveTurnStatusSnapshot(
+                    header="Working",
+                    elapsed_seconds=2,
+                    auth_label=None,
+                    goal_status=None,
+                    active_context_tokens=None,
+                    active_context_estimated=False,
+                    session_context_tokens=None,
+                    session_context_estimated=False,
+                    session_reasoning_tokens=None,
+                    context_window=None,
+                    animation_millis=0,
+                ),
+                _AnsiStyle(True),
+            )
+        )
+        second = "\n".join(
+            _live_status_display_lines(
+                _LiveTurnStatusSnapshot(
+                    header="Working",
+                    elapsed_seconds=2,
+                    auth_label=None,
+                    goal_status=None,
+                    active_context_tokens=None,
+                    active_context_estimated=False,
+                    session_context_tokens=None,
+                    session_context_estimated=False,
+                    session_reasoning_tokens=None,
+                    context_window=None,
+                    animation_millis=600,
+                ),
+                _AnsiStyle(True),
+            )
+        )
+
+        self.assertIn("Working", _ANSI_RE.sub("", first))
+        self.assertIn("• Working", _ANSI_RE.sub("", first))
+        self.assertIn("• Working", _ANSI_RE.sub("", second))
+        self.assertRegex(first, r"\x1b\[1;90m•")
+        self.assertRegex(second, r"\x1b\[2;90m•")
+        self.assertNotRegex(first, r"\x1b\[1;38;(2|5);")
+        self.assertNotRegex(second, r"\x1b\[1;38;(2|5);")
+        self.assertNotEqual(first, second)
+
     def test_live_status_tracks_background_terminal_waits_like_upstream(self) -> None:
+        from codex.cli import _AnsiStyle
         from codex.cli import _LiveTurnStatus
+        from codex.cli import _live_status_display_lines
 
         status = _LiveTurnStatus()
+        status.update(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "metadata": {
+                        "session_id": 1,
+                        "command": "cargo test -p codex-core -- --exact very_long_background_terminal_test_name",
+                    },
+                },
+            )
+        )
         status.update(
             codex_types.CodexEvent(
                 "tool.started",
@@ -7609,7 +7974,14 @@ new file mode 100644
         )
 
         session = CodexSession(CodexConfig(skip_git_repo_check=True, ephemeral=True))
-        self.assertEqual(status.snapshot(session).header, "Waiting for background terminal")
+        snapshot = status.snapshot(session)
+        self.assertEqual(snapshot.header, "Waiting for background terminal")
+        self.assertIn("cargo test -p codex-core", snapshot.details or "")
+
+        rendered = "\n".join(_live_status_display_lines(snapshot, _AnsiStyle(False)))
+        self.assertIn("Waiting for background terminal", rendered)
+        self.assertNotIn("• Waiting for background terminal", rendered)
+        self.assertIn("  └ cargo test -p codex-core", rendered)
 
     def test_shared_remote_token_usage_updates_local_status_metrics(self) -> None:
         from codex.cli import _apply_app_server_token_usage
@@ -7775,7 +8147,7 @@ new file mode 100644
             )
         )
 
-        rendered = "\n".join(lines)
+        rendered = "\n".join(str(getattr(item, "text", item)) for item in lines)
         self.assertIn("↳ Interacted with background terminal · python3 -i", rendered)
         self.assertIn("  └ ls", rendered)
         self.assertIn("    pwd", rendered)
@@ -7815,11 +8187,8 @@ new file mode 100644
                 )
             )
 
-        rendered = rendered_io.getvalue()
-        self.assertIn("• Running printf x", rendered)
-        self.assertIn("  └ streamed-output", rendered)
-        self.assertIn("• Ran printf x", rendered)
-        self.assertEqual(rendered.count("streamed-output"), 1)
+        rendered_lines = [line for line in _ansi_terminal_lines(rendered_io.getvalue()) if line]
+        self.assertEqual(rendered_lines, ["• Ran printf x", "  └ streamed-output"])
 
     def test_cli_human_renderer_streams_partial_output_on_same_line(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -7856,9 +8225,9 @@ new file mode 100644
                 )
             )
 
-        rendered = rendered_io.getvalue()
-        self.assertIn("  └ ...\n", rendered)
-        self.assertNotIn("  └ .\n    .", rendered)
+        rendered_lines = [line for line in _ansi_terminal_lines(rendered_io.getvalue()) if line]
+        self.assertEqual(rendered_lines, ["• Ran python -m unittest", "  └ ..."])
+        self.assertNotIn("  └ .\n    .", rendered_io.getvalue())
 
     def test_cli_human_renderer_marks_long_live_output_but_keeps_tail_streaming(self) -> None:
         from unittest.mock import patch
@@ -7923,6 +8292,54 @@ new file mode 100644
         self.assertFalse(reader.output_partial_line_open)
         self.assertEqual(reader.renders, 1)
 
+    def test_cli_output_drain_batches_prompt_clear_for_live_writes(self) -> None:
+        import queue
+
+        from codex.cli import _ConsoleWrite
+        from codex.cli import _drain_output_queue
+
+        class FakeReader:
+            def __init__(self) -> None:
+                self.output_partial_line_open = False
+                self.clears = 0
+                self.renders = 0
+
+            def clear(self) -> None:
+                self.clears += 1
+
+            def render(self) -> None:
+                self.renders += 1
+
+        output: "queue.Queue[Any]" = queue.Queue()
+        reader = FakeReader()
+        output.put(_ConsoleWrite("first\n", partial_line_open=False))
+        output.put(_ConsoleWrite("second\n", partial_line_open=False))
+        output.put("• Ran command")
+
+        with redirect_stderr(io.StringIO()):
+            _drain_output_queue(output, input_reader=reader)
+
+        self.assertEqual(reader.clears, 1)
+        self.assertEqual(reader.renders, 1)
+
+    def test_cli_output_drain_coalesces_intermediate_live_frames(self) -> None:
+        import queue
+
+        from codex.cli import _ConsoleWrite
+        from codex.cli import _drain_output_queue
+
+        output: "queue.Queue[Any]" = queue.Queue()
+        output.put(_ConsoleWrite("CLEAR-OLD", live_op="live_clear"))
+        output.put(_ConsoleWrite("PANEL-1", live_op="live_panel"))
+        output.put(_ConsoleWrite("CLEAR-1", live_op="live_clear"))
+        output.put(_ConsoleWrite("PANEL-2", live_op="live_panel"))
+
+        rendered = io.StringIO()
+        with redirect_stderr(rendered):
+            _drain_output_queue(output)
+
+        self.assertEqual(rendered.getvalue(), "CLEAR-OLDPANEL-2")
+
     def test_cli_human_renderer_restarts_terminal_header_after_agent_message(self) -> None:
         from codex.cli import _HumanEventRenderer
 
@@ -7942,7 +8359,7 @@ new file mode 100644
             renderer.render(
                 codex_types.CodexEvent(
                     "exec_command.output_delta",
-                    {"call_id": "cmd-1", "delta": "booting", "stream": "stdout"},
+                    {"call_id": "cmd-1", "delta": "booting\n", "stream": "stdout"},
                 )
             )
             renderer.render(
@@ -7952,7 +8369,7 @@ new file mode 100644
                         "name": "exec_command",
                         "call_id": "cmd-1",
                         "ok": True,
-                        "metadata": {"session_id": 7, "command": "python slow.py", "output": "booting"},
+                        "metadata": {"session_id": 7, "command": "python slow.py", "output": "booting\n"},
                     },
                 )
             )
@@ -7990,7 +8407,47 @@ new file mode 100644
         self.assertIn("  └ booting\n", rendered)
         self.assertIn("• Still running; I will check again.", rendered)
         self.assertIn("• Waited for background terminal", rendered)
-        self.assertIn("  └ done\n", rendered)
+        self.assertIn("    done\n", rendered)
+
+    def test_cli_human_renderer_keeps_gap_when_live_output_moves_below_agent_message(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        rendered_io = io.StringIO()
+        renderer = _HumanEventRenderer(color_mode="never")
+        with redirect_stderr(rendered_io):
+            renderer.render(
+                codex_types.CodexEvent(
+                    "tool.started",
+                    {
+                        "name": "exec_command",
+                        "call_id": "cmd-1",
+                        "arguments": {"cmd": "python slow.py", "yield_time_ms": 1000},
+                    },
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "exec_command.output_delta",
+                    {"call_id": "cmd-1", "delta": "booting\n", "stream": "stdout"},
+                )
+            )
+            renderer.render(
+                codex_types.CodexEvent(
+                    "item.completed",
+                    {
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Still running; I will check again."}],
+                        }
+                    },
+                )
+            )
+
+        lines = _ansi_terminal_lines(rendered_io.getvalue())
+        message_index = lines.index("• Still running; I will check again.")
+        self.assertEqual(lines[message_index + 1], "")
+        self.assertEqual(lines[message_index + 2], "• Running python slow.py")
 
     def test_cli_human_renderer_hides_running_cells_for_silent_background_command(self) -> None:
         from codex.cli import _HumanEventRenderer
@@ -8727,7 +9184,7 @@ new file mode 100644
         self.assertRegex(plain, r"Working \([0-9]+s • esc to interrupt\)")
         self.assertIn("ctx ", plain)
         self.assertIn("session ", plain)
-        self.assertNotIn("Ask Codex to do anything", plain)
+        self.assertIn("Ask Codex to do anything", plain)
         self.assertIn("Conversation interrupted", plain)
         self.assertNotIn("Running sleep 10", plain)
         self.assertNotIn("Chunk ID:", plain)

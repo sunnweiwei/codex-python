@@ -17,6 +17,7 @@ import base64
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from typing import Callable
 from unittest.mock import patch
 
 from codex.remote_control import (
@@ -86,6 +87,11 @@ class _FakeWebSocket:
 
     def send(self, payload: str) -> None:
         self.sent.append(json.loads(payload))
+
+
+class _ClosedWebSocket:
+    def send(self, payload: str) -> None:
+        raise BrokenPipeError("websocket closed")
 
 
 class _BrokenSendSocket:
@@ -780,6 +786,35 @@ class CodexRemoteControlTests(unittest.TestCase):
             )
             self.assertIsInstance(second.sent[0]["stream_id"], str)
             self.assertNotEqual(second.sent[0]["stream_id"], first_stream)
+
+    def test_remote_control_send_failure_buffers_event_without_crashing_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = RemoteControlConfig(codex_home=Path(tmp), cwd=Path(tmp))
+            service = RemoteControlService(config)
+            ws = _ClosedWebSocket()
+            service._client_streams.add(("client-a", "stream-a"))
+            service._stream_connections[("client-a", "stream-a")] = ws
+
+            service.send_notification(
+                ws,
+                "client-a",
+                "stream-a",
+                "process/exited",
+                {
+                    "processHandle": "proc-1",
+                    "exitCode": 0,
+                    "stdout": "",
+                    "stdoutCapReached": False,
+                    "stderr": "",
+                    "stderrCapReached": False,
+                },
+            )
+
+            buffered = service._outbound_buffer.server_envelopes()
+            self.assertEqual(len(buffered), 1)
+            self.assertEqual(buffered[0].event["message"]["method"], "process/exited")  # type: ignore[index]
+            self.assertNotIn(("client-a", "stream-a"), service._stream_connections)
+            self.assertEqual(service.status, "connecting")
 
     def test_remote_control_advertises_mobile_supported_app_server_version(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3109,9 +3144,21 @@ class CodexRemoteControlTests(unittest.TestCase):
                 )
 
             thread = threading.Thread(target=ask_user)
+            start_index = len(ws.sent)
             thread.start()
             request = _wait_for_sent_method(ws, "item/tool/requestUserInput")
             self.assertEqual(request["params"]["threadId"], thread_id)  # type: ignore[index]
+            waiting_status = _wait_for_sent_message(
+                ws,
+                lambda message: message.get("method") == "thread/status/changed"
+                and message.get("params", {}).get("threadId") == thread_id  # type: ignore[union-attr]
+                and message.get("params", {}).get("status")  # type: ignore[union-attr]
+                == {"type": "active", "activeFlags": ["waitingOnUserInput"]},
+                "waitingOnUserInput thread status",
+                start=start_index,
+            )
+            _assert_notification_matches_upstream_schema(self, waiting_status)
+            response_index = len(ws.sent)
             app_server.handle_message(
                 ws,
                 "client-a",
@@ -3120,6 +3167,24 @@ class CodexRemoteControlTests(unittest.TestCase):
             )
             self.assertEqual(answers.get(timeout=2), {"answers": {"choice": {"answers": ["A"]}}})
             thread.join(timeout=2)
+            resolved = _wait_for_sent_message(
+                ws,
+                lambda message: message.get("method") == "serverRequest/resolved"
+                and message.get("params", {}).get("threadId") == thread_id  # type: ignore[union-attr]
+                and message.get("params", {}).get("requestId") == request["id"],  # type: ignore[union-attr]
+                "request user input resolved notification",
+                start=response_index,
+            )
+            _assert_notification_matches_upstream_schema(self, resolved)
+            idle_status = _wait_for_sent_message(
+                ws,
+                lambda message: message.get("method") == "thread/status/changed"
+                and message.get("params", {}).get("threadId") == thread_id  # type: ignore[union-attr]
+                and message.get("params", {}).get("status") == {"type": "idle"},  # type: ignore[union-attr]
+                "idle thread status after request user input",
+                start=response_index,
+            )
+            _assert_notification_matches_upstream_schema(self, idle_status)
 
             approvals: queue.Queue[object] = queue.Queue(maxsize=1)
 
@@ -3129,9 +3194,21 @@ class CodexRemoteControlTests(unittest.TestCase):
                 approvals.put(provider({"tool": "exec_command", "cmd": "echo hi", "reason": "test"}))
 
             thread = threading.Thread(target=ask_approval)
+            start_index = len(ws.sent)
             thread.start()
             request = _wait_for_sent_method(ws, "item/commandExecution/requestApproval")
             self.assertEqual(request["params"]["command"], "echo hi")  # type: ignore[index]
+            waiting_status = _wait_for_sent_message(
+                ws,
+                lambda message: message.get("method") == "thread/status/changed"
+                and message.get("params", {}).get("threadId") == thread_id  # type: ignore[union-attr]
+                and message.get("params", {}).get("status")  # type: ignore[union-attr]
+                == {"type": "active", "activeFlags": ["waitingOnApproval"]},
+                "waitingOnApproval thread status",
+                start=start_index,
+            )
+            _assert_notification_matches_upstream_schema(self, waiting_status)
+            response_index = len(ws.sent)
             app_server.handle_message(
                 ws,
                 "client-a",
@@ -3140,6 +3217,24 @@ class CodexRemoteControlTests(unittest.TestCase):
             )
             self.assertEqual(approvals.get(timeout=2), {"decision": "approved_for_session"})
             thread.join(timeout=2)
+            resolved = _wait_for_sent_message(
+                ws,
+                lambda message: message.get("method") == "serverRequest/resolved"
+                and message.get("params", {}).get("threadId") == thread_id  # type: ignore[union-attr]
+                and message.get("params", {}).get("requestId") == request["id"],  # type: ignore[union-attr]
+                "approval resolved notification",
+                start=response_index,
+            )
+            _assert_notification_matches_upstream_schema(self, resolved)
+            idle_status = _wait_for_sent_message(
+                ws,
+                lambda message: message.get("method") == "thread/status/changed"
+                and message.get("params", {}).get("threadId") == thread_id  # type: ignore[union-attr]
+                and message.get("params", {}).get("status") == {"type": "idle"},  # type: ignore[union-attr]
+                "idle thread status after approval",
+                start=response_index,
+            )
+            _assert_notification_matches_upstream_schema(self, idle_status)
 
             app_server.handle_message(
                 ws,
@@ -3232,6 +3327,65 @@ class CodexRemoteControlTests(unittest.TestCase):
             self.assertEqual(process_exit["params"]["exitCode"], 0)  # type: ignore[index]
             self.assertEqual(process_exit["params"]["stdout"], "")  # type: ignore[index]
             self.assertEqual(process_exit["params"]["stderr"], "")  # type: ignore[index]
+
+    def test_remote_app_server_cancels_pending_server_request_when_mobile_disconnects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = RemoteControlConfig(codex_home=root / "codex-home", auth_codex_home=root / "auth-home", cwd=root)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": config,
+                    "status": "connected",
+                    "installation_id": "install-test",
+                    "environment_id": "env-test",
+                    "send_message": lambda self, ws, client_id, stream_id, message: ws.send(json.dumps(message)),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+            app_server.handle_message(ws, "client-a", "stream-a", {"id": 1, "method": "thread/start", "params": {}})
+            start_response = next(message for message in ws.sent if message.get("id") == 1)
+            thread_id = start_response["result"]["thread"]["id"]  # type: ignore[index]
+            session = app_server._session_by_id(thread_id)  # type: ignore[attr-defined]
+            with app_server._lock:  # type: ignore[attr-defined]
+                app_server._active_turn_clients[thread_id] = (ws, "client-a", "stream-a")  # type: ignore[attr-defined]
+
+            answers: queue.Queue[object] = queue.Queue(maxsize=1)
+
+            def ask_user() -> None:
+                provider = session.config.request_user_input_provider
+                assert provider is not None
+                answers.put(
+                    provider(
+                        [
+                            {
+                                "id": "choice",
+                                "header": "Choice",
+                                "question": "Pick one",
+                                "options": [{"label": "A", "description": "Use A"}],
+                            }
+                        ]
+                    )
+                )
+
+            thread = threading.Thread(target=ask_user)
+            thread.start()
+            request = _wait_for_sent_method(ws, "item/tool/requestUserInput")
+            self.assertEqual(request["params"]["threadId"], thread_id)  # type: ignore[index]
+            app_server.close_client("client-a", "stream-a")
+
+            self.assertIsNone(answers.get(timeout=2))
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            with app_server._lock:  # type: ignore[attr-defined]
+                self.assertEqual(app_server._pending_server_requests, {})  # type: ignore[attr-defined]
+                self.assertEqual(app_server._pending_server_request_targets, {})  # type: ignore[attr-defined]
+                self.assertNotIn(thread_id, app_server._thread_active_flag_counts)  # type: ignore[attr-defined]
 
     def test_remote_command_exec_streaming_output_cap_matches_upstream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3877,6 +4031,70 @@ class CodexRemoteControlTests(unittest.TestCase):
         goal = next(message for message in ws.sent if message.get("method") == "thread/goal/updated")
         self.assertEqual(goal["params"]["threadId"], "thread-mobile-coverage")  # type: ignore[index]
         self.assertEqual(goal["params"]["turnId"], "turn-mobile-coverage")  # type: ignore[index]
+
+    def test_remote_turn_emits_direct_plan_update_events_to_mobile(self) -> None:
+        class _PlanEventSession:
+            def __init__(self, root: Path) -> None:
+                self.config = CodexConfig(cwd=root, codex_home=root / "codex-home", skip_git_repo_check=True)
+                self.state = type("State", (), {"thread_id": "thread-plan-event", "turn_id": "turn-plan-event"})()
+                self.state.config = self.config
+                self.tools = type("Tools", (), {"config": self.config})()
+
+            def stream(self, prompt: str) -> list[CodexEvent]:
+                return [
+                    CodexEvent("turn.started"),
+                    CodexEvent(
+                        "plan_update",
+                        {
+                            "type": "plan_update",
+                            "explanation": "直接 plan_update 事件也要发给手机。",
+                            "plan": [
+                                {"step": "确认事件", "status": "completed"},
+                                {"step": "通知手机", "status": "in_progress"},
+                            ],
+                        },
+                    ),
+                    CodexEvent(
+                        "item.completed",
+                        {
+                            "item": {
+                                "type": "message",
+                                "role": "assistant",
+                                "id": "msg_plan_done",
+                                "content": [{"type": "output_text", "text": "plan done"}],
+                            },
+                            "item_id": "msg_plan_done",
+                        },
+                    ),
+                    CodexEvent("turn.completed"),
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = type(
+                "Service",
+                (),
+                {
+                    "config": RemoteControlConfig(codex_home=root / "codex-home", auth_codex_home=root / "auth-home", cwd=root),
+                    "send_notification": lambda self, ws, client_id, stream_id, method, params: ws.send(
+                        json.dumps({"method": method, "params": params})
+                    ),
+                },
+            )()
+            app_server = _RemoteAppServer(service)  # type: ignore[arg-type]
+            ws = _FakeWebSocket()
+
+            app_server._run_turn(ws, "client-a", "stream-a", _PlanEventSession(root), "show plan")  # type: ignore[arg-type]
+
+        for message in ws.sent:
+            _assert_notification_matches_upstream_schema(self, message)
+        plan = next(message for message in ws.sent if message.get("method") == "turn/plan/updated")
+        self.assertEqual(plan["params"]["threadId"], "thread-plan-event")  # type: ignore[index]
+        self.assertEqual(plan["params"]["turnId"], "turn-plan-event")  # type: ignore[index]
+        self.assertEqual(
+            [step["status"] for step in plan["params"]["plan"]],  # type: ignore[index]
+            ["completed", "inProgress"],
+        )
 
     def test_remote_turn_emits_collab_agent_tool_call_items_like_upstream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4710,6 +4928,22 @@ def _wait_for_sent_method(ws: _FakeWebSocket, method: str) -> dict[str, object]:
                 return message
         time.sleep(0.01)
     raise AssertionError(f"server request {method} was not sent")
+
+
+def _wait_for_sent_message(
+    ws: _FakeWebSocket,
+    predicate: Callable[[dict[str, object]], bool],
+    description: str,
+    *,
+    start: int = 0,
+) -> dict[str, object]:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        for message in ws.sent[start:]:
+            if predicate(message):
+                return message
+        time.sleep(0.01)
+    raise AssertionError(f"server message was not sent: {description}")
 
 
 def _wait_for_response_id(ws: _FakeWebSocket, response_id: int) -> dict[str, object]:

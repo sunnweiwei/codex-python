@@ -38,7 +38,21 @@ from .types import CodexConfig, CodexEvent, _model_catalog_info, normalize_servi
 from . import types as _types
 
 
-_CLI_SYNTAX_THEME = os.environ.get("PY_CODEX_SYNTAX_THEME", "monokai")
+def _default_cli_syntax_theme() -> str:
+    configured = os.environ.get("PY_CODEX_SYNTAX_THEME")
+    if configured:
+        return configured
+    colorfgbg = os.environ.get("COLORFGBG", "")
+    try:
+        bg = int(colorfgbg.split(";")[-1])
+    except (TypeError, ValueError):
+        bg = -1
+    if bg in {7, 15} or bg >= 230:
+        return "catppuccin-latte"
+    return "catppuccin-mocha"
+
+
+_CLI_SYNTAX_THEME = _default_cli_syntax_theme()
 _UPSTREAM_TERMINAL_RESIZE_REFLOW_FALLBACK_MAX_ROWS = 1000
 _DEFAULT_SHARED_REMOTE_CONTROL_NAME = REQUIRED_REMOTE_CONTROL_SERVER_NAME
 
@@ -1470,6 +1484,7 @@ def _run_chat(
         _render_chat_startup_panel(session, color_mode=color_mode)
     exit_status = 0
     queued_prompts: deque[str] = deque()
+    composer_draft = _ComposerDraft()
     while True:
         if prompt is None and queued_prompts:
             prompt = queued_prompts.popleft()
@@ -1481,9 +1496,18 @@ def _run_chat(
                     session,
                     shared_runtime,
                     color_mode=color_mode,
+                    initial_text=composer_draft.text,
+                    initial_cursor=composer_draft.cursor,
                 )
             else:
-                prompt = _read_interactive_prompt(color_mode=color_mode)
+                prompt = _read_interactive_prompt(
+                    color_mode=color_mode,
+                    initial_text=composer_draft.text,
+                    initial_cursor=composer_draft.cursor,
+                )
+            if prompt is not None:
+                composer_draft.text = ""
+                composer_draft.cursor = 0
         if prompt is None:
             return exit_status
         slash_result = _handle_interactive_slash_command(
@@ -1516,6 +1540,7 @@ def _run_chat(
                     color_mode=color_mode,
                     queued_prompts=queued_prompts,
                     shared_runtime=shared_runtime,
+                    composer_draft=composer_draft,
                 )
             else:
                 renderer = _HumanEventRenderer(color_mode=color_mode)
@@ -1831,6 +1856,7 @@ def _run_session_human_interactive(
     color_mode: str = "auto",
     queued_prompts: deque[str] | None = None,
     shared_runtime: "_SharedRemoteRuntime | None" = None,
+    composer_draft: _ComposerDraft | None = None,
 ) -> int:
     output: "queue.Queue[str]" = queue.Queue()
     status_tracker = _LiveTurnStatus()
@@ -1877,13 +1903,23 @@ def _run_session_human_interactive(
         shared_runtime.drain(renderer, color_mode=color_mode)
     _drain_output_queue(output)
     interrupted = False
-    with _TurnInputReader(enabled=sys.stdin.isatty() and sys.stderr.isatty(), color_mode=color_mode) as reader:
+    next_output_drain_at = 0.0
+    output_drain_interval = 0.16
+    with _TurnInputReader(
+        enabled=sys.stdin.isatty() and sys.stderr.isatty(),
+        color_mode=color_mode,
+        initial_text=composer_draft.text if composer_draft is not None else "",
+        initial_cursor=composer_draft.cursor if composer_draft is not None else None,
+    ) as reader:
         reader.set_status(status_tracker.snapshot(session))
         while thread.is_alive():
             if shared_runtime is not None:
                 shared_runtime.drain(renderer, color_mode=color_mode, input_reader=reader)
-            _drain_output_queue(output, input_reader=reader)
-            if not reader.output_partial_line_open:
+            now = time.monotonic()
+            if now >= next_output_drain_at:
+                _drain_output_queue(output, input_reader=reader)
+                next_output_drain_at = now + output_drain_interval
+            if not reader.output_partial_line_open and output.empty():
                 reader.set_status(status_tracker.snapshot(session))
             request = request_user_input_bridge.take_pending()
             if request is not None:
@@ -1896,14 +1932,17 @@ def _run_session_human_interactive(
             for action in reader.poll():
                 if action.kind == "interrupt" and not interrupted:
                     interrupted = True
-                    reader.clear()
                     if shared_runtime is not None:
                         shared_runtime.interrupt()
                     else:
                         session.interrupt()
                     renderer.render_interrupted()
                     _drain_output_queue(output, input_reader=reader)
+                    reader.render()
                 elif action.kind == "submit" and action.text.strip():
+                    if composer_draft is not None:
+                        composer_draft.text = ""
+                        composer_draft.cursor = 0
                     if shared_runtime is not None:
                         accepted = shared_runtime.steer(action.text)
                         if not accepted:
@@ -1913,6 +1952,9 @@ def _run_session_human_interactive(
                     renderer.render_pending_input_preview(action.text, active=accepted)
                     _drain_output_queue(output, input_reader=reader)
             thread.join(timeout=0.03)
+        if composer_draft is not None:
+            composer_draft.text = reader.draft_text()
+            composer_draft.cursor = reader.draft_cursor()
     thread.join(timeout=0.1)
     if shared_runtime is not None:
         shared_runtime.drain(renderer, color_mode=color_mode)
@@ -1967,15 +2009,15 @@ def _run_compact_human_interactive(
         reader.set_status(status_tracker.snapshot(session))
         while thread.is_alive():
             _drain_output_queue(output, input_reader=reader)
-            if not reader.output_partial_line_open:
+            if not reader.output_partial_line_open and output.empty():
                 reader.set_status(status_tracker.snapshot(session))
             for action in reader.poll():
                 if action.kind == "interrupt" and not interrupted:
                     interrupted = True
-                    reader.clear()
                     session.interrupt()
                     renderer.render_interrupted()
                     _drain_output_queue(output, input_reader=reader)
+                    reader.render()
                 elif action.kind == "submit" and action.text.strip():
                     accepted = _submit_turn_input(session, action.text, queued_prompts=queued_prompts)
                     renderer.render_pending_input_preview(action.text, active=accepted)
@@ -2510,7 +2552,7 @@ def _request_user_input_selector_lines(
     question_count: int,
     style: "_AnsiStyle",
 ) -> list[str]:
-    lines = [f"{style.dim('•')} {style.bold('Questions')}"]
+    lines = [f"{style.marker()} {style.bold('Questions')}"]
     if question_count > 1:
         lines.append(f"  {style.dim(f'Question {question_index}/{question_count}')}")
     header = str(question.get("header") or "").strip()
@@ -2609,19 +2651,28 @@ def _split_request_user_input_answer_values(values: list[str]) -> tuple[list[str
 class _ConsoleWrite:
     text: str
     partial_line_open: bool = False
+    live_op: str | None = None
+
+
+@dataclass
+class _ComposerDraft:
+    text: str = ""
+    cursor: int = 0
 
 
 def _drain_output_queue(output: "queue.Queue[Any]", *, input_reader: "_TurnInputReader | None" = None) -> None:
-    printed = False
+    items: list[Any] = []
     while True:
         try:
-            item = output.get_nowait()
+            items.append(output.get_nowait())
         except queue.Empty:
-            if printed and input_reader is not None and not input_reader.output_partial_line_open:
-                input_reader.render()
-            return
-        if input_reader is not None:
-            input_reader.clear()
+            break
+    if not items:
+        return
+    items = _coalesce_console_writes(items)
+    if input_reader is not None:
+        input_reader.clear()
+    for item in items:
         if isinstance(item, _ConsoleWrite):
             sys.stderr.write(item.text)
             sys.stderr.flush()
@@ -2631,7 +2682,44 @@ def _drain_output_queue(output: "queue.Queue[Any]", *, input_reader: "_TurnInput
             print(item, file=sys.stderr, flush=True)
             if input_reader is not None:
                 input_reader.output_partial_line_open = False
-        printed = True
+    if input_reader is not None and not input_reader.output_partial_line_open:
+        input_reader.render()
+
+
+def _coalesce_console_writes(items: list[Any]) -> list[Any]:
+    coalesced: list[Any] = []
+    run: list[_ConsoleWrite] = []
+
+    def flush_run() -> None:
+        nonlocal run
+        if run:
+            coalesced.extend(_coalesce_console_write_run(run))
+            run = []
+
+    for item in items:
+        if isinstance(item, _ConsoleWrite):
+            run.append(item)
+            continue
+        flush_run()
+        coalesced.append(item)
+    flush_run()
+    return coalesced
+
+
+def _coalesce_console_write_run(run: list[_ConsoleWrite]) -> list[_ConsoleWrite]:
+    if len(run) <= 1:
+        return list(run)
+    if any(item.live_op not in {"live_clear", "live_panel"} for item in run):
+        return list(run)
+    first_clear = next((item for item in run if item.live_op == "live_clear"), None)
+    last_panel = next((item for item in reversed(run) if item.live_op == "live_panel"), None)
+    if first_clear is not None and last_panel is not None:
+        return [first_clear, last_panel]
+    if last_panel is not None:
+        return [last_panel]
+    if first_clear is not None:
+        return [first_clear]
+    return list(run)
 
 
 @dataclass(frozen=True)
@@ -2655,12 +2743,16 @@ class _LiveTurnStatusSnapshot:
     finished: bool = False
     outcome: str | None = None
     fast_status: str | None = None
+    details: str | None = None
+    animation_millis: int = 0
 
 
 class _LiveTurnStatus:
     def __init__(self, *, header: str = "Working") -> None:
         self._started_at = time.monotonic()
         self._header = header
+        self._details: str | None = None
+        self._background_terminal_commands: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def update(self, event: Any) -> None:
@@ -2670,19 +2762,43 @@ class _LiveTurnStatus:
         with self._lock:
             if event_type == "context_compaction.started":
                 self._header = "Compacting"
+                self._details = None
             elif event_type == "context_compaction.completed":
                 self._header = "Working"
+                self._details = None
             elif event_type == "model.request":
                 self._header = "Compacting" if payload.get("compact") else "Working"
+                self._details = None
             elif event_type == "stream_error":
                 self._header = "Reconnecting"
+                self._details = None
+            elif event_type == "tool.completed" and payload.get("name") == "exec_command":
+                metadata = payload.get("metadata")
+                meta = metadata if isinstance(metadata, dict) else {}
+                session_id = meta.get("session_id")
+                command = meta.get("command") or meta.get("cmd")
+                if session_id is not None and isinstance(command, str) and command:
+                    self._background_terminal_commands[str(session_id)] = _command_display(command)
             elif event_type == "tool.started" and payload.get("name") == "write_stdin":
                 arguments = payload.get("arguments")
                 args = arguments if isinstance(arguments, dict) else {}
-                self._header = "Waiting for background terminal" if not args.get("chars") else "Working"
+                if args.get("chars"):
+                    self._header = "Working"
+                    self._details = None
+                else:
+                    self._header = "Waiting for background terminal"
+                    session_id = args.get("session_id")
+                    self._details = (
+                        self._background_terminal_commands.get(str(session_id))
+                        if session_id is not None
+                        else None
+                    )
             elif event_type in {"tool.started", "tool.completed", "item.completed", "model.response"} and not payload.get("compact"):
                 if self._header in {"Compacting", "Reconnecting"}:
                     self._header = "Working"
+                    self._details = None
+                elif self._header != "Waiting for background terminal":
+                    self._details = None
 
     def snapshot(
         self,
@@ -2693,7 +2809,10 @@ class _LiveTurnStatus:
     ) -> _LiveTurnStatusSnapshot:
         with self._lock:
             header = self._header
-            elapsed = max(0, int(time.monotonic() - self._started_at))
+            details = self._details
+            elapsed_raw = max(0.0, time.monotonic() - self._started_at)
+            elapsed = int(elapsed_raw)
+            animation_millis = int(elapsed_raw * 1000)
         (
             active_context,
             active_context_estimated,
@@ -2716,17 +2835,27 @@ class _LiveTurnStatus:
             context_window=context_window,
             finished=finished,
             outcome=outcome,
+            details=details,
+            animation_millis=animation_millis,
         )
 
 
 class _TurnInputReader:
-    def __init__(self, *, enabled: bool, color_mode: str = "auto") -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        color_mode: str = "auto",
+        initial_text: str = "",
+        initial_cursor: int | None = None,
+    ) -> None:
         self.enabled = enabled
         self._fd: int | None = None
         self._old_attrs: list[Any] | None = None
         self._style = _AnsiStyle(_should_use_color(color_mode))
-        self._buffer = ""
-        self._cursor = 0
+        self._buffer = initial_text
+        cursor = len(initial_text) if initial_cursor is None else initial_cursor
+        self._cursor = max(0, min(len(initial_text), cursor))
         self._pending = b""
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._kill_buffer = ""
@@ -2795,8 +2924,8 @@ class _TurnInputReader:
     def render(self) -> None:
         if not self.enabled:
             return
-        prompt_lines = _prompt_display_lines(self._buffer, self._style)
         cols = _terminal_columns()
+        prompt_lines = _prompt_display_lines(self._buffer, self._style, width=cols, boxed=True)
         slash_lines = _slash_palette_display_lines(
             self._buffer,
             self._cursor,
@@ -2805,20 +2934,28 @@ class _TurnInputReader:
             style=self._style,
             width=cols,
         )
-        lines = [*self._status_lines, *prompt_lines, *slash_lines]
+        status_block = _composer_status_block(self._status_lines)
+        lines = [*status_block, *prompt_lines, *slash_lines]
         self.clear()
         print("\n".join(lines), end="", file=sys.stderr, flush=True)
         self._rendered_lines = _prompt_screen_rows(lines, cols)
-        status_rows = _prompt_screen_rows(self._status_lines, cols)
+        status_rows = _prompt_screen_rows(status_block, cols)
+        prompt_top_rows = _composer_prompt_top_rows(self._buffer, boxed=True)
         cursor_row = _prompt_cursor_screen_row(
             self._buffer,
             self._cursor,
             self._rendered_lines,
             cols,
-            prefix_rows=status_rows,
+            prefix_rows=status_rows + prompt_top_rows,
         )
         self._rendered_rows_below_cursor = max(0, self._rendered_lines - 1 - cursor_row)
-        _move_prompt_cursor(self._buffer, self._cursor, self._rendered_lines, cols, prefix_rows=status_rows)
+        _move_prompt_cursor(
+            self._buffer,
+            self._cursor,
+            self._rendered_lines,
+            cols,
+            prefix_rows=status_rows + prompt_top_rows,
+        )
         self._dirty = False
 
     def set_status(self, snapshot: _LiveTurnStatusSnapshot | None) -> None:
@@ -2839,6 +2976,12 @@ class _TurnInputReader:
         self._rendered_lines = 0
         self._rendered_rows_below_cursor = 0
         self._dirty = False
+
+    def draft_text(self) -> str:
+        return self._buffer
+
+    def draft_cursor(self) -> int:
+        return self._cursor
 
     def suspend(self) -> None:
         if not self.enabled or self._fd is None:
@@ -3052,9 +3195,18 @@ def _print_cli_error(exc: Exception) -> None:
     print(f"ERROR: {_exception_display_message(exc)}", file=sys.stderr)
 
 
-def _read_interactive_prompt(*, color_mode: str = "auto") -> str | None:
+def _read_interactive_prompt(
+    *,
+    color_mode: str = "auto",
+    initial_text: str = "",
+    initial_cursor: int | None = None,
+) -> str | None:
     if sys.stdin.isatty() and sys.stderr.isatty():
-        prompt = _read_tty_prompt(color_mode=color_mode)
+        prompt = _read_tty_prompt(
+            color_mode=color_mode,
+            initial_text=initial_text,
+            initial_cursor=initial_cursor,
+        )
         if prompt is not None:
             return prompt
 
@@ -3078,24 +3230,35 @@ def _read_interactive_prompt_with_shared_runtime(
     shared_runtime: "_SharedRemoteRuntime",
     *,
     color_mode: str = "auto",
+    initial_text: str = "",
+    initial_cursor: int | None = None,
 ) -> str | None:
     if not (sys.stdin.isatty() and sys.stderr.isatty()):
-        return _read_interactive_prompt(color_mode=color_mode)
+        return _read_interactive_prompt(
+            color_mode=color_mode,
+            initial_text=initial_text,
+            initial_cursor=initial_cursor,
+        )
     output: "queue.Queue[str]" = queue.Queue()
     renderer = _HumanEventRenderer(color_mode=color_mode, line_sink=output.put)
-    with _TurnInputReader(enabled=True, color_mode=color_mode) as reader:
+    with _TurnInputReader(
+        enabled=True,
+        color_mode=color_mode,
+        initial_text=initial_text,
+        initial_cursor=initial_cursor,
+    ) as reader:
         reader.render()
         while True:
             shared_runtime.drain(renderer, color_mode=color_mode, input_reader=reader)
             _drain_output_queue(output, input_reader=reader)
-            if not reader.output_partial_line_open:
+            if not reader.output_partial_line_open and output.empty():
                 reader.set_status(None)
             for action in reader.poll():
                 if action.kind == "interrupt":
-                    reader.clear()
                     session.interrupt()
                     renderer.render_interrupted()
                     _drain_output_queue(output, input_reader=reader)
+                    reader.render()
                 elif action.kind == "submit":
                     shared_runtime.drain(renderer, color_mode=color_mode, input_reader=reader)
                     _drain_output_queue(output, input_reader=reader)
@@ -3103,7 +3266,12 @@ def _read_interactive_prompt_with_shared_runtime(
             time.sleep(0.03)
 
 
-def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
+def _read_tty_prompt(
+    *,
+    color_mode: str = "auto",
+    initial_text: str = "",
+    initial_cursor: int | None = None,
+) -> str | None:
     style = _AnsiStyle(_should_use_color(color_mode))
     try:
         fd = sys.stdin.fileno()
@@ -3111,8 +3279,9 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
     except Exception:
         return None
 
-    buffer = ""
-    cursor = 0
+    buffer = initial_text
+    requested_cursor = len(initial_text) if initial_cursor is None else initial_cursor
+    cursor = max(0, min(len(initial_text), requested_cursor))
     kill_buffer = ""
     rendered_lines = 0
     rendered_rows_below_cursor = 0
@@ -3158,8 +3327,8 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
 
     def render() -> None:
         nonlocal rendered_lines, rendered_rows_below_cursor
-        lines = _prompt_display_lines(buffer, style)
         cols = _terminal_columns()
+        lines = _prompt_display_lines(buffer, style, width=cols, boxed=True)
         lines.extend(
             _slash_palette_display_lines(
                 buffer,
@@ -3173,9 +3342,10 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
         _clear_prompt_lines(rendered_lines, rows_below_cursor=rendered_rows_below_cursor)
         print("\n".join(lines), end="", file=sys.stderr, flush=True)
         rendered_lines = _prompt_screen_rows(lines, cols)
-        cursor_row = _prompt_cursor_screen_row(buffer, cursor, rendered_lines, cols)
+        prompt_top_rows = _composer_prompt_top_rows(buffer, boxed=True)
+        cursor_row = _prompt_cursor_screen_row(buffer, cursor, rendered_lines, cols, prefix_rows=prompt_top_rows)
         rendered_rows_below_cursor = max(0, rendered_lines - 1 - cursor_row)
-        _move_prompt_cursor(buffer, cursor, rendered_lines, cols)
+        _move_prompt_cursor(buffer, cursor, rendered_lines, cols, prefix_rows=prompt_top_rows)
         state["dirty"] = False
 
     def request_render() -> None:
@@ -3317,13 +3487,91 @@ def _read_tty_prompt(*, color_mode: str = "auto") -> str | None:
         sys.stderr.flush()
 
 
-def _prompt_display_lines(text: str, style: "_AnsiStyle") -> list[str]:
+_COMPOSER_PLACEHOLDER = "Ask Codex to do anything"
+_USER_MESSAGE_BG_RGB = (244, 244, 244)
+_USER_MESSAGE_FG_RGB = (28, 28, 28)
+
+
+def _prompt_display_lines(
+    text: str,
+    style: "_AnsiStyle",
+    *,
+    width: int | None = None,
+    boxed: bool = False,
+) -> list[str]:
+    prompt_prefix = (
+        f"{style.composer_bold('›')}{style.user_message(' ')}"
+        if boxed
+        else f"{style.bold('›')} "
+    )
     if text == "":
-        return [f"{style.bold('›')} "]
+        rendered = prompt_prefix
+        rendered += style.composer_dim(_COMPOSER_PLACEHOLDER) if boxed else style.dim(_COMPOSER_PLACEHOLDER)
+        return _composer_block_lines([rendered], style=style, width=width) if boxed else [rendered]
     lines = text.split("\n")
-    rendered = [f"{style.bold('›')} {lines[0]}"]
-    rendered.extend(f"  {line}" for line in lines[1:])
+    rendered = [
+        f"{prompt_prefix}{style.composer(lines[0]) if boxed else lines[0]}"
+    ]
+    rendered.extend(
+        f"{style.composer('  ') if boxed else '  '}{style.composer(line) if boxed else line}"
+        for line in lines[1:]
+    )
+    if boxed:
+        rendered = _composer_block_lines(rendered, style=style, width=width)
     return rendered
+
+
+def _composer_block_lines(text_lines: list[str], *, style: "_AnsiStyle", width: int | None) -> list[str]:
+    # Upstream ChatComposer reserves a composer rect with top/bottom padding:
+    # textarea.desired_height(inner_width) + 2. Render the same shape in the
+    # inline fallback so the input appears as a region, not a one-row stripe.
+    blank = _composer_blank_line(style=style, width=width)
+    body = [_composer_box_line(line, style=style, width=width) for line in text_lines]
+    return [blank, *body, blank]
+
+
+def _composer_blank_line(*, style: "_AnsiStyle", width: int | None) -> str:
+    target = _composer_box_width(width)
+    return style.user_message(" " * target) if target > 0 else style.user_message("")
+
+
+def _composer_box_line(line: str, *, style: "_AnsiStyle", width: int | None) -> str:
+    target = _composer_box_width(width)
+    if target <= 0:
+        return line
+    padding = target - _visible_len(line)
+    if padding <= 0:
+        return line
+    return f"{line}{style.user_message(' ' * padding)}"
+
+
+def _user_message_blank_line(style: "_AnsiStyle", width: int) -> str:
+    target = _composer_box_width(width)
+    return style.user_message(" " * target) if target > 0 else style.user_message("")
+
+
+def _user_message_box_line(line: str, style: "_AnsiStyle", width: int) -> str:
+    return _composer_box_line(line, style=style, width=width)
+
+
+def _composer_box_width(width: int | None) -> int:
+    if width is None or width <= 0:
+        return 0
+    # Avoid writing into the terminal's last column; many terminals auto-wrap
+    # after that cell, which would make prompt clearing leave artifacts.
+    return max(1, width - 1)
+
+
+def _composer_prompt_top_rows(text: str, *, boxed: bool) -> int:
+    return 1 if boxed else 0
+
+
+def _composer_status_block(status_lines: list[str]) -> list[str]:
+    if not status_lines:
+        return []
+    # Latest upstream bottom-pane snapshots reserve a blank row above the live
+    # status. The composer itself contributes the padded blank row below.
+    return ["", *status_lines, ""]
 
 
 def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: "_AnsiStyle") -> list[str]:
@@ -3333,8 +3581,11 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
     if snapshot.finished:
         parts = [style.dim(f"  {_finished_status_label(snapshot)} {elapsed}")]
     else:
+        indicator = _activity_indicator(snapshot.animation_millis, style)
+        header = _animated_status_header(snapshot.header, snapshot.animation_millis, style)
+        prefix = f"{indicator} " if indicator else ""
         parts = [
-            f"{style.dim('•')} {style.bold(snapshot.header)} "
+            f"{prefix}{header} "
             f"{style.dim(f'({elapsed} • esc to interrupt)')}",
         ]
     metric_parts: list[str] = []
@@ -3360,9 +3611,29 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
     line = "".join(parts)
     width = _terminal_columns()
     wrapped = _wrap_ansi_line(line, max(20, width))
-    if len(wrapped) <= 1:
-        return wrapped
-    return [wrapped[0], *[f"  {style.dim(line)}" for line in wrapped[1:]]]
+    lines = wrapped if len(wrapped) <= 1 else [wrapped[0], *[f"  {style.dim(line)}" for line in wrapped[1:]]]
+    if snapshot.details and not snapshot.finished:
+        lines.append(_status_details_line(snapshot.details, style=style, width=width))
+    return lines
+
+
+def _activity_indicator(animation_millis: int, style: "_AnsiStyle") -> str:
+    if not style.enabled:
+        return ""
+    blink_on = (max(0, int(animation_millis)) // 600) % 2 == 0
+    return style.marker() if blink_on else style.marker_off()
+
+
+def _animated_status_header(text: str, animation_millis: int, style: "_AnsiStyle") -> str:
+    del animation_millis
+    return style.bold(text)
+
+
+def _status_details_line(details: str, *, style: "_AnsiStyle", width: int) -> str:
+    collapsed = " ".join(str(details).split())
+    prefix = "  └ "
+    detail_width = max(1, width - _visible_len(prefix))
+    return f"{style.dim(prefix)}{style.dim(_truncate_display_text(collapsed, detail_width))}"
 
 
 def _print_finished_turn_status(
@@ -5805,6 +6076,7 @@ class _HumanEventRenderer:
         self._live_exec_output_text: dict[str, str] = {}
         self._live_exec_regions: dict[str, _LiveExecRegion] = {}
         self._live_exec_panel_rows = 0
+        self._live_exec_panel_needs_leading_gap = False
         self._exploration_calls: list[_ExecDisplayCall] = []
         self._final_message: str = ""
         self._final_message_rendered = False
@@ -5853,7 +6125,7 @@ class _HumanEventRenderer:
             text = f"{message} {self._style.dim(hint)}"
         self._emit_prefixed_lines(
             [text],
-            first_prefix=f"{self._style.dim('•')} ",
+            first_prefix=f"{self._style.marker()} ",
             rest_prefix="  ",
         )
 
@@ -5891,11 +6163,32 @@ class _HumanEventRenderer:
                 continue
             lines.extend(_wrap_ansi_line(raw_line, max(10, terminal_width - 2)))
         self._begin_cell()
+        if self._style.enabled:
+            self._emit_user_message_block(lines, terminal_width=terminal_width)
+            return
         self._emit_prefixed_lines(
             lines,
             first_prefix=self._style.dim(self._style.bold("› ")),
             rest_prefix="  ",
         )
+
+    def _emit_user_message_block(self, lines: list[str], *, terminal_width: int) -> None:
+        self._line(_user_message_blank_line(self._style, terminal_width))
+        first = True
+        for logical_line in lines:
+            if logical_line == "":
+                self._line(_user_message_blank_line(self._style, terminal_width))
+                first = False
+                continue
+            prefix = (
+                self._style.user_message_bold_dim("› ")
+                if first
+                else self._style.user_message("  ")
+            )
+            body = self._style.user_message(logical_line)
+            self._line(_user_message_box_line(f"{prefix}{body}", self._style, terminal_width))
+            first = False
+        self._line(_user_message_blank_line(self._style, terminal_width))
 
     def render_pending_input_preview(self, text: str, *, active: bool) -> None:
         normalized = text.rstrip("\r\n")
@@ -5910,7 +6203,7 @@ class _HumanEventRenderer:
             lines.extend(_wrap_ansi_line(raw_line, max(10, terminal_width - 4)))
         self._begin_cell()
         header = "Messages to be submitted after next tool call" if active else "Queued follow-up inputs"
-        self._line(f"{self._style.dim('•')} {self._style.bold(header)}")
+        self._line(f"{self._style.marker()} {self._style.bold(header)}")
         self._emit_prefixed_lines(
             lines,
             first_prefix=self._style.dim("  ↳ "),
@@ -5990,6 +6283,13 @@ class _HumanEventRenderer:
                     "stdin": str(args.get("chars") or ""),
                     "command": self._background_terminal_commands.get(session_id, ""),
                 }
+                if event_call_id in self._live_exec_regions:
+                    self._ensure_live_exec_region(
+                        event_call_id,
+                        kind="background",
+                        command=self._background_terminal_commands.get(session_id, ""),
+                        stdin=str(args.get("chars") or ""),
+                    )
             return
         elif name == "apply_patch":
             return
@@ -6033,7 +6333,7 @@ class _HumanEventRenderer:
                 if ok:
                     self._emit_prefixed_lines(
                         [f"{self._style.bold('Request user input')} {self._style.green('completed')}"],
-                        first_prefix=f"{self._style.dim('•')} ",
+                        first_prefix=f"{self._style.marker()} ",
                         rest_prefix="  ",
                     )
                 else:
@@ -6054,7 +6354,7 @@ class _HumanEventRenderer:
                 self._begin_work_cell()
                 self._emit_prefixed_lines(
                     [f"{self._style.bold(_tool_display_title(name))} {self._style.green('completed')}"],
-                    first_prefix=f"{self._style.dim('•')} ",
+                    first_prefix=f"{self._style.marker()} ",
                     rest_prefix="  ",
                 )
             else:
@@ -6084,7 +6384,7 @@ class _HumanEventRenderer:
             )
 
     def _collab_title_text(self, title: str) -> str:
-        return f"{self._style.dim('•')} {self._style.bold(title)}"
+        return f"{self._style.marker()} {self._style.bold(title)}"
 
     def _collab_title(
         self,
@@ -6094,7 +6394,7 @@ class _HumanEventRenderer:
         *,
         spawn_args: Any | None = None,
     ) -> str:
-        title = f"{self._style.dim('•')} {self._style.bold(prefix)} {self._agent_label(agent_id, nickname)}"
+        title = f"{self._style.marker()} {self._style.bold(prefix)} {self._agent_label(agent_id, nickname)}"
         if spawn_args is not None:
             extra = self._collab_spawn_request(spawn_args)
             if extra:
@@ -6298,7 +6598,7 @@ class _HumanEventRenderer:
         text = " ".join(part for part in [self._style.bold(header), detail or query] if part)
         self._emit_prefixed_lines(
             [text],
-            first_prefix=f"{self._style.dim('•')} ",
+            first_prefix=f"{self._style.marker()} ",
             rest_prefix="  ",
         )
 
@@ -6319,7 +6619,7 @@ class _HumanEventRenderer:
             )
         self._emit_prefixed_lines(
             [self._style.bold(summary), *details],
-            first_prefix=f"{self._style.dim('•')} ",
+            first_prefix=f"{self._style.marker()} ",
             rest_prefix="  ",
         )
 
@@ -6343,7 +6643,17 @@ class _HumanEventRenderer:
             if ok:
                 output = _visible_command_output(meta, payload)
                 should_render_interaction = bool(str(args.get("chars") or "").strip()) or bool(output.strip())
-                if should_render_interaction and event_call_id not in self._rendered_background_terminal_interactions:
+                process_still_running = _int_value(meta.get("exit_code")) is None
+                has_live_region = (
+                    event_call_id in self._live_exec_regions
+                    or event_call_id in self._live_exec_output_seen
+                )
+                if (
+                    should_render_interaction
+                    and not process_still_running
+                    and not has_live_region
+                    and event_call_id not in self._rendered_background_terminal_interactions
+                ):
                     self.render_terminal_interaction(session_id, str(args.get("chars") or ""), command=command)
                 self._render_write_stdin_exec_completion(
                     call_id,
@@ -6394,9 +6704,9 @@ class _HumanEventRenderer:
             self._detach_live_exec_region(call_id, commit_if_last=False)
             suppress_empty_output = False
         elif live_output_seen:
-            call.output = self._remaining_live_exec_output(call_id, output)
-            self._detach_live_exec_region(call_id, commit_if_last=True)
-            suppress_empty_output = True
+            call.output = output or self._live_exec_output_text.get(call_id, "")
+            self._detach_live_exec_region(call_id, commit_if_last=False)
+            suppress_empty_output = not bool(call.output.strip())
         else:
             call.output = output
             suppress_empty_output = False
@@ -6406,10 +6716,6 @@ class _HumanEventRenderer:
             self._clear_live_exec(call_id)
             return
         if live_output_seen and exit_value is None:
-            if self._live_exec_has_other_regions(call_id):
-                self._render_exec_call(call, running=True, ok=True)
-                self._render_live_exec_panel()
-            self._clear_live_exec_metadata(call_id)
             return
         if exit_value is not None and call.is_exploration and not live_output_seen:
             self._exploration_calls.append(call)
@@ -6459,6 +6765,13 @@ class _HumanEventRenderer:
                     command = self._background_terminal_call_commands.get(call_id, "")
                     call = _ExecDisplayCall(call_id=call_id, command=command, parsed=parse_command_actions(command))
                 self._ensure_live_exec_region(call_id, kind="exec", command=call.command)
+        elif interaction is not None:
+            self._ensure_live_exec_region(
+                call_id,
+                kind="background",
+                command=interaction.get("command", ""),
+                stdin=interaction.get("stdin", ""),
+            )
         self._live_exec_rendered.add(call_id)
         self._live_exec_output_seen.add(call_id)
         self._live_exec_output_text[call_id] = self._live_exec_output_text.get(call_id, "") + delta
@@ -6508,19 +6821,18 @@ class _HumanEventRenderer:
         live_output_seen = event_call_id in self._live_exec_output_seen
         if exit_value is None:
             if live_output_seen:
-                final_output = self._live_exec_final_output(event_call_id, output)
-                if self._live_exec_has_other_regions(event_call_id):
-                    self._detach_live_exec_region(event_call_id, commit_if_last=False)
-                    self.render_terminal_interaction(session_id, stdin, command=command)
-                    if final_output.strip():
-                        self._render_output_block(final_output)
-                    self._render_live_exec_panel()
-                else:
-                    self._detach_live_exec_region(event_call_id, commit_if_last=True)
-                self._clear_live_exec_metadata(event_call_id)
                 return
             if output.strip():
-                self._render_output_block(output)
+                self._ensure_live_exec_region(event_call_id, kind="background", command=command, stdin=stdin)
+                self._live_exec_rendered.add(event_call_id)
+                self._live_exec_output_seen.add(event_call_id)
+                self._live_exec_output_text[event_call_id] = self._live_exec_output_text.get(event_call_id, "") + output
+                self._render_live_exec_panel()
+                return
+            if stdin.strip():
+                self._ensure_live_exec_region(event_call_id, kind="background", command=command, stdin=stdin)
+                self._live_exec_rendered.add(event_call_id)
+                self._render_live_exec_panel()
             return
         if session_id:
             self._background_terminal_commands.pop(session_id, None)
@@ -6535,9 +6847,9 @@ class _HumanEventRenderer:
             self._detach_live_exec_region(event_call_id, commit_if_last=False)
             suppress_empty_output = False
         elif live_output_seen:
-            call.output = self._remaining_live_exec_output(event_call_id, output)
-            self._detach_live_exec_region(event_call_id, commit_if_last=True)
-            suppress_empty_output = True
+            call.output = output or self._live_exec_output_text.get(event_call_id, "")
+            self._detach_live_exec_region(event_call_id, commit_if_last=False)
+            suppress_empty_output = not bool(call.output.strip())
         else:
             call.output = output
             suppress_empty_output = False
@@ -6585,14 +6897,14 @@ class _HumanEventRenderer:
             change = changes[0]
             verb = {"add": "Added", "delete": "Deleted"}.get(change.kind, "Edited")
             self._line(
-                f"{self._style.dim('•')} {self._style.bold(verb)} "
+                f"{self._style.marker()} {self._style.bold(verb)} "
                 f"{_file_change_path_label(change)} (+{change.additions} -{change.deletions})"
             )
             self._render_file_change_rows(change)
             return
         noun = "file" if len(changes) == 1 else "files"
         self._line(
-            f"{self._style.dim('•')} {self._style.bold('Edited')} {len(changes)} {noun} "
+            f"{self._style.marker()} {self._style.bold('Edited')} {len(changes)} {noun} "
             f"(+{total_added} -{total_deleted})"
         )
         for index, change in enumerate(changes):
@@ -6632,13 +6944,13 @@ class _HumanEventRenderer:
         command_lines = _command_display_lines(call.command, self._style)
         if running:
             title = "Running"
-            bullet = self._style.cyan("•")
+            bullet = self._style.marker("cyan")
         elif call.exit_code == 0 and ok:
             title = "Ran"
-            bullet = self._style.green("•")
+            bullet = self._style.marker("green")
         else:
             title = "Ran"
-            bullet = self._style.red("•")
+            bullet = self._style.marker("red")
         header_prefix = f"{bullet} {self._style.bold(title)} "
         self._emit_limited_prefixed_lines(
             command_lines,
@@ -6662,7 +6974,7 @@ class _HumanEventRenderer:
         calls = self._exploration_calls
         self._exploration_calls = []
         self._begin_work_cell()
-        self._line(f"{self._style.dim('•')} {self._style.bold('Explored')}")
+        self._line(f"{self._style.marker()} {self._style.bold('Explored')}")
         rows: list[tuple[str, str]] = []
         while calls:
             call = calls.pop(0)
@@ -6711,7 +7023,7 @@ class _HumanEventRenderer:
             head,
             first_prefix=self._style.dim("  └ "),
             rest_prefix=self._style.dim("    "),
-            transform=self._style.dim,
+            transform=lambda segment: _dim_command_output_segment(segment, self._style),
         )
         if omitted:
             self._line(self._style.dim(f"    {_ellipsis_text(omitted, transcript_hint=True)}"))
@@ -6719,7 +7031,7 @@ class _HumanEventRenderer:
                 tail,
                 first_prefix=self._style.dim("    "),
                 rest_prefix=self._style.dim("    "),
-                transform=self._style.dim,
+                transform=lambda segment: _dim_command_output_segment(segment, self._style),
             )
 
     def _render_tool_failure(self, name: str, output: str = "") -> None:
@@ -6728,7 +7040,7 @@ class _HumanEventRenderer:
         title = f"{_tool_display_title(name)} failed"
         self._emit_prefixed_lines(
             [self._style.bold(title)],
-            first_prefix=f"{self._style.red('•')} ",
+            first_prefix=f"{self._style.marker('red')} ",
             rest_prefix="  ",
         )
         if output.strip():
@@ -6744,6 +7056,8 @@ class _HumanEventRenderer:
     ) -> None:
         region = self._live_exec_regions.get(call_id)
         if region is not None:
+            if kind == "background":
+                region.kind = "background"
             if command and not region.command:
                 region.command = command
             if stdin and not region.stdin:
@@ -6772,8 +7086,11 @@ class _HumanEventRenderer:
         self._clear_live_exec_panel()
         if not rows:
             return
-        self._write("\n".join(rows) + "\n", partial_line_open=False)
-        self._live_exec_panel_rows = len(rows)
+        leading_gap = self._live_exec_panel_needs_leading_gap
+        self._live_exec_panel_needs_leading_gap = False
+        text = ("\n" if leading_gap else "") + "\n".join(rows) + "\n"
+        self._write(text, partial_line_open=False, live_op="live_panel")
+        self._live_exec_panel_rows = len(rows) + (1 if leading_gap else 0)
 
     def _live_exec_panel_display_rows(self) -> list[str]:
         terminal_width = shutil.get_terminal_size((100, 24)).columns
@@ -6806,7 +7123,7 @@ class _HumanEventRenderer:
     def _live_exec_command_header_rows(self, command: str, terminal_width: int) -> list[str]:
         return self._prefixed_wrapped_rows(
             _command_display_lines(command, self._style),
-            first_prefix=f"{self._style.cyan('•')} {self._style.bold('Running')} ",
+            first_prefix=f"{self._style.marker('cyan')} {self._style.bold('Running')} ",
             rest_prefix=self._style.dim("  │ "),
             max_lines=5,
             ellipsis_prefix=self._style.dim("  │ "),
@@ -6820,7 +7137,7 @@ class _HumanEventRenderer:
         command_display: str,
         terminal_width: int,
     ) -> list[str]:
-        prefix = f"{self._style.dim(marker)} "
+        prefix = f"{self._style.marker()} " if marker == "•" else f"{self._style.dim(marker)} "
         line = self._style.bold(label)
         command_snapshot = _terminal_interaction_command_snapshot(
             command_display,
@@ -6866,12 +7183,18 @@ class _HumanEventRenderer:
             return rows
         return [f"{prefix}{segment}" for prefix, segment in rendered]
 
-    def _clear_live_exec_panel(self) -> None:
+    def _clear_live_exec_panel(self, *, leading_gap_after_clear: bool = False) -> None:
         if self._live_exec_panel_rows <= 0:
             self._live_exec_panel_rows = 0
             return
-        self._write(_clear_rendered_block_sequence(self._live_exec_panel_rows), partial_line_open=False)
+        self._write(
+            _clear_rendered_block_sequence(self._live_exec_panel_rows),
+            partial_line_open=False,
+            live_op="live_clear",
+        )
         self._live_exec_panel_rows = 0
+        if leading_gap_after_clear:
+            self._live_exec_panel_needs_leading_gap = True
 
     def _live_exec_has_other_regions(self, call_id: str) -> bool:
         return any(active_call_id != call_id for active_call_id in self._live_exec_regions)
@@ -6920,10 +7243,10 @@ class _HumanEventRenderer:
 
     def _finish_all_live_output_lines(self) -> None:
         if self._live_exec_regions:
-            self._clear_live_exec_panel()
+            self._clear_live_exec_panel(leading_gap_after_clear=True)
 
     def _render_plan(self, meta: dict[str, Any]) -> None:
-        self._line(f"{self._style.dim('•')} {self._style.bold('Updated Plan')}")
+        self._line(f"{self._style.marker()} {self._style.bold('Updated Plan')}")
         explanation = meta.get("explanation")
         indented: list[tuple[str, Any | None]] = []
         if isinstance(explanation, str) and explanation.strip():
@@ -6976,7 +7299,7 @@ class _HumanEventRenderer:
             if isinstance(question, dict)
             and _request_user_input_answer_list(answers.get(str(question.get("id") or "")))
         )
-        header = f"{self._style.dim('•')} {self._style.bold('Questions')} {self._style.dim(f'{answered}/{total} answered')}"
+        header = f"{self._style.marker()} {self._style.bold('Questions')} {self._style.dim(f'{answered}/{total} answered')}"
         if interrupted:
             header += f" {self._style.cyan('(interrupted)')}"
         self._line(header)
@@ -7038,7 +7361,8 @@ class _HumanEventRenderer:
         if not lines:
             return
         self._begin_cell()
-        self._emit_prefixed_lines(lines, first_prefix=f"{self._style.magenta('•')} ", rest_prefix="  ")
+        self._emit_prefixed_lines(lines, first_prefix=f"{self._style.marker('magenta')} ", rest_prefix="  ")
+        self._render_live_exec_panel()
 
     def _render_reasoning_message(self, text: str) -> None:
         terminal_width = shutil.get_terminal_size((100, 24)).columns
@@ -7048,10 +7372,11 @@ class _HumanEventRenderer:
         self._begin_cell()
         self._emit_prefixed_lines(
             lines,
-            first_prefix=f"{self._style.dim('•')} ",
+            first_prefix=f"{self._style.marker()} ",
             rest_prefix="  ",
             transform=self._style.dim,
         )
+        self._render_live_exec_panel()
 
     def _render_final_separator(self) -> None:
         self._begin_cell()
@@ -7128,9 +7453,9 @@ class _HumanEventRenderer:
             return
         print(text, file=sys.stderr, flush=True)
 
-    def _write(self, text: str, *, partial_line_open: bool) -> None:
+    def _write(self, text: str, *, partial_line_open: bool, live_op: str | None = None) -> None:
         if self._line_sink is not None:
-            self._line_sink(_ConsoleWrite(text, partial_line_open=partial_line_open))
+            self._line_sink(_ConsoleWrite(text, partial_line_open=partial_line_open, live_op=live_op))
             return
         sys.stderr.write(text)
         sys.stderr.flush()
@@ -7526,6 +7851,9 @@ class _AnsiStyle:
     def green(self, text: str) -> str:
         return self._wrap("32", text)
 
+    def blue(self, text: str) -> str:
+        return self._wrap("34", text)
+
     def yellow(self, text: str) -> str:
         return self._wrap("33", text)
 
@@ -7538,13 +7866,66 @@ class _AnsiStyle:
     def magenta(self, text: str) -> str:
         return self._wrap("35", text)
 
+    def marker(self, color: str = "dim") -> str:
+        codes = {
+            "dim": "1;90",
+            "green": "1;32",
+            "yellow": "1;33",
+            "red": "1;31",
+            "cyan": "1;36",
+            "magenta": "1;35",
+        }
+        return self._wrap(codes.get(color, "1;90"), "•")
+
+    def marker_off(self) -> str:
+        return self._wrap("2;90", "•")
+
+    def fg256(self, color: int, text: str) -> str:
+        return self._wrap(f"38;5;{color}", text)
+
+    def fg256_bold(self, color: int, text: str) -> str:
+        return self._wrap(f"1;38;5;{color}", text)
+
+    def fg_rgb(self, red: int, green: int, blue: int, text: str) -> str:
+        return self._wrap(f"38;2;{red};{green};{blue}", text)
+
+    def fg_rgb_bold(self, red: int, green: int, blue: int, text: str) -> str:
+        return self._wrap(f"1;38;2;{red};{green};{blue}", text)
+
     def inverse(self, text: str) -> str:
         return self._wrap("7", text)
+
+    def composer(self, text: str) -> str:
+        return self.user_message(text)
+
+    def composer_bold(self, text: str) -> str:
+        return self.user_message_bold(text)
+
+    def composer_dim(self, text: str) -> str:
+        return self.user_message_dim(text)
+
+    def user_message(self, text: str) -> str:
+        return self._wrap(_user_message_style_code(), text)
+
+    def user_message_bold(self, text: str) -> str:
+        return self._wrap(f"1;{_user_message_style_code()}", text)
+
+    def user_message_dim(self, text: str) -> str:
+        return self._wrap(f"2;{_user_message_style_code()}", text)
+
+    def user_message_bold_dim(self, text: str) -> str:
+        return self._wrap(f"1;2;{_user_message_style_code()}", text)
 
     def _wrap(self, code: str, text: str) -> str:
         if not self.enabled or not text:
             return text
         return f"\033[{code}m{text}\033[0m"
+
+
+def _user_message_style_code() -> str:
+    fg_r, fg_g, fg_b = _USER_MESSAGE_FG_RGB
+    bg_r, bg_g, bg_b = _USER_MESSAGE_BG_RGB
+    return f"38;2;{fg_r};{fg_g};{fg_b};48;2;{bg_r};{bg_g};{bg_b}"
 
 
 def _should_use_color(color_mode: str) -> bool:
@@ -7656,6 +8037,14 @@ def _ellipsis_text(omitted: int, *, transcript_hint: bool = False) -> str:
     return f"… +{omitted} lines{suffix}"
 
 
+def _dim_command_output_segment(segment: str, style: "_AnsiStyle") -> str:
+    if not segment:
+        return segment
+    if _ANSI_RE.search(segment):
+        return segment
+    return style.dim(segment)
+
+
 def _truncate_middle_parts(lines: list[str], max_lines: int) -> tuple[list[str], list[str], int]:
     if len(lines) <= max_lines:
         return lines, [], 0
@@ -7699,7 +8088,7 @@ def _live_output_display_rows(output: str, style: "_AnsiStyle", terminal_width: 
         wrapped = _wrap_ansi_line(logical_line, available)
         for index, segment in enumerate(wrapped):
             current_prefix = prefix if index == 0 else rest_prefix
-            rows.append(f"{current_prefix}{style.dim(segment)}")
+            rows.append(f"{current_prefix}{_dim_command_output_segment(segment, style)}")
             first = False
     max_rows = 5
     if len(rows) <= max_rows:
@@ -7858,16 +8247,23 @@ _CODEX_THEME_TO_PYGMENTS = {
     "coldark-cold": "friendly",
     "coldark-dark": "native",
     "dark-neon": "native",
+    "dracula": "dracula",
     "github": "github-dark",
+    "gruvbox-dark": "gruvbox-dark",
+    "gruvbox-light": "gruvbox-light",
     "inspired-github": "github-dark",
     "monokai-extended": "monokai",
     "monokai-extended-bright": "monokai",
     "monokai-extended-light": "monokai",
     "monokai-extended-origin": "monokai",
+    "nord": "nord",
     "one-half-dark": "one-dark",
     "one-half-light": "default",
+    "solarized-dark": "solarized-dark",
+    "solarized-light": "solarized-light",
     "sublime-snazzy": "monokai",
     "two-dark": "native",
+    "zenburn": "zenburn",
 }
 
 
@@ -8327,10 +8723,135 @@ def _command_display(command: str) -> str:
 
 def _command_display_lines(command: str, style: _AnsiStyle) -> list[str]:
     display = _command_display(command)
-    highlighted = _highlight_code_for_terminal(display, "bash", style)
-    if highlighted is not None:
-        return highlighted
+    if style.enabled:
+        highlighted = _highlight_code_for_terminal(display, "bash", style)
+        if highlighted is not None and not _bash_highlight_is_low_contrast(highlighted):
+            return highlighted
+        fallback = _highlight_shell_command_for_terminal(display, style)
+        if fallback:
+            return fallback
+        if highlighted is not None:
+            return highlighted
     return display.splitlines() or [display]
+
+
+_SHELL_TOKEN_RE = re.compile(
+    r"""
+    (?P<space>\s+)
+    |(?P<single>'(?:[^'\\]|\\.)*')
+    |(?P<double>"(?:[^"\\]|\\.)*")
+    |(?P<op>\|\||&&|[|;<>])
+    |(?P<word>[^\s|;&<>]+)
+    """,
+    re.VERBOSE,
+)
+
+
+def _bash_highlight_is_low_contrast(lines: list[str]) -> bool:
+    joined = "".join(lines)
+    if not _ANSI_RE.search(joined):
+        return True
+    visible = _ANSI_RE.sub("", joined)
+    if not visible.strip():
+        return False
+    stripped = joined.lstrip()
+    if not stripped.startswith("\033[") or stripped.startswith(("\033[38;5;15m", "\033[38;5;252m", "\033[38;5;249m")):
+        return True
+    # Pygments maps many bash tokens to bright white for several themes.  The
+    # upstream TUI uses syntect's active Codex theme, which gives shell syntax
+    # more visible accents, so fall back when the highlighted command is mostly
+    # reset/default/white spans.
+    accent_sequences = {
+        sequence
+        for sequence in re.findall(r"\x1b\[([0-9;]*)m", joined)
+        if sequence not in {"", "0", "00", "39", "39;00", "38;5;15", "38;5;15;01"}
+    }
+    return not accent_sequences
+
+
+def _highlight_shell_command_for_terminal(script: str, style: _AnsiStyle) -> list[str]:
+    if not style.enabled:
+        return script.splitlines() or [script]
+    rendered: list[str] = []
+    heredoc_delimiter: str | None = None
+    for line in script.splitlines() or [script]:
+        if heredoc_delimiter is not None:
+            rendered.append(style.fg256(186, line))
+            if line.strip() == heredoc_delimiter:
+                heredoc_delimiter = None
+            continue
+        rendered.append(_highlight_shell_command_line(line, style))
+        heredoc_delimiter = _shell_heredoc_delimiter(line)
+    return rendered
+
+
+def _highlight_shell_command_line(line: str, style: _AnsiStyle) -> str:
+    rendered: list[str] = []
+    at_command = True
+    for match in _SHELL_TOKEN_RE.finditer(line):
+        kind = match.lastgroup or "word"
+        token = match.group(0)
+        if kind == "space":
+            rendered.append(token)
+            continue
+        if kind in {"single", "double"}:
+            rendered.append(style.fg256(186, token))
+            at_command = False
+            continue
+        if kind == "op":
+            rendered.append(style.fg256(117, token))
+            at_command = True
+            continue
+        rendered.append(_highlight_shell_word(token, style, at_command=at_command))
+        if not _is_shell_assignment(token):
+            at_command = False
+    return "".join(rendered)
+
+
+def _highlight_shell_word(token: str, style: _AnsiStyle, *, at_command: bool) -> str:
+    if _is_shell_assignment(token):
+        key, value = token.split("=", 1)
+        return f"{style.cyan(key)}{style.dim('=')}{_highlight_shell_assignment_value(value, style)}"
+    if token.startswith(("-", "--")):
+        return style.yellow(token)
+    if token.startswith("$") or token.startswith("${"):
+        return style.fg256(141, token)
+    if at_command:
+        return style.cyan(token)
+    if _looks_like_path_or_file(token):
+        return style.fg256(117, token)
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", token):
+        return style.fg256(141, token)
+    return token
+
+
+def _highlight_shell_assignment_value(value: str, style: _AnsiStyle) -> str:
+    if not value:
+        return ""
+    if value.startswith(('"', "'")):
+        return style.fg256(186, value)
+    if value.startswith("$"):
+        return style.fg256(141, value)
+    if _looks_like_path_or_file(value):
+        return style.fg256(117, value)
+    return value
+
+
+def _is_shell_assignment(token: str) -> bool:
+    return re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token) is not None
+
+
+def _looks_like_path_or_file(token: str) -> bool:
+    if "/" in token or token.startswith(("./", "../", "~/")):
+        return True
+    return re.search(r"\.[A-Za-z0-9_+-]{1,8}$", token) is not None
+
+
+def _shell_heredoc_delimiter(line: str) -> str | None:
+    match = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_-]*)\1", line)
+    if match is None:
+        return None
+    return match.group(2)
 
 
 def _duration_ms(raw: Any) -> int | None:

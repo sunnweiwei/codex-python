@@ -524,7 +524,25 @@ class RemoteControlService:
             return
         for outbound in outbounds:
             self._outbound_buffer.insert(outbound)
-            self._send_wire_envelope(ws, outbound)
+            try:
+                self._send_wire_envelope(ws, outbound)
+            except Exception as exc:
+                self._mark_stream_send_failed(ws, client_id, stream_id, exc)
+                break
+
+    def _mark_stream_send_failed(self, ws: Any, client_id: str, stream_id: str, exc: Exception) -> None:
+        key = (client_id, stream_id)
+        if self._stream_connections.get(key) is ws:
+            self._stream_connections.pop(key, None)
+        self._server.close_client(client_id, stream_id)
+        if not self._stop.is_set():
+            self.status = "connecting"
+        _remote_log(
+            "server_send_failed",
+            client_id=client_id,
+            stream_id=stream_id,
+            error=str(exc),
+        )
 
     def _send_wire_envelope(self, ws: Any, envelope: ServerEnvelope) -> None:
         payload = json.dumps(envelope.to_wire(), ensure_ascii=False, separators=(",", ":"))

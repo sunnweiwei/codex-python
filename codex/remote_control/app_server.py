@@ -294,14 +294,20 @@ class _RemoteAppServer:
         self._command_processes: dict[tuple[str, str], _RemoteCommandProcess] = {}
         self._process_processes: dict[tuple[str, str], _RemoteCommandProcess] = {}
         self._pending_server_requests: dict[Any, queue.Queue[dict[str, Any]]] = {}
+        self._pending_server_request_targets: dict[Any, tuple[str, str, str]] = {}
         self._client_names: dict[tuple[str, str], str | None] = {}
+        self._thread_active_flag_counts: dict[str, dict[str, int]] = {}
         self._next_server_request_id = 1
 
     def close_client(self, client_id: str, stream_id: str) -> None:
+        canceled_requests: list[tuple[Any, queue.Queue[dict[str, Any]]]] = []
         with self._lock:
             for key in list(self._client_names):
                 if key[0] == client_id and (stream_id is None or key[1] == stream_id):
                     self._client_names.pop(key, None)
+            for thread_id, target in list(self._active_turn_clients.items()):
+                if target[1] == client_id and (stream_id is None or target[2] == stream_id):
+                    self._active_turn_clients.pop(thread_id, None)
             for key in list(self._fs_watches):
                 if key[0] == client_id:
                     self._fs_watches.pop(key, None)
@@ -324,8 +330,24 @@ class _RemoteAppServer:
                 for key in list(self._process_processes)
                 if key[0] == client_id
             )
+            for request_id, target in list(self._pending_server_request_targets.items()):
+                if target[0] == client_id and (stream_id is None or target[1] == stream_id):
+                    self._pending_server_request_targets.pop(request_id, None)
+                    queue_ref = self._pending_server_requests.pop(request_id, None)
+                    if queue_ref is not None:
+                        canceled_requests.append((request_id, queue_ref))
         for process in processes:
             _terminate_remote_process(process)
+        for request_id, queue_ref in canceled_requests:
+            try:
+                queue_ref.put_nowait(
+                    {
+                        "id": request_id,
+                        "error": {"code": -32000, "message": "client disconnected"},
+                    }
+                )
+            except queue.Full:
+                pass
 
     def handle_message(self, ws: Any, client_id: str, stream_id: str, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -904,6 +926,45 @@ class _RemoteAppServer:
             return [fallback]
         return refs
 
+    def _thread_status_payload_for(self, thread_id: str) -> dict[str, Any]:
+        with self._lock:
+            running = thread_id in self._turn_threads
+            counts = dict(self._thread_active_flag_counts.get(thread_id) or {})
+        active_flags = [
+            flag
+            for flag in ("waitingOnApproval", "waitingOnUserInput")
+            if counts.get(flag, 0) > 0
+        ]
+        if running or active_flags:
+            return {"type": "active", "activeFlags": active_flags}
+        return {"type": "idle"}
+
+    def _set_thread_active_flag(
+        self,
+        thread_id: str,
+        flag: str,
+        enabled: bool,
+        *,
+        fallback: tuple[Any, str, str] | None = None,
+    ) -> None:
+        with self._lock:
+            counts = self._thread_active_flag_counts.setdefault(thread_id, {})
+            current = counts.get(flag, 0)
+            if enabled:
+                counts[flag] = current + 1
+            elif current <= 1:
+                counts.pop(flag, None)
+                if not counts:
+                    self._thread_active_flag_counts.pop(thread_id, None)
+            else:
+                counts[flag] = current - 1
+        self._notify_thread(
+            thread_id,
+            "thread/status/changed",
+            {"threadId": thread_id, "status": self._thread_status_payload_for(thread_id)},
+            fallback=fallback,
+        )
+
     def _notify_thread(
         self,
         thread_id: str,
@@ -963,7 +1024,7 @@ class _RemoteAppServer:
                         "thread/status/changed",
                         {
                             "threadId": session.state.thread_id,
-                            "status": {"type": "active", "activeFlags": []},
+                            "status": self._thread_status_payload_for(session.state.thread_id),
                         },
                         fallback=fallback_ref,
                     )
@@ -1093,6 +1154,15 @@ class _RemoteAppServer:
                                 "itemId": call_id,
                                 "delta": delta,
                             },
+                            fallback=fallback_ref,
+                        )
+                elif event.type == "plan_update":
+                    plan_payload = _turn_plan_update_payload(session.state.thread_id, session.state.turn_id, event.payload)
+                    if plan_payload is not None:
+                        self._notify_thread(
+                            session.state.thread_id,
+                            "turn/plan/updated",
+                            plan_payload,
                             fallback=fallback_ref,
                         )
                 elif event.type == "tool.completed":
@@ -1317,15 +1387,15 @@ class _RemoteAppServer:
                 {"threadId": session.state.thread_id, "turn": final_turn},
                 fallback=fallback_ref,
             )
-            self._notify_thread(
-                session.state.thread_id,
-                "thread/status/changed",
-                {"threadId": session.state.thread_id, "status": {"type": "idle"}},
-                fallback=fallback_ref,
-            )
             with self._lock:
                 self._active_turn_clients.pop(session.state.thread_id, None)
                 self._turn_threads.pop(session.state.thread_id, None)
+            self._notify_thread(
+                session.state.thread_id,
+                "thread/status/changed",
+                {"threadId": session.state.thread_id, "status": self._thread_status_payload_for(session.state.thread_id)},
+                fallback=fallback_ref,
+            )
 
     def _create_session(self, params: dict[str, Any]) -> CodexSession:
         session_ref: list[CodexSession] = []
@@ -1588,11 +1658,7 @@ class _RemoteAppServer:
                     include_turns=False,
                 )
                 if thread is not None:
-                    thread["status"] = (
-                        {"type": "active", "activeFlags": []}
-                        if session.state.thread_id in self._active_turn_clients
-                        else {"type": "idle"}
-                    )
+                    thread["status"] = self._thread_status_payload_for(session.state.thread_id)
                     with self._lock:
                         name = self._thread_names.get(session.state.thread_id)
                         git_info = self._thread_git_info.get(session.state.thread_id)
@@ -1638,7 +1704,6 @@ class _RemoteAppServer:
             _redact_thread_resume_payloads(thread)
 
     def _thread_payload(self, session: CodexSession, *, include_turns: bool) -> dict[str, Any]:
-        active = session.state.thread_id in self._active_turn_clients
         with self._lock:
             name = self._thread_names.get(session.state.thread_id)
             git_info = self._thread_git_info.get(session.state.thread_id)
@@ -1651,7 +1716,7 @@ class _RemoteAppServer:
             source=_api_session_source(session.config.session_source or "cli"),
             preview=_preview_from_history(session.state.history),
             path=str(session.state.rollout_path()) if not session.config.ephemeral else None,
-            status={"type": "active", "activeFlags": []} if active else {"type": "idle"},
+            status=self._thread_status_payload_for(session.state.thread_id),
             turns=_turns_from_history(session) if include_turns else [],
             created_at=created_at,
             updated_at=updated_at,
@@ -2508,6 +2573,8 @@ class _RemoteAppServer:
                     "questions": [_request_user_input_question_payload(question) for question in questions],
                 },
                 timeout_seconds=None,
+                thread_id=session.state.thread_id,
+                active_flag="waitingOnUserInput",
             )
             return result if isinstance(result, dict) else None
 
@@ -2523,7 +2590,16 @@ class _RemoteAppServer:
                 return None
             ws, client_id, stream_id = target
             method, params = _approval_server_request(session, request)
-            result = self._send_server_request(ws, client_id, stream_id, method, params, timeout_seconds=None)
+            result = self._send_server_request(
+                ws,
+                client_id,
+                stream_id,
+                method,
+                params,
+                timeout_seconds=None,
+                thread_id=session.state.thread_id,
+                active_flag="waitingOnApproval",
+            )
             if not isinstance(result, dict):
                 return None
             decision = result.get("decision")
@@ -2549,18 +2625,38 @@ class _RemoteAppServer:
         params: dict[str, Any],
         *,
         timeout_seconds: float | None,
+        thread_id: str | None = None,
+        active_flag: str | None = None,
     ) -> dict[str, Any] | None:
         request_id = self._next_server_request_id_value()
         response_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        fallback_ref = (ws, client_id, stream_id)
         with self._lock:
             self._pending_server_requests[request_id] = response_queue
+            self._pending_server_request_targets[request_id] = (client_id, stream_id, thread_id or "")
+        if thread_id is not None and active_flag is not None:
+            self._set_thread_active_flag(thread_id, active_flag, True, fallback=fallback_ref)
         self.service.send_message(ws, client_id, stream_id, {"id": request_id, "method": method, "params": params})
         try:
             response = response_queue.get(timeout=timeout_seconds)
         except queue.Empty:
             with self._lock:
                 self._pending_server_requests.pop(request_id, None)
+                self._pending_server_request_targets.pop(request_id, None)
             return None
+        finally:
+            with self._lock:
+                self._pending_server_requests.pop(request_id, None)
+                self._pending_server_request_targets.pop(request_id, None)
+            if thread_id is not None:
+                self._notify_thread(
+                    thread_id,
+                    "serverRequest/resolved",
+                    {"threadId": thread_id, "requestId": request_id},
+                    fallback=fallback_ref,
+                )
+                if active_flag is not None:
+                    self._set_thread_active_flag(thread_id, active_flag, False, fallback=fallback_ref)
         if isinstance(response.get("error"), dict):
             return None
         result = response.get("result")

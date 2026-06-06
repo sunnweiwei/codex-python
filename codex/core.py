@@ -109,6 +109,12 @@ class CodexSession:
 
         thread_id = self.state.thread_id
 
+        if callable(interrupt_tools):
+            try:
+                interrupt_tools()
+            except Exception:
+                pass
+
         def cancel_runtime() -> None:
             if callable(cancel_model):
                 # Scope cancellation to this session's own in-flight responses so
@@ -122,11 +128,6 @@ class CodexSession:
                         cancel_model()
                     except Exception:
                         pass
-                except Exception:
-                    pass
-            if callable(interrupt_tools):
-                try:
-                    interrupt_tools()
                 except Exception:
                     pass
 

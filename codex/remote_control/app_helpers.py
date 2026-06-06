@@ -2251,10 +2251,13 @@ def _turn_plan_update_payload(
     turn_id: str,
     payload: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if str(payload.get("name") or "") != "update_plan":
+    if str(payload.get("type") or "") == "plan_update":
+        metadata = payload
+    elif str(payload.get("name") or "") == "update_plan":
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+    else:
         return None
-    metadata = payload.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
     plan = metadata.get("plan")
     if not isinstance(plan, list):
         return None
