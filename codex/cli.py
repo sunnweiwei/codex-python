@@ -47,7 +47,7 @@ def _default_cli_syntax_theme() -> str:
         bg = int(colorfgbg.split(";")[-1])
     except (TypeError, ValueError):
         bg = -1
-    if bg in {7, 15} or bg >= 230:
+    if bg < 0 or bg in {7, 15} or bg >= 230:
         return "catppuccin-latte"
     return "catppuccin-mocha"
 
@@ -8564,7 +8564,96 @@ def _highlight_code_for_terminal(code: str, lang: str, style: _AnsiStyle) -> lis
     except Exception:
         return None
     rendered_lines = rendered.rstrip("\n").splitlines()
+    if _terminal_background_is_light(default=True):
+        rendered_lines = [_improve_code_highlight_contrast_for_light_background(line) for line in rendered_lines]
     return rendered_lines or [""]
+
+
+def _terminal_background_is_light(*, default: bool) -> bool:
+    colorfgbg = os.environ.get("COLORFGBG", "")
+    try:
+        bg = int(colorfgbg.split(";")[-1])
+    except (TypeError, ValueError):
+        return default
+    luminance = _ansi_256_luminance(bg)
+    if luminance is None:
+        return default
+    return luminance >= 0.62
+
+
+_ANSI_256_FG_RE = re.compile(r"\033\[(?P<prefix>(?:\d+;)*)38;5;(?P<color>\d+)(?P<suffix>(?:;\d+)*)m")
+
+
+def _improve_code_highlight_contrast_for_light_background(line: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        color = int(match.group("color"))
+        if not _ansi_256_foreground_is_too_light_for_light_background(color):
+            return match.group(0)
+        return f"\033[{match.group('prefix')}38;5;238{match.group('suffix')}m"
+
+    return _ANSI_256_FG_RE.sub(replace, line)
+
+
+def _ansi_256_foreground_is_too_light_for_light_background(color: int) -> bool:
+    # Several dark syntax themes render ordinary tokens as white/near-white
+    # (for example Pygments material/monokai use 15). On Codex's light terminal
+    # surface those become washed out, while accent colors should stay intact.
+    if color in {7, 15, 231}:
+        return True
+    if 250 <= color <= 255:
+        return True
+    luminance = _ansi_256_luminance(color)
+    return luminance is not None and luminance >= 0.92 and _ansi_256_is_neutral_gray(color)
+
+
+def _ansi_256_luminance(color: int) -> float | None:
+    rgb = _ansi_256_rgb(color)
+    if rgb is None:
+        return None
+    red, green, blue = rgb
+    return (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255
+
+
+def _ansi_256_is_neutral_gray(color: int) -> bool:
+    rgb = _ansi_256_rgb(color)
+    if rgb is None:
+        return False
+    red, green, blue = rgb
+    return max(rgb) - min(rgb) <= 8 or (red == green == blue)
+
+
+def _ansi_256_rgb(color: int) -> tuple[int, int, int] | None:
+    basic = {
+        0: (0, 0, 0),
+        1: (128, 0, 0),
+        2: (0, 128, 0),
+        3: (128, 128, 0),
+        4: (0, 0, 128),
+        5: (128, 0, 128),
+        6: (0, 128, 128),
+        7: (192, 192, 192),
+        8: (128, 128, 128),
+        9: (255, 0, 0),
+        10: (0, 255, 0),
+        11: (255, 255, 0),
+        12: (0, 0, 255),
+        13: (255, 0, 255),
+        14: (0, 255, 255),
+        15: (255, 255, 255),
+    }
+    if color in basic:
+        return basic[color]
+    if 16 <= color <= 231:
+        value = color - 16
+        scale = [0, 95, 135, 175, 215, 255]
+        red = scale[value // 36]
+        green = scale[(value % 36) // 6]
+        blue = scale[value % 6]
+        return red, green, blue
+    if 232 <= color <= 255:
+        gray = 8 + (color - 232) * 10
+        return gray, gray, gray
+    return None
 
 
 _CODEX_THEME_TO_PYGMENTS = {

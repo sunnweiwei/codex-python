@@ -1152,6 +1152,101 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(client.auth_display_name, "API key")
         self.assertTrue(any(event.type == "warning" and "switched to API key" in event.payload.get("message", "") for event in result.events))
 
+    def test_fallback_model_client_retries_chatgpt_on_next_user_turn_and_restores(self) -> None:
+        class _RecoveringChatGPT:
+            auth_display_name = "ChatGPT"
+
+            def __init__(self) -> None:
+                self.requests: list[PromptRequest] = []
+
+            def create(self, request: PromptRequest):
+                raise AssertionError("stream expected")
+
+            def stream(self, request: PromptRequest):
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    raise RuntimeError("budget limit reached for this ChatGPT account")
+                yield _stream_message("chatgpt recovered")
+                yield ModelStreamEvent("model.response", {"response_id": "chatgpt-ok"})
+
+        primary = _RecoveringChatGPT()
+        client = FallbackModelClient(
+            primary=primary,
+            fallback=ScriptedResponsesModel([message("api fallback ok")]),
+        )
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=client,
+        )
+
+        first = session.run("first")
+        second = session.run("second")
+
+        self.assertEqual(first.final_message, "api fallback ok")
+        self.assertTrue(any(event.type == "warning" and "switched to API key" in event.payload.get("message", "") for event in first.events))
+        self.assertEqual(second.final_message, "chatgpt recovered")
+        self.assertFalse(client.using_fallback)
+        self.assertEqual(client.auth_display_name, "ChatGPT")
+        self.assertTrue(
+            any(
+                event.type == "warning"
+                and "switched back from API key" in event.payload.get("message", "")
+                for event in second.events
+            )
+        )
+        self.assertEqual(len(primary.requests), 2)
+
+    def test_fallback_model_client_retries_chatgpt_only_once_per_user_turn(self) -> None:
+        class _StillLimitedChatGPT:
+            auth_display_name = "ChatGPT"
+
+            def __init__(self) -> None:
+                self.requests: list[PromptRequest] = []
+
+            def create(self, request: PromptRequest):
+                raise AssertionError("stream expected")
+
+            def stream(self, request: PromptRequest):
+                self.requests.append(request)
+                raise RuntimeError("usage limit still reached for this ChatGPT account")
+                yield  # pragma: no cover
+
+        primary = _StillLimitedChatGPT()
+        client = FallbackModelClient(
+            primary=primary,
+            fallback=ScriptedResponsesModel(
+                [
+                    message("api fallback first"),
+                    {
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "name": "exec_command",
+                                "call_id": "call-1",
+                                "arguments": json.dumps({"cmd": "printf hi"}),
+                            }
+                        ]
+                    },
+                    message("api fallback after tool"),
+                ]
+            ),
+        )
+        session = CodexSession(
+            CodexConfig(skip_git_repo_check=True, ephemeral=True),
+            model_client=client,
+        )
+
+        first = session.run("first")
+        second = session.run("second")
+
+        self.assertEqual(first.final_message, "api fallback first")
+        self.assertEqual(second.final_message, "api fallback after tool")
+        self.assertTrue(client.using_fallback)
+        # First turn: one ChatGPT request fails and switches to API key.
+        # Second turn: one recovery probe at the first user-facing request.
+        # The tool follow-up request stays on API key and must not probe again.
+        self.assertEqual(len(primary.requests), 2)
+
     def test_chatgpt_model_adds_official_auth_and_session_headers(self) -> None:
         access_token = _fake_jwt({"exp": int(time.time()) + 3600})
         with tempfile.TemporaryDirectory() as tmp:
@@ -6830,6 +6925,36 @@ new file mode 100644
         self.assertIn("def hello", plain)
         self.assertIn("return 'ok'", plain)
         self.assertRegex(joined, r"\x1b\[[0-9;]*m")
+
+    def test_cli_markdown_code_fences_keep_normal_tokens_readable_on_light_terminal(self) -> None:
+        import codex.cli as cli
+        from codex.cli import _ANSI_RE
+        from codex.cli import _AnsiStyle
+        from codex.cli import _render_markdown_for_terminal
+
+        old_theme = cli._CLI_SYNTAX_THEME
+        old_colorfgbg = os.environ.get("COLORFGBG")
+        try:
+            os.environ["COLORFGBG"] = "0;15"
+            self.assertTrue(cli._set_cli_syntax_theme("catppuccin-mocha"))
+            rendered = _render_markdown_for_terminal(
+                "```python\nx = 1\nprint(x)\n```",
+                _AnsiStyle(True),
+                terminal_width=80,
+            )
+            joined = "\n".join(rendered)
+            plain = _ANSI_RE.sub("", joined)
+        finally:
+            cli._CLI_SYNTAX_THEME = old_theme
+            if old_colorfgbg is None:
+                os.environ.pop("COLORFGBG", None)
+            else:
+                os.environ["COLORFGBG"] = old_colorfgbg
+
+        self.assertIn("x = 1", plain)
+        self.assertIn("print(x)", plain)
+        self.assertNotIn("\033[38;5;15m", joined)
+        self.assertIn("\033[38;5;238m", joined)
 
     def test_cli_markdown_plain_code_fences_are_not_dimmed(self) -> None:
         from codex.cli import _ANSI_RE

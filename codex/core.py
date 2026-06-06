@@ -679,6 +679,8 @@ class CodexSession:
                     output_schema=self.config.output_schema,
                     output_schema_strict=self.config.output_schema_strict,
                 )
+                if iteration == 1:
+                    self._retry_primary_auth_on_next_request_if_available()
                 yield self.state.emit(
                     "model.request",
                     iteration=iteration,
@@ -740,6 +742,15 @@ class CodexSession:
             return
         finally:
             self._end_active_turn()
+
+    def _retry_primary_auth_on_next_request_if_available(self) -> None:
+        retry_primary = getattr(self.model_client, "retry_primary_on_next_request", None)
+        if not callable(retry_primary):
+            return
+        try:
+            retry_primary()
+        except Exception:
+            pass
 
     def _stream_model_output(
         self,

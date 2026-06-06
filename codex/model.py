@@ -453,6 +453,7 @@ class FallbackModelClient:
         self.fallback_label = fallback_label
         self._using_fallback = False
         self._last_fallback_reason: str | None = None
+        self._try_primary_next_request = False
 
     @property
     def auth_display_name(self) -> str:
@@ -470,7 +471,30 @@ class FallbackModelClient:
     def last_fallback_reason(self) -> str | None:
         return self._last_fallback_reason
 
+    def retry_primary_on_next_request(self) -> None:
+        """Probe the primary transport once on the next model request.
+
+        Codex can fall back from ChatGPT subscription auth to an API key when
+        the account budget is exhausted. That limit can later reset. Rather
+        than polling on every request, the session arms this at the beginning
+        of a new user turn so the first real sampling request tries ChatGPT
+        once and only stays on the API key if the limit is still active.
+        """
+
+        if self._using_fallback:
+            self._try_primary_next_request = True
+
     def create(self, request: PromptRequest) -> ModelResponse:
+        if self._should_retry_primary_once():
+            try:
+                response = self.primary.create(request)
+            except Exception as exc:
+                if not _looks_like_account_limit_error(exc):
+                    raise
+                self._last_fallback_reason = str(exc).strip() or type(exc).__name__
+                return self.fallback.create(request)
+            self._restore_primary()
+            return response
         try:
             return self._active_client().create(request)
         except Exception as exc:
@@ -480,6 +504,35 @@ class FallbackModelClient:
             return self.fallback.create(request)
 
     def stream(self, request: PromptRequest) -> Iterable[ModelStreamEvent]:
+        if self._should_retry_primary_once():
+            yielded = False
+            restored = False
+            try:
+                for event in self.primary.stream(request):
+                    if not yielded:
+                        yielded = True
+                        restored = True
+                        self._restore_primary()
+                        yield ModelStreamEvent(
+                            "warning",
+                            {
+                                "message": (
+                                    f"{self.primary_label} limit appears recovered; "
+                                    f"switched back from {self.fallback_label}."
+                                )
+                            },
+                        )
+                    yield event
+                if not yielded:
+                    self._restore_primary()
+                return
+            except Exception as exc:
+                if restored or yielded or not _looks_like_account_limit_error(exc):
+                    raise
+                self._last_fallback_reason = str(exc).strip() or type(exc).__name__
+            yield from self.fallback.stream(request)
+            return
+
         yielded = False
         try:
             for event in self._active_client().stream(request):
@@ -533,7 +586,19 @@ class FallbackModelClient:
 
     def _switch_to_fallback(self, exc: Exception) -> None:
         self._using_fallback = True
+        self._try_primary_next_request = False
         self._last_fallback_reason = str(exc).strip() or type(exc).__name__
+
+    def _restore_primary(self) -> None:
+        self._using_fallback = False
+        self._try_primary_next_request = False
+        self._last_fallback_reason = None
+
+    def _should_retry_primary_once(self) -> bool:
+        if not self._using_fallback or not self._try_primary_next_request:
+            return False
+        self._try_primary_next_request = False
+        return True
 
 
 def _iter_sse_events(stream: Any) -> Iterable[dict[str, Any]]:
