@@ -2585,7 +2585,7 @@ def _request_user_input_selector_lines(
         row = f"{prefix}{label}"
         if option.description:
             row = f"{row} {style.dim(option.description)}"
-        wrapped_row = _wrap_ansi_line(row, max(20, _terminal_columns()))
+        wrapped_row = _wrap_ansi_line(row, max(20, _terminal_safe_width(_terminal_columns())))
         if len(wrapped_row) > 1:
             indent = " " * _visible_width(prefix)
             wrapped_row = [wrapped_row[0], *[f"{indent}{line}" for line in wrapped_row[1:]]]
@@ -3702,7 +3702,8 @@ def _live_status_display_lines(snapshot: _LiveTurnStatusSnapshot | None, style: 
         parts.append(style.dim(" · " + " · ".join(metric_parts)))
     line = "".join(parts)
     width = _terminal_columns()
-    wrapped = _wrap_ansi_line(line, max(20, width))
+    safe_width = _terminal_safe_width(width)
+    wrapped = _wrap_ansi_line(line, max(20, safe_width - 2))
     lines = wrapped if len(wrapped) <= 1 else [wrapped[0], *[f"  {style.dim(line)}" for line in wrapped[1:]]]
     if snapshot.details and not snapshot.finished:
         lines.append(_status_details_line(snapshot.details, style=style, width=width))
@@ -3724,7 +3725,7 @@ def _animated_status_header(text: str, animation_millis: int, style: "_AnsiStyle
 def _status_details_line(details: str, *, style: "_AnsiStyle", width: int) -> str:
     collapsed = " ".join(str(details).split())
     prefix = "  └ "
-    detail_width = max(1, width - _visible_len(prefix))
+    detail_width = max(1, _terminal_safe_width(width) - _visible_len(prefix))
     return f"{style.dim(prefix)}{style.dim(_truncate_display_text(collapsed, detail_width))}"
 
 
@@ -4527,7 +4528,8 @@ def _slash_palette_row_lines(
     plain_name = f"/{row.display_name}"
     padded_name = _pad_visible(plain_name, name_width)
     prefix = f"  {padded_name}  "
-    desc_width = max(12, width - _visible_len(prefix))
+    safe_width = _terminal_safe_width(width)
+    desc_width = max(12, safe_width - _visible_len(prefix))
     desc_lines = _wrap_ansi_line(row.description, desc_width)
     rendered: list[str] = []
     for index, desc in enumerate(desc_lines):
@@ -4535,7 +4537,7 @@ def _slash_palette_row_lines(
         desc_text = style.dim(desc) if desc else ""
         line = f"{line_prefix}{desc_text}".rstrip()
         if selected:
-            line = style.inverse(_pad_visible(line, min(width, max(_visible_len(line), 1))))
+            line = style.inverse(_pad_visible(line, min(safe_width, max(_visible_len(line), 1))))
         rendered.append(line)
     return rendered
 
@@ -7484,7 +7486,7 @@ class _HumanEventRenderer:
                 continue
             line_first = first_physical_line
             prefix = first_prefix if line_first else rest_prefix
-            available_width = max(10, terminal_width - _visible_len(prefix))
+            available_width = max(10, _terminal_safe_width(terminal_width) - _visible_len(prefix))
             for segment in _wrap_ansi_line(logical_line, available_width):
                 rendered.append((first_prefix if line_first else rest_prefix, segment))
                 line_first = False
@@ -8340,6 +8342,12 @@ def _wrap_ansi_line(text: str, width: int) -> list[str]:
     return wrapped
 
 
+def _terminal_safe_width(width: int) -> int:
+    if width <= 1:
+        return max(1, width)
+    return width - 1
+
+
 def _split_visible_chunk(text: str, width: int) -> list[str]:
     pieces: list[str] = []
     current = ""
@@ -8451,7 +8459,7 @@ def _live_output_display_rows(output: str, style: "_AnsiStyle", terminal_width: 
         logical_lines.pop()
     for logical_line in logical_lines or [cleaned]:
         prefix = first_prefix if first else rest_prefix
-        available = max(10, terminal_width - _visible_len(prefix))
+        available = max(10, _terminal_safe_width(terminal_width) - _visible_len(prefix))
         wrapped = _wrap_ansi_line(logical_line, available)
         for index, segment in enumerate(wrapped):
             current_prefix = prefix if index == 0 else rest_prefix

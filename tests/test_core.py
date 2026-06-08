@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.parse
 import unittest
+import unittest.mock
 
 from contextlib import redirect_stderr
 from datetime import datetime
@@ -8807,6 +8808,34 @@ new file mode 100644
             _drain_output_queue(output)
 
         self.assertEqual(rendered.getvalue(), "CLEAR-OLDPANEL-2")
+
+    def test_cli_dynamic_rows_avoid_terminal_autowrap_column(self) -> None:
+        from codex import cli
+
+        style = cli._AnsiStyle(False)
+        width = 40
+        output_width = width - cli._visible_len("  └ ")
+        rows = cli._live_output_display_rows("x" * output_width, style, width)
+
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertTrue(all(cli._visible_len(row) < width for row in rows))
+
+        snapshot = cli._LiveTurnStatusSnapshot(
+            header="Working",
+            elapsed_seconds=1,
+            auth_label="ChatGPT",
+            goal_status=None,
+            active_context_tokens=12345,
+            active_context_estimated=False,
+            session_context_tokens=12345,
+            session_context_estimated=False,
+            session_reasoning_tokens=100,
+            context_window=272000,
+            details="x" * width,
+        )
+        with unittest.mock.patch.object(cli, "_terminal_columns", return_value=width):
+            status_rows = cli._live_status_display_lines(snapshot, style)
+        self.assertTrue(all(cli._visible_len(row) < width for row in status_rows))
 
     def test_cli_human_renderer_restarts_terminal_header_after_agent_message(self) -> None:
         from codex.cli import _HumanEventRenderer
