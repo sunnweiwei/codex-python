@@ -180,6 +180,27 @@ class CodexSession:
         with self._turn_state_lock:
             return bool(self._pending_input)
 
+    def pop_pending_input_prompts_for_interrupt(self) -> list[str]:
+        """Drain user steers that have not yet been committed to history.
+
+        The interactive UI uses this for the reference ESC behavior: pending
+        steers can interrupt the current model/tool wait and be resubmitted as
+        the next user turn. If the turn loop already drained them into history,
+        this returns an empty list so they are not duplicated.
+        """
+
+        with self._turn_state_lock:
+            if not self._pending_input:
+                return []
+            items = list(self._pending_input)
+            self._pending_input.clear()
+        prompts: list[str] = []
+        for item in items:
+            text = _message_text(item).strip()
+            if text:
+                prompts.append(text)
+        return prompts
+
     def _check_interrupted(self) -> None:
         if self._interrupt_event.is_set():
             raise TurnInterrupted("interrupted")

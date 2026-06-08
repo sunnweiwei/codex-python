@@ -1934,11 +1934,24 @@ def _run_session_human_interactive(
             for action in reader.poll():
                 if action.kind == "interrupt" and not interrupted:
                     interrupted = True
+                    pending_interrupt_prompts: list[str] = []
+                    if shared_runtime is None:
+                        pending_interrupt_prompts = session.pop_pending_input_prompts_for_interrupt()
+                        if pending_interrupt_prompts:
+                            merged_prompt = "\n".join(pending_interrupt_prompts).strip()
+                            if merged_prompt:
+                                if queued_prompts is not None:
+                                    queued_prompts.appendleft(merged_prompt)
+                                else:
+                                    session.queue_input_for_next_turn(merged_prompt)
                     if shared_runtime is not None:
                         shared_runtime.interrupt()
                     else:
                         session.interrupt()
-                    renderer.render_interrupted()
+                    if pending_interrupt_prompts:
+                        renderer.render_pending_steer_interrupt()
+                    else:
+                        renderer.render_interrupted()
                     _drain_output_queue(output, input_reader=reader)
                     reader.render()
                 elif action.kind == "submit" and action.text.strip():
@@ -6242,6 +6255,12 @@ class _HumanEventRenderer:
             "Conversation interrupted - tell the model what to do differently. "
             "Something went wrong? Hit `/feedback` to report the issue."
         )
+
+    def render_pending_steer_interrupt(self) -> None:
+        if self._interrupted_rendered:
+            return
+        self._interrupted_rendered = True
+        self.render_info_message("Model interrupted to submit steer instructions.")
 
     def render_user_message(self, text: str) -> None:
         normalized = text.rstrip("\r\n")

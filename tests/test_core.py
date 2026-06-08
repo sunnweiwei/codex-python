@@ -10426,6 +10426,56 @@ new file mode 100644
         self.assertIn("• saw queued input", plain)
         self.assertNotIn("�", plain)
 
+    def test_cli_tty_esc_with_pending_input_sends_it_immediately(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("PTY smoke is Unix-only")
+        responses = [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "sleep-1",
+                        "arguments": json.dumps({"cmd": "sleep 10", "yield_time_ms": 30000}),
+                    }
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+            },
+            message("saw immediate steer"),
+        ]
+        env = {
+            **os.environ,
+            "TERM": "xterm-256color",
+            "PY_CODEX_FAKE_RESPONSES": json.dumps(responses),
+            "PYTHONPATH": os.getcwd(),
+        }
+        output = self._run_cli_pty(
+            [
+                sys.executable,
+                "-m",
+                "codex",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+                "start slow turn",
+            ],
+            env=env,
+            interactions=[
+                ("", "Working"),
+                ("urgent steer\r", "Messages to be submitted after next tool call"),
+                ("\x1b", "Model interrupted to submit steer instructions."),
+                ("", "saw immediate steer"),
+                ("/exit\r", None),
+            ],
+            timeout=20.0,
+        )
+        plain = _plain_terminal_output(output)
+
+        self.assertIn("› urgent steer", plain)
+        self.assertIn("• saw immediate steer", plain)
+        self.assertNotIn("Conversation interrupted", plain)
+
     def test_cli_tty_chat_answers_request_user_input_tool(self) -> None:
         if sys.platform == "win32":
             self.skipTest("PTY smoke is Unix-only")
