@@ -887,10 +887,51 @@ def iter_model_stream_events(events: Iterable[Any]) -> Iterable[ModelStreamEvent
                 {
                     "response_id": str(response.get("id", "")) if isinstance(response, dict) else "",
                     "response": response,
-                    "error": data.get("error"),
+                    "error": _response_failure_error(event_type, data, response),
                     "raw_type": event_type,
                 },
             )
+
+
+_NON_RETRYABLE_RESPONSE_FAILED_CODES = {
+    "context_length_exceeded",
+    "insufficient_quota",
+    "usage_not_included",
+    "invalid_prompt",
+    "cyber_policy",
+    "server_is_overloaded",
+    "slow_down",
+}
+
+
+def _response_failure_error(event_type: str, data: dict[str, Any], response: dict[str, Any] | None) -> Any:
+    raw_error = data.get("error")
+    if raw_error is None and isinstance(response, dict):
+        raw_error = response.get("error")
+
+    if event_type == "response.incomplete":
+        reason = "unknown"
+        if isinstance(response, dict):
+            details = response.get("incomplete_details")
+            if isinstance(details, dict) and isinstance(details.get("reason"), str):
+                reason = details["reason"]
+        message = f"Incomplete response returned, reason: {reason}"
+        if isinstance(raw_error, dict):
+            error = dict(raw_error)
+            error.setdefault("message", message)
+            error.setdefault("retryable", True)
+            return error
+        return {"message": str(raw_error) if isinstance(raw_error, str) and raw_error else message, "retryable": True}
+
+    if isinstance(raw_error, dict):
+        error = dict(raw_error)
+        code = str(error.get("code") or "")
+        error.setdefault("message", "response.failed event received")
+        error.setdefault("retryable", code not in _NON_RETRYABLE_RESPONSE_FAILED_CODES)
+        return error
+    if isinstance(raw_error, str) and raw_error:
+        return {"message": raw_error, "retryable": True}
+    return {"message": "response.failed event received", "retryable": True}
 
 
 def _scripted_stream_events(response: dict[str, Any]) -> Iterable[ModelStreamEvent]:

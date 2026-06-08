@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import itertools
+import re
 import threading
 import time
 
@@ -1882,7 +1883,7 @@ def _history_has_initial_context(history: list[dict[str, Any]]) -> bool:
         if item.get("type") != "message":
             continue
         if item.get("role") == "developer":
-            if _is_recent_activity_header_message(item):
+            if _is_recent_activity_marker_message(item):
                 continue
             saw_developer = True
             continue
@@ -1899,9 +1900,9 @@ def _history_has_initial_context(history: list[dict[str, Any]]) -> bool:
     return saw_developer or saw_contextual_user
 
 
-def _is_recent_activity_header_message(item: dict[str, Any]) -> bool:
+def _is_recent_activity_marker_message(item: dict[str, Any]) -> bool:
     text = _message_text(item).strip()
-    return text.startswith("<recent_activity>") and text.endswith("</recent_activity>")
+    return (text.startswith("<recent_activity>") and text.endswith("</recent_activity>")) or text == "<recent_activity_end />"
 
 
 def _user_message(
@@ -2129,6 +2130,14 @@ def _model_error_retry_after_seconds(error: Any) -> float | None:
         parsed = _float_or_none(getattr(error, attr, None))
         if parsed is not None:
             return parsed
+    text = _model_error_text(error)
+    match = re.search(r"(?:try again|retry)[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)\s*(ms|s|seconds?|milliseconds?)\b", text, re.I)
+    if match:
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        if unit == "ms" or unit.startswith("millisecond"):
+            return value / 1000.0
+        return value
     return None
 
 

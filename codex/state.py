@@ -983,6 +983,7 @@ RECENT_OFFLOAD_HEADER = (
     "content.\n"
     "</recent_activity>"
 )
+RECENT_OFFLOAD_FOOTER = "<recent_activity_end />"
 _RECENT_ASSISTANT_TEXT_MAX_TOKENS = 2_000
 _RECENT_USER_TEXT_MAX_TOKENS = 2_000
 _RECENT_TOOL_ARG_MAX_TOKENS = 400
@@ -1004,6 +1005,7 @@ def build_recent_context_offload(
     if budget_tokens <= 0:
         return []
 
+    history = _remove_previous_recent_activity_blocks(history)
     name_by_call: dict[str, str] = {}
     cmd_by_call: dict[str, str] = {}
     for item in history:
@@ -1038,7 +1040,40 @@ def build_recent_context_offload(
         "role": "developer",
         "content": [{"type": "input_text", "text": RECENT_OFFLOAD_HEADER}],
     }
-    return [header, *selected]
+    footer = {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": RECENT_OFFLOAD_FOOTER}],
+    }
+    return [header, *selected, footer]
+
+
+def _remove_previous_recent_activity_blocks(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    retained: list[dict[str, Any]] = []
+    buffered_block: list[dict[str, Any]] | None = None
+    for item in history:
+        if _is_recent_activity_header_message(item):
+            if buffered_block is not None:
+                retained.extend(buffered_block)
+            buffered_block = [item]
+            continue
+        if buffered_block is not None:
+            buffered_block.append(item)
+            if _is_recent_activity_footer_message(item):
+                buffered_block = None
+            continue
+        retained.append(item)
+    if buffered_block is not None:
+        retained.extend(buffered_block)
+    return retained
+
+
+def _is_recent_activity_header_message(item: dict[str, Any]) -> bool:
+    return item.get("type") == "message" and item.get("role") == "developer" and _message_text(item).strip() == RECENT_OFFLOAD_HEADER
+
+
+def _is_recent_activity_footer_message(item: dict[str, Any]) -> bool:
+    return item.get("type") == "message" and item.get("role") == "developer" and _message_text(item).strip() == RECENT_OFFLOAD_FOOTER
 
 
 def _compress_recent_item(
@@ -1069,6 +1104,8 @@ def _compress_recent_item(
             # bounded and harmless.
             text = _message_text(item)
             if not text:
+                return None
+            if is_summary_message(text):
                 return None
             kept = _truncate_and_offload(
                 text, max_tokens=_RECENT_USER_TEXT_MAX_TOKENS, offload_dir=offload_dir, label="user"

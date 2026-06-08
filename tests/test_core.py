@@ -1805,6 +1805,76 @@ class CodexCoreTests(unittest.TestCase):
         self.assertNotIn("turn.failed", [event.type for event in result.events])
         self.assertEqual([item.get("role") for item in result.history if item.get("role") == "assistant"], ["assistant"])
 
+    def test_response_failed_model_streaming_error_retries_sampling_request(self) -> None:
+        model = ScriptedResponsesModel(
+            [
+                {
+                    "events": [
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "id": "resp-failed",
+                                "error": {"code": "model_error", "message": "model streaming failed"},
+                            },
+                        }
+                    ]
+                },
+                message("recovered after reconnect"),
+            ]
+        )
+        session = CodexSession(
+            CodexConfig(
+                skip_git_repo_check=True,
+                ephemeral=True,
+                model_stream_max_retries=1,
+                model_stream_retry_base_delay_ms=0,
+            ),
+            model_client=model,
+        )
+
+        result = session.run("hello")
+
+        self.assertEqual(result.final_message, "recovered after reconnect")
+        self.assertEqual(len(model.requests), 2)
+        stream_error = next(event for event in result.events if event.type == "stream_error")
+        self.assertIn("model streaming failed", stream_error.payload["additional_details"])
+        self.assertNotIn("turn.failed", [event.type for event in result.events])
+
+    def test_response_failed_context_window_is_not_retried(self) -> None:
+        model = ScriptedResponsesModel(
+            [
+                {
+                    "events": [
+                        {
+                            "type": "response.failed",
+                            "response": {
+                                "id": "resp-context",
+                                "error": {
+                                    "code": "context_length_exceeded",
+                                    "message": "Your input exceeds the context window of this model.",
+                                },
+                            },
+                        }
+                    ]
+                },
+                message("should not be used"),
+            ]
+        )
+        session = CodexSession(
+            CodexConfig(
+                skip_git_repo_check=True,
+                ephemeral=True,
+                model_stream_max_retries=1,
+                model_stream_retry_base_delay_ms=0,
+            ),
+            model_client=model,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "context_length_exceeded"):
+            session.run("hello")
+
+        self.assertEqual(len(model.requests), 1)
+
     def test_steer_input_is_drained_before_follow_up_request(self) -> None:
         class SteeringModel:
             def __init__(self) -> None:
@@ -2473,6 +2543,41 @@ class CodexCoreTests(unittest.TestCase):
         self.assertEqual(len(list(tmp.glob("*.txt"))), 1)
         # apply_patch (file edit) output: dropped, replaced with a short pointer note.
         self.assertIn("output omitted", outputs["c2"])
+
+    def test_recent_context_offload_does_not_recopy_previous_recent_block(self) -> None:
+        from codex.state import build_recent_context_offload
+
+        config = CodexConfig(skip_git_repo_check=True, ephemeral=True)
+        previous_recent = build_recent_context_offload(
+            [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "old assistant"}]},
+                {"type": "function_call", "name": "exec_command", "call_id": "old", "arguments": json.dumps({"cmd": "old"})},
+                {"type": "function_call_output", "call_id": "old", "output": "old output"},
+            ],
+            20_000,
+            config,
+            offload_dir=None,
+        )
+        history = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": build_compaction_summary_text("old summary")}],
+            },
+            *previous_recent,
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "new assistant"}]},
+            {"type": "function_call", "name": "exec_command", "call_id": "new", "arguments": json.dumps({"cmd": "new"})},
+            {"type": "function_call_output", "call_id": "new", "output": "new output"},
+        ]
+
+        block = build_recent_context_offload(history, 20_000, config, offload_dir=None)
+
+        serialized = json.dumps(block, ensure_ascii=False)
+        self.assertNotIn("old summary", serialized)
+        self.assertNotIn("old assistant", serialized)
+        self.assertNotIn("old output", serialized)
+        self.assertIn("new assistant", serialized)
+        self.assertIn("new output", serialized)
 
     def test_recent_context_offload_default_gates_on_persistence(self) -> None:
         # Auto default: on for persistent sessions, off for ephemeral/throwaway.
