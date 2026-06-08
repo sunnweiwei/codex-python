@@ -8809,6 +8809,46 @@ new file mode 100644
 
         self.assertEqual(rendered.getvalue(), "CLEAR-OLDPANEL-2")
 
+    def test_cli_output_drain_synchronizes_tty_redraw_with_input_reader(self) -> None:
+        import queue
+
+        from codex.cli import _drain_output_queue
+
+        class FakeTty(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        class FakeReader:
+            enabled = True
+
+            def __init__(self) -> None:
+                self.output_partial_line_open = False
+                self.cleared = False
+                self.rendered = False
+
+            def clear(self) -> None:
+                self.cleared = True
+                print("CLEAR", file=sys.stderr)
+
+            def render(self) -> None:
+                self.rendered = True
+                print("PROMPT", file=sys.stderr)
+
+        output: "queue.Queue[Any]" = queue.Queue()
+        output.put("• streamed")
+        reader = FakeReader()
+        rendered = FakeTty()
+
+        with redirect_stderr(rendered):
+            _drain_output_queue(output, input_reader=reader)
+
+        value = rendered.getvalue()
+        self.assertTrue(value.startswith("\033[?2026h"))
+        self.assertTrue(value.endswith("\033[?2026l"))
+        self.assertIn("CLEAR\n• streamed\nPROMPT\n", value)
+        self.assertTrue(reader.cleared)
+        self.assertTrue(reader.rendered)
+
     def test_cli_human_renderer_serializes_cross_thread_render_calls(self) -> None:
         from codex.cli import _HumanEventRenderer
 

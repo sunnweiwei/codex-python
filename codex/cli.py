@@ -2685,20 +2685,38 @@ def _drain_output_queue(output: "queue.Queue[Any]", *, input_reader: "_TurnInput
     if not items:
         return
     items = _coalesce_console_writes(items)
-    if input_reader is not None:
-        input_reader.clear()
-    for item in items:
-        if isinstance(item, _ConsoleWrite):
-            sys.stderr.write(item.text)
+    synchronized = _should_synchronize_terminal_update(input_reader)
+    if synchronized:
+        sys.stderr.write("\033[?2026h")
+        sys.stderr.flush()
+    try:
+        if input_reader is not None:
+            input_reader.clear()
+        for item in items:
+            if isinstance(item, _ConsoleWrite):
+                sys.stderr.write(item.text)
+                sys.stderr.flush()
+                if input_reader is not None:
+                    input_reader.output_partial_line_open = item.partial_line_open
+            else:
+                print(item, file=sys.stderr, flush=True)
+                if input_reader is not None:
+                    input_reader.output_partial_line_open = False
+        if input_reader is not None and not input_reader.output_partial_line_open:
+            input_reader.render()
+    finally:
+        if synchronized:
+            sys.stderr.write("\033[?2026l")
             sys.stderr.flush()
-            if input_reader is not None:
-                input_reader.output_partial_line_open = item.partial_line_open
-        else:
-            print(item, file=sys.stderr, flush=True)
-            if input_reader is not None:
-                input_reader.output_partial_line_open = False
-    if input_reader is not None and not input_reader.output_partial_line_open:
-        input_reader.render()
+
+
+def _should_synchronize_terminal_update(input_reader: "_TurnInputReader | None") -> bool:
+    if input_reader is None or not getattr(input_reader, "enabled", False):
+        return False
+    try:
+        return sys.stderr.isatty()
+    except Exception:
+        return False
 
 
 def _coalesce_console_writes(items: list[Any]) -> list[Any]:
