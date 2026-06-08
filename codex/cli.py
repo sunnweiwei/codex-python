@@ -6193,97 +6193,106 @@ class _HumanEventRenderer:
         self._style = _AnsiStyle(_should_use_color(color_mode))
         self._line_sink = line_sink
         self._status_tracker = status_tracker
+        self._render_lock = threading.RLock()
 
     def render(self, event: Any) -> None:
-        if self._status_tracker is not None:
-            self._status_tracker.update(event)
-        if event.type == "item.completed":
-            self._render_item(event.payload.get("item"), pending_input=bool(event.payload.get("pending_input")))
-        elif event.type == "tool.started":
-            self._render_tool_started(event.payload)
-        elif event.type == "exec_command.output_delta":
-            self._render_exec_output_delta(event.payload)
-        elif event.type == "tool.completed":
-            self._render_tool_completed(event.payload)
-        elif event.type == "context_compaction.completed":
-            self.render_info_message("Context compacted")
-        elif event.type == "warning":
-            self.render_warning(str(event.payload.get("message") or ""))
-        elif event.type == "stream_error":
-            self._begin_cell()
-            self._line(str(event.payload.get("message") or "Reconnecting..."))
-        elif event.type == "turn.aborted":
-            self.render_interrupted()
-        elif event.type == "thread.goal.updated":
-            goal = event.payload.get("goal")
-            if isinstance(goal, dict):
-                self._render_goal_updated(goal)
-        elif event.type == "thread.goal.cleared":
-            self.render_info_message("Goal cleared")
+        with self._render_lock:
+            if self._status_tracker is not None:
+                self._status_tracker.update(event)
+            if event.type == "item.completed":
+                self._render_item(event.payload.get("item"), pending_input=bool(event.payload.get("pending_input")))
+            elif event.type == "tool.started":
+                self._render_tool_started(event.payload)
+            elif event.type == "exec_command.output_delta":
+                self._render_exec_output_delta(event.payload)
+            elif event.type == "tool.completed":
+                self._render_tool_completed(event.payload)
+            elif event.type == "context_compaction.completed":
+                self.render_info_message("Context compacted")
+            elif event.type == "warning":
+                self.render_warning(str(event.payload.get("message") or ""))
+            elif event.type == "stream_error":
+                self._begin_cell()
+                self._line(str(event.payload.get("message") or "Reconnecting..."))
+            elif event.type == "turn.aborted":
+                self.render_interrupted()
+            elif event.type == "thread.goal.updated":
+                goal = event.payload.get("goal")
+                if isinstance(goal, dict):
+                    self._render_goal_updated(goal)
+            elif event.type == "thread.goal.cleared":
+                self.render_info_message("Goal cleared")
 
     def render_error(self, message: str) -> None:
-        self._begin_cell()
-        self._line(f"ERROR: {message}")
+        with self._render_lock:
+            self._begin_cell()
+            self._line(f"ERROR: {message}")
 
     def render_info_message(self, message: str, hint: str | None = None) -> None:
-        self._begin_cell()
-        text = message
-        if hint:
-            text = f"{message} {self._style.dim(hint)}"
-        self._emit_prefixed_lines(
-            [text],
-            first_prefix=f"{self._style.marker()} ",
-            rest_prefix="  ",
-        )
+        with self._render_lock:
+            self._begin_cell()
+            text = message
+            if hint:
+                text = f"{message} {self._style.dim(hint)}"
+            self._emit_prefixed_lines(
+                [text],
+                first_prefix=f"{self._style.marker()} ",
+                rest_prefix="  ",
+            )
 
     def render_warning(self, message: str) -> None:
-        if not message:
-            return
-        self._begin_cell()
-        self._emit_prefixed_lines(
-            [message],
-            first_prefix=self._style.yellow("⚠ "),
-            rest_prefix="  ",
-            transform=self._style.yellow,
-        )
+        with self._render_lock:
+            if not message:
+                return
+            self._begin_cell()
+            self._emit_prefixed_lines(
+                [message],
+                first_prefix=self._style.yellow("⚠ "),
+                rest_prefix="  ",
+                transform=self._style.yellow,
+            )
 
     def render_interrupted(self) -> None:
-        if self._interrupted_rendered:
-            return
-        self._interrupted_rendered = True
-        self._begin_cell()
-        self._line(
-            f"{self._style.red('■')} "
-            "Conversation interrupted - tell the model what to do differently. "
-            "Something went wrong? Hit `/feedback` to report the issue."
-        )
+        with self._render_lock:
+            if self._interrupted_rendered:
+                return
+            self._interrupted_rendered = True
+            self._begin_cell()
+            self._line(
+                f"{self._style.red('■')} "
+                "Conversation interrupted - tell the model what to do differently. "
+                "Something went wrong? Hit `/feedback` to report the issue."
+            )
 
     def render_pending_steer_interrupt(self) -> None:
-        if self._interrupted_rendered:
-            return
-        self._interrupted_rendered = True
-        self.render_info_message("Model interrupted to submit steer instructions.")
+        with self._render_lock:
+            if self._interrupted_rendered:
+                return
+            self._interrupted_rendered = True
+            self.render_info_message("Model interrupted to submit steer instructions.")
 
     def render_user_message(self, text: str) -> None:
-        normalized = text.rstrip("\r\n")
-        if not normalized:
-            return
-        terminal_width = shutil.get_terminal_size((100, 24)).columns
-        lines: list[str] = []
-        for raw_line in normalized.split("\n"):
-            if raw_line == "":
-                lines.append("")
-                continue
-            lines.extend(_wrap_ansi_line(raw_line, max(10, terminal_width - 2)))
-        self._begin_cell()
-        if self._style.enabled:
-            self._emit_user_message_block(lines, terminal_width=terminal_width)
-            return
-        self._emit_prefixed_lines(
-            lines,
-            first_prefix=self._style.dim(self._style.bold("› ")),
-            rest_prefix="  ",
-        )
+        with self._render_lock:
+            normalized = text.rstrip("\r\n")
+            if not normalized:
+                return
+            terminal_width = shutil.get_terminal_size((100, 24)).columns
+            safe_width = _terminal_safe_width(terminal_width)
+            lines: list[str] = []
+            for raw_line in normalized.split("\n"):
+                if raw_line == "":
+                    lines.append("")
+                    continue
+                lines.extend(_wrap_ansi_line(raw_line, max(10, safe_width - 2)))
+            self._begin_cell()
+            if self._style.enabled:
+                self._emit_user_message_block(lines, terminal_width=terminal_width)
+                return
+            self._emit_prefixed_lines(
+                lines,
+                first_prefix=self._style.dim(self._style.bold("› ")),
+                rest_prefix="  ",
+            )
 
     def _emit_user_message_block(self, lines: list[str], *, terminal_width: int) -> None:
         self._line(_user_message_blank_line(self._style, terminal_width))
@@ -6304,39 +6313,42 @@ class _HumanEventRenderer:
         self._line(_user_message_blank_line(self._style, terminal_width))
 
     def render_pending_input_preview(self, text: str, *, active: bool) -> None:
-        normalized = text.rstrip("\r\n")
-        if not normalized:
-            return
-        terminal_width = shutil.get_terminal_size((100, 24)).columns
-        lines: list[str] = []
-        for raw_line in normalized.split("\n"):
-            if raw_line == "":
-                lines.append("")
-                continue
-            lines.extend(_wrap_ansi_line(raw_line, max(10, terminal_width - 4)))
-        self._begin_cell()
-        header = "Messages to be submitted after next tool call" if active else "Queued follow-up inputs"
-        self._line(f"{self._style.marker()} {self._style.bold(header)}")
-        self._emit_prefixed_lines(
-            lines,
-            first_prefix=self._style.dim("  ↳ "),
-            rest_prefix=self._style.dim("    "),
-            transform=self._style.dim,
-        )
+        with self._render_lock:
+            normalized = text.rstrip("\r\n")
+            if not normalized:
+                return
+            terminal_width = shutil.get_terminal_size((100, 24)).columns
+            safe_width = _terminal_safe_width(terminal_width)
+            lines: list[str] = []
+            for raw_line in normalized.split("\n"):
+                if raw_line == "":
+                    lines.append("")
+                    continue
+                lines.extend(_wrap_ansi_line(raw_line, max(10, safe_width - 4)))
+            self._begin_cell()
+            header = "Messages to be submitted after next tool call" if active else "Queued follow-up inputs"
+            self._line(f"{self._style.marker()} {self._style.bold(header)}")
+            self._emit_prefixed_lines(
+                lines,
+                first_prefix=self._style.dim("  ↳ "),
+                rest_prefix=self._style.dim("    "),
+                transform=self._style.dim,
+            )
 
     def finish(self, final_message: str, *, print_to_stdout: bool = True) -> None:
-        self._flush_exploration()
-        self._final_message = final_message or self._final_message
-        if not self._final_message:
-            return
-        if sys.stdout.isatty() and sys.stderr.isatty():
+        with self._render_lock:
+            self._flush_exploration()
+            self._final_message = final_message or self._final_message
+            if not self._final_message:
+                return
+            if sys.stdout.isatty() and sys.stderr.isatty():
+                if not self._final_message_rendered:
+                    self._render_agent_message(self._final_message)
+                return
             if not self._final_message_rendered:
                 self._render_agent_message(self._final_message)
-            return
-        if not self._final_message_rendered:
-            self._render_agent_message(self._final_message)
-        if print_to_stdout:
-            print(self._final_message, flush=True)
+            if print_to_stdout:
+                print(self._final_message, flush=True)
 
     def _render_item(self, item: Any, *, pending_input: bool = False) -> None:
         if not isinstance(item, dict):
@@ -6935,20 +6947,21 @@ class _HumanEventRenderer:
         self._render_output_delta_block(call_id, previous_output, self._live_exec_output_text[call_id], first=first_output)
 
     def render_terminal_interaction(self, session_id: str, stdin: str, *, command: str | None = None) -> None:
-        self._flush_exploration()
-        self._begin_work_cell()
-        command_display = command or self._background_terminal_commands.get(str(session_id), "")
-        if not stdin:
-            self._render_terminal_interaction_header("•", "Waited for background terminal", command_display)
-            return
-        self._render_terminal_interaction_header("↳", "Interacted with background terminal", command_display)
-        input_lines = stdin.rstrip("\n").splitlines()
-        if input_lines:
-            self._emit_prefixed_lines(
-                input_lines,
-                first_prefix=self._style.dim("  └ "),
-                rest_prefix=self._style.dim("    "),
-            )
+        with self._render_lock:
+            self._flush_exploration()
+            self._begin_work_cell()
+            command_display = command or self._background_terminal_commands.get(str(session_id), "")
+            if not stdin:
+                self._render_terminal_interaction_header("•", "Waited for background terminal", command_display)
+                return
+            self._render_terminal_interaction_header("↳", "Interacted with background terminal", command_display)
+            input_lines = stdin.rstrip("\n").splitlines()
+            if input_lines:
+                self._emit_prefixed_lines(
+                    input_lines,
+                    first_prefix=self._style.dim("  └ "),
+                    rest_prefix=self._style.dim("    "),
+                )
 
     def _flush_pending_background_terminal_wait(self, call_id: str | None = None) -> None:
         if self._flushing_background_terminal_wait:
@@ -7597,12 +7610,13 @@ class _HumanEventRenderer:
 
     def _render_plan(self, meta: dict[str, Any]) -> None:
         self._line(f"{self._style.marker()} {self._style.bold('Updated Plan')}")
+        safe_width = _terminal_safe_width(shutil.get_terminal_size((100, 24)).columns)
         explanation = meta.get("explanation")
         indented: list[tuple[str, Any | None]] = []
         if isinstance(explanation, str) and explanation.strip():
             for rendered_line in _wrap_ansi_line(
                 explanation.strip(),
-                max(10, shutil.get_terminal_size((100, 24)).columns - 6),
+                max(10, safe_width - 6),
             ):
                 indented.append((rendered_line, lambda value, style=self._style: style.dim(style.italic(value))))
         plan = meta.get("plan")
@@ -7621,7 +7635,7 @@ class _HumanEventRenderer:
                 else:
                     marker_text = self._style.dim("□")
                     render_step = self._style.dim
-                wrapped = _wrap_ansi_line(step, max(10, shutil.get_terminal_size((100, 24)).columns - 8))
+                wrapped = _wrap_ansi_line(step, max(10, safe_width - 8))
                 if wrapped:
                     indented.append((f"{marker_text} {render_step(wrapped[0])}", None))
                     for continuation in wrapped[1:]:
@@ -7703,10 +7717,11 @@ class _HumanEventRenderer:
             self._render_final_separator()
             self._had_work_activity = False
         terminal_width = shutil.get_terminal_size((100, 24)).columns
+        safe_width = _terminal_safe_width(terminal_width)
         lines = _render_markdown_for_terminal(
             text,
             self._style,
-            terminal_width=max(10, terminal_width - 2),
+            terminal_width=max(10, safe_width - 2),
         )
         if not lines:
             return
@@ -7716,7 +7731,8 @@ class _HumanEventRenderer:
 
     def _render_reasoning_message(self, text: str) -> None:
         terminal_width = shutil.get_terminal_size((100, 24)).columns
-        lines = _render_reasoning_for_terminal(text, self._style, terminal_width=max(10, terminal_width - 2))
+        safe_width = _terminal_safe_width(terminal_width)
+        lines = _render_reasoning_for_terminal(text, self._style, terminal_width=max(10, safe_width - 2))
         if not lines:
             return
         self._begin_cell()
@@ -7731,7 +7747,7 @@ class _HumanEventRenderer:
     def _render_final_separator(self) -> None:
         self._begin_cell()
         width = shutil.get_terminal_size((100, 24)).columns
-        self._line(self._style.dim("─" * max(20, width)))
+        self._line(self._style.dim("─" * max(20, _terminal_safe_width(width))))
 
     def _begin_work_cell(self) -> None:
         self._had_work_activity = True
@@ -7756,6 +7772,7 @@ class _HumanEventRenderer:
         transform: Any | None = None,
     ) -> None:
         terminal_width = shutil.get_terminal_size((100, 24)).columns
+        safe_width = _terminal_safe_width(terminal_width)
         first_physical_line = True
         for logical_line in lines:
             if logical_line == "":
@@ -7764,7 +7781,7 @@ class _HumanEventRenderer:
                 continue
             line_first = first_physical_line
             prefix = first_prefix if line_first else rest_prefix
-            available_width = max(10, terminal_width - _visible_len(prefix))
+            available_width = max(10, safe_width - _visible_len(prefix))
             for segment in _wrap_ansi_line(logical_line, available_width):
                 prefix = first_prefix if line_first else rest_prefix
                 rendered = transform(segment) if transform is not None else segment
@@ -7782,12 +7799,13 @@ class _HumanEventRenderer:
         ellipsis_prefix: str,
     ) -> None:
         terminal_width = shutil.get_terminal_size((100, 24)).columns
+        safe_width = _terminal_safe_width(terminal_width)
         rendered: list[tuple[str, str]] = []
         first_physical_line = True
         for logical_line in lines:
             line_first = first_physical_line
             prefix = first_prefix if line_first else rest_prefix
-            available_width = max(10, terminal_width - _visible_len(prefix))
+            available_width = max(10, safe_width - _visible_len(prefix))
             for segment in _wrap_ansi_line(logical_line, available_width):
                 rendered.append((first_prefix if line_first else rest_prefix, segment))
                 line_first = False

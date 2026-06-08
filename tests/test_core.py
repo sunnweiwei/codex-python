@@ -8809,6 +8809,57 @@ new file mode 100644
 
         self.assertEqual(rendered.getvalue(), "CLEAR-OLDPANEL-2")
 
+    def test_cli_human_renderer_serializes_cross_thread_render_calls(self) -> None:
+        from codex.cli import _HumanEventRenderer
+
+        lines: list[Any] = []
+        first_sink_call = True
+        concurrent_started = threading.Event()
+        concurrent_thread: threading.Thread | None = None
+        renderer: Any = None
+
+        def sink(item: Any) -> None:
+            nonlocal first_sink_call, concurrent_thread
+            if first_sink_call:
+                first_sink_call = False
+
+                def render_concurrent_preview() -> None:
+                    concurrent_started.set()
+                    renderer.render_pending_input_preview("queued while streaming", active=True)
+
+                concurrent_thread = threading.Thread(target=render_concurrent_preview)
+                concurrent_thread.start()
+                self.assertTrue(concurrent_started.wait(timeout=1.0))
+                time.sleep(0.05)
+            lines.append(item)
+
+        renderer = _HumanEventRenderer(color_mode="never", line_sink=sink)
+        renderer.render(
+            codex_types.CodexEvent(
+                "tool.completed",
+                {
+                    "name": "exec_command",
+                    "call_id": "cmd",
+                    "ok": True,
+                    "metadata": {
+                        "command": "python slow.py",
+                        "exit_code": 0,
+                        "output": "line one\nline two\n",
+                    },
+                },
+            )
+        )
+        self.assertIsNotNone(concurrent_thread)
+        concurrent_thread.join(timeout=1.0)
+        self.assertFalse(concurrent_thread.is_alive())
+
+        rendered = "\n".join(str(line) for line in lines)
+        ran_index = rendered.index("• Ran python slow.py")
+        output_index = rendered.index("line two")
+        queued_index = rendered.index("Messages to be submitted after next tool call")
+        self.assertLess(ran_index, output_index)
+        self.assertLess(output_index, queued_index)
+
     def test_cli_dynamic_rows_avoid_terminal_autowrap_column(self) -> None:
         from codex import cli
 
