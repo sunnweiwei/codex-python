@@ -3619,16 +3619,56 @@ def _prompt_display_lines(
         rendered += style.composer_dim(_COMPOSER_PLACEHOLDER) if boxed else style.dim(_COMPOSER_PLACEHOLDER)
         return _composer_block_lines([rendered], style=style, width=width) if boxed else [rendered]
     lines = text.split("\n")
-    rendered = [
-        f"{prompt_prefix}{style.composer(lines[0]) if boxed else lines[0]}"
-    ]
-    rendered.extend(
-        f"{style.composer('  ') if boxed else '  '}{style.composer(line) if boxed else line}"
-        for line in lines[1:]
-    )
+    content_width = _prompt_content_width(width) if boxed else None
+    rendered: list[str] = []
+    for line_index, line in enumerate(lines):
+        chunks = (
+            [chunk.text for chunk in _prompt_line_chunks(line, content_width)]
+            if content_width is not None
+            else [line]
+        )
+        for chunk_index, chunk in enumerate(chunks):
+            is_first_prompt_line = line_index == 0 and chunk_index == 0
+            prefix = prompt_prefix if is_first_prompt_line else (style.composer("  ") if boxed else "  ")
+            body = style.composer(chunk) if boxed else chunk
+            rendered.append(f"{prefix}{body}")
     if boxed:
         rendered = _composer_block_lines(rendered, style=style, width=width)
     return rendered
+
+
+@dataclass(frozen=True)
+class _PromptLineChunk:
+    text: str
+    start: int
+    end: int
+
+
+def _prompt_content_width(width: int | None) -> int:
+    target = _composer_box_width(width)
+    return max(1, target - 2) if target > 0 else 1
+
+
+def _prompt_line_chunks(line: str, width: int | None) -> list[_PromptLineChunk]:
+    if width is None or width <= 0:
+        return [_PromptLineChunk(line, 0, len(line))]
+    if line == "":
+        return [_PromptLineChunk("", 0, 0)]
+    chunks: list[_PromptLineChunk] = []
+    current = ""
+    current_width = 0
+    start = 0
+    for index, char in enumerate(line):
+        char_width = _display_width(char)
+        if current and char_width > 0 and current_width + char_width > width:
+            chunks.append(_PromptLineChunk(current, start, index))
+            current = ""
+            current_width = 0
+            start = index
+        current += char
+        current_width += char_width
+    chunks.append(_PromptLineChunk(current, start, len(line)))
+    return chunks
 
 
 def _composer_block_lines(text_lines: list[str], *, style: "_AnsiStyle", width: int | None) -> list[str]:
@@ -4034,16 +4074,29 @@ def _prompt_cursor_position(text: str, cursor: int, cols: int) -> tuple[int, int
     cursor = max(0, min(cursor, len(text)))
     before = text[:cursor]
     logical_line_index = before.count("\n")
-    current_prefix_width = 2
+    prefix_width = 2
+    content_width = _prompt_content_width(cols)
     row = 0
     lines = text.split("\n")
     for line in lines[:logical_line_index]:
-        width = current_prefix_width + _visible_width(line)
-        row += 1 if width == 0 else max(1, (width + cols - 1) // cols)
+        row += len(_prompt_line_chunks(line, content_width))
     current_text = before.rsplit("\n", 1)[-1]
-    width_before_cursor = current_prefix_width + _visible_width(current_text)
-    row += width_before_cursor // cols
-    col = width_before_cursor % cols
+    cursor_col = len(current_text)
+    current_line = lines[logical_line_index] if logical_line_index < len(lines) else ""
+    chunks = _prompt_line_chunks(current_line, content_width)
+    selected_index = 0
+    for index, chunk in enumerate(chunks):
+        if cursor_col <= chunk.end:
+            selected_index = index
+            break
+    else:
+        selected_index = max(0, len(chunks) - 1)
+    if cursor_col == chunks[selected_index].start and selected_index > 0:
+        selected_index -= 1
+    chunk = chunks[selected_index]
+    row += selected_index
+    cursor_in_chunk = max(chunk.start, min(cursor_col, chunk.end))
+    col = prefix_width + _display_width(current_line[chunk.start:cursor_in_chunk])
     return row, col
 
 

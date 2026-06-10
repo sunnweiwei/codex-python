@@ -8138,6 +8138,7 @@ new file mode 100644
     def test_tty_prompt_empty_state_matches_upstream_composer_placeholder(self) -> None:
         from codex.cli import _AnsiStyle
         from codex.cli import _composer_status_block
+        from codex.cli import _prompt_cursor_position
         from codex.cli import _prompt_display_lines
         from codex.cli import _prompt_visible_text_window
         from codex.cli import _visible_len
@@ -8175,6 +8176,12 @@ new file mode 100644
         boxed_input = _prompt_display_lines("abc", _AnsiStyle(True), width=40, boxed=True)[1]
         self.assertNotIn("\x1b[0m \x1b[", boxed_input)
         self.assertIn("\x1b[38;2;28;28;28;48;2;244;244;244m \x1b[0m", boxed_input)
+
+        wrapped_chinese = _prompt_display_lines("你好世界你好", _AnsiStyle(True), width=12, boxed=True)
+        self.assertEqual([_visible_len(line) for line in wrapped_chinese], [11, 11, 11, 11])
+        self.assertNotIn("\x1b[0m \x1b[", "\n".join(wrapped_chinese))
+        self.assertEqual(_prompt_cursor_position("你好世界你好", 4, 12), (0, 10))
+        self.assertEqual(_prompt_cursor_position("你好世界你好", 6, 12), (1, 6))
 
         self.assertEqual(
             _composer_status_block(["• Working (0s • esc to interrupt)"]),
